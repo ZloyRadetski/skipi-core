@@ -30,6 +30,7 @@ import (
 	corenet "github.com/xtls/xray-core/common/net"
 	corefilesystem "github.com/xtls/xray-core/common/platform/filesystem"
 	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	corestats "github.com/xtls/xray-core/features/stats"
 	coreserial "github.com/xtls/xray-core/infra/conf/serial"
@@ -580,4 +581,144 @@ func ReadMemoryStats() string {
 func ForceFreeMemory() {
 	debug.FreeOSMemory()
 }
+
+// FastSelectBestOutbound concurrently tests candidate outbounds against a probe URL (defaulting to
+// http://connectivitycheck.gstatic.com/generate_204) and returns the tag of the fastest responsive node.
+// It uses early-return racing with a tight per-node timeout to avoid blocking on dead nodes.
+func FastSelectBestOutbound(configJSON string, candidateTags string, probeURL string, timeoutMs int64) string {
+	if configJSON == "" || candidateTags == "" {
+		return ""
+	}
+
+	tags := strings.Split(candidateTags, ",")
+	var candidates []string
+	for _, t := range tags {
+		trimmed := strings.TrimSpace(t)
+		if trimmed != "" {
+			candidates = append(candidates, trimmed)
+		}
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+
+	if probeURL == "" {
+		probeURL = "http://connectivitycheck.gstatic.com/generate_204"
+	}
+	if timeoutMs <= 0 {
+		timeoutMs = 1200
+	}
+
+	config, err := coreserial.LoadJSONConfig(strings.NewReader(configJSON))
+	if err != nil {
+		return candidates[0]
+	}
+
+	config.Inbound = nil
+
+	server, err := core.New(config)
+	if err != nil {
+		return candidates[0]
+	}
+
+	if err := server.Start(); err != nil {
+		return candidates[0]
+	}
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
+
+	type probeResult struct {
+		tag     string
+		latency int64
+		err     error
+	}
+
+	resultCh := make(chan probeResult, len(candidates))
+
+	for _, tag := range candidates {
+		go func(outboundTag string) {
+			tr := &http.Transport{
+				TLSHandshakeTimeout: time.Duration(timeoutMs) * time.Millisecond,
+				DisableKeepAlives:   true,
+				DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+					d, err := corenet.ParseDestination(fmt.Sprintf("%s:%s", network, addr))
+					if err != nil {
+						return nil, err
+					}
+					taggedCtx := session.SetForcedOutboundTagToContext(dialCtx, outboundTag)
+					return core.Dial(taggedCtx, server, d)
+				},
+			}
+			defer tr.CloseIdleConnections()
+
+			client := &http.Client{
+				Transport: tr,
+				Timeout:   time.Duration(timeoutMs) * time.Millisecond,
+			}
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+			if err != nil {
+				resultCh <- probeResult{tag: outboundTag, latency: -1, err: err}
+				return
+			}
+
+			start := time.Now()
+			resp, err := client.Do(req)
+			if err != nil {
+				resultCh <- probeResult{tag: outboundTag, latency: -1, err: err}
+				return
+			}
+			_ = resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+				dur := time.Since(start).Milliseconds()
+				resultCh <- probeResult{tag: outboundTag, latency: dur, err: nil}
+			} else {
+				resultCh <- probeResult{tag: outboundTag, latency: -1, err: fmt.Errorf("bad status: %d", resp.StatusCode)}
+			}
+		}(tag)
+	}
+
+	var fastestTag string
+	var lowestLatency int64 = 999999
+
+	received := 0
+	for received < len(candidates) {
+		select {
+		case res := <-resultCh:
+			received++
+			if res.err == nil && res.latency >= 0 {
+				if fastestTag == "" {
+					fastestTag = res.tag
+					lowestLatency = res.latency
+					if res.latency < 350 {
+						return fastestTag
+					}
+				} else if res.latency < lowestLatency {
+					fastestTag = res.tag
+					lowestLatency = res.latency
+				}
+			}
+		case <-ctx.Done():
+			if fastestTag != "" {
+				return fastestTag
+			}
+			return candidates[0]
+		}
+		if fastestTag != "" && (received >= (len(candidates)+1)/2 || received >= 3) {
+			return fastestTag
+		}
+	}
+
+	if fastestTag != "" {
+		return fastestTag
+	}
+	return candidates[0]
+}
+
 
