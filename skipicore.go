@@ -8,11 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/core"
 	_ "github.com/xtls/xray-core/main/distro/all"
 )
@@ -26,10 +30,10 @@ type CoreCallbackHandler interface {
 
 // CoreController manages the lifecycle of an Xray-core instance.
 type CoreController struct {
-	mu           sync.Mutex
-	instance     *core.Instance
-	callback     CoreCallbackHandler
-	isRunning    bool
+	mu        sync.Mutex
+	instance  *core.Instance
+	callback  CoreCallbackHandler
+	isRunning bool
 }
 
 // NewCoreController creates a new CoreController with the provided callback handler.
@@ -40,7 +44,7 @@ func NewCoreController(handler CoreCallbackHandler) *CoreController {
 }
 
 // StartLoop initializes and starts the Xray core instance with given JSON config.
-func (c *CoreController) StartLoop(configJSON string, tunFd int) error {
+func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -48,7 +52,16 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int) error {
 		return errors.New("core instance is already running")
 	}
 
-	config, err := core.LoadConfig("json", []byte(configJSON))
+	if tunFd > 0 {
+		fdStr := strconv.FormatInt(tunFd, 10)
+		_ = os.Setenv("xray.tun.fd", fdStr)
+		_ = os.Setenv("v2ray.tun.fd", fdStr)
+	} else {
+		_ = os.Unsetenv("xray.tun.fd")
+		_ = os.Unsetenv("v2ray.tun.fd")
+	}
+
+	config, err := core.LoadConfig("json", strings.NewReader(configJSON))
 	if err != nil {
 		return fmt.Errorf("failed to load xray config: %w", err)
 	}
@@ -99,11 +112,15 @@ func (c *CoreController) IsRunning() bool {
 	return c.isRunning
 }
 
-// InitCoreEnv configures environment variables (assets path) for Xray.
+// InitCoreEnv configures environment variables (assets and certificate path) for Xray.
 func InitCoreEnv(dataDir string, assetKey string) {
 	if dataDir != "" {
 		_ = os.Setenv("xray.location.asset", dataDir)
+		_ = os.Setenv("xray.location.cert", dataDir)
 		_ = os.Setenv("v2ray.location.asset", dataDir)
+	}
+	if assetKey != "" {
+		_ = os.Setenv("xray.xudp.basekey", assetKey)
 	}
 }
 
@@ -118,7 +135,7 @@ func MeasureOutboundDelay(configJSON string, targetURL string) (int64, error) {
 		targetURL = "https://www.google.com/generate_204"
 	}
 
-	config, err := core.LoadConfig("json", []byte(configJSON))
+	config, err := core.LoadConfig("json", strings.NewReader(configJSON))
 	if err != nil {
 		return -1, fmt.Errorf("failed to parse test config: %w", err)
 	}
@@ -133,20 +150,32 @@ func MeasureOutboundDelay(configJSON string, targetURL string) (int64, error) {
 	}
 	defer server.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	start := time.Now()
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, targetURL, nil)
+	tr := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dest, err := xnet.ParseDestination(network + ":" + addr)
+			if err != nil {
+				return nil, err
+			}
+			return core.Dial(ctx, server, dest)
+		},
+	}
+
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   10 * time.Second,
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return -1, err
 	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-	// Use custom transport routed via Xray core if needed or HTTP request
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-	}
-
+	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
 		return -1, err
