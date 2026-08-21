@@ -17,6 +17,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -536,3 +538,46 @@ func marshalCertSha256Result(result certSha256Result) string {
 	}
 	return string(data)
 }
+
+// MemoryStats holds detailed metrics on Go runtime and core memory usage.
+type MemoryStats struct {
+	AllocBytes    int64  `json:"allocBytes"`
+	AllocMb       string `json:"allocMb"`
+	TotalAlloc    int64  `json:"totalAlloc"`
+	SysBytes      int64  `json:"sysBytes"`
+	SysMb         string `json:"sysMb"`
+	HeapInuse     int64  `json:"heapInuse"`
+	HeapIdle      int64  `json:"heapIdle"`
+	HeapReleased  int64  `json:"heapReleased"`
+	NumGoroutines int    `json:"numGoroutines"`
+	NumGC         uint32 `json:"numGc"`
+}
+
+// ReadMemoryStats returns the current memory usage of the Go runtime and tunnel core as a JSON string.
+func ReadMemoryStats() string {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	stats := MemoryStats{
+		AllocBytes:    int64(m.Alloc),
+		AllocMb:       fmt.Sprintf("%.2f MB", float64(m.Alloc)/(1024*1024)),
+		TotalAlloc:    int64(m.TotalAlloc),
+		SysBytes:      int64(m.Sys),
+		SysMb:         fmt.Sprintf("%.2f MB", float64(m.Sys)/(1024*1024)),
+		HeapInuse:     int64(m.HeapInuse),
+		HeapIdle:      int64(m.HeapIdle),
+		HeapReleased:  int64(m.HeapReleased),
+		NumGoroutines: runtime.NumGoroutine(),
+		NumGC:         m.NumGC,
+	}
+	data, err := json.Marshal(stats)
+	if err != nil {
+		return `{"error":"failed to marshal memory stats"}`
+	}
+	return string(data)
+}
+
+// ForceFreeMemory triggers a garbage collection cycle and releases unused memory back to the OS.
+func ForceFreeMemory() {
+	debug.FreeOSMemory()
+}
+
