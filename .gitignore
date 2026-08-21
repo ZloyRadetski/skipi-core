@@ -1,0 +1,6 @@
+*.aar
+*.jar
+*.so
+.DS_Store
+.idea/
+.vscode/
