@@ -50,6 +50,8 @@ jobs:
 
       - name: Build SKIPI Core AAR
         run: |
+          go get -tool golang.org/x/mobile/cmd/gobind
+          go get golang.org/x/mobile@latest
           gomobile bind -v -target=android -androidapi 24 -javapkg=app.skipi.core -o skipicore.aar .
 
       - name: Upload AAR Artifact
