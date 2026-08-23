@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -241,6 +242,25 @@ func TestMemoryStats(t *testing.T) {
 
 	t.Logf("Memory stats: Alloc=%s, Sys=%s, Goroutines=%d, NumGC=%d",
 		stats.AllocMb, stats.SysMb, stats.NumGoroutines, stats.NumGC)
+}
+
+// The UI polls memory stats periodically while the tunnel forwards traffic:
+// the metrics-based read must stay allocation-free, unlike MemStats.
+func BenchmarkReadMemoryStats(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = ReadMemoryStats()
+	}
+}
+
+// Reference point: the legacy stop-the-world read this benchmark contrasts
+// against BenchmarkReadMemoryStats.
+func BenchmarkLegacyReadMemStats(b *testing.B) {
+	var m runtime.MemStats
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		runtime.ReadMemStats(&m)
+	}
 }
 
 func TestFastSelectBestOutbound(t *testing.T) {

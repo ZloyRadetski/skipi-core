@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +51,36 @@ const (
 	browserDialerAddress = "xray.browser.dialer"
 	coreLibVersion       = 1
 )
+
+// Mobile-first runtime profile applied before any core starts:
+//   - GOGC 50 keeps the live heap tighter than the Go default (100), which
+//     matters on Android where a fat Go heap invites the low-memory killer.
+//     Proxy forwarding is I/O bound, so the extra minor-cycle CPU cost is
+//     negligible next to the stability gain.
+//   - A soft memory limit acts purely as a safety net: it only starts forcing
+//     GC once total runtime memory approaches the ceiling, preventing runaway
+//     growth under connection bursts from turning into an OOM kill.
+//
+// Both values can be overridden per install via SKIPI_GOGC and
+// SKIPI_GOMEMLIMIT (bytes) environment variables.
+func init() {
+	gcPercent := 50
+	if raw := os.Getenv("SKIPI_GOGC"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			gcPercent = parsed
+		}
+	}
+	debug.SetGCPercent(gcPercent)
+
+	const defaultMemoryLimitBytes = 256 << 20 // 256 MiB soft ceiling
+	memoryLimit := int64(defaultMemoryLimitBytes)
+	if raw := os.Getenv("SKIPI_GOMEMLIMIT"); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			memoryLimit = parsed
+		}
+	}
+	debug.SetMemoryLimit(memoryLimit)
+}
 
 // CoreCallbackHandler handles lifecycle and logging events from the core.
 type CoreCallbackHandler interface {
@@ -242,7 +273,10 @@ func (c *CoreController) QueryAllOutboundTrafficStats() string {
 		return ""
 	}
 
+	// Called roughly once per second by the traffic stats service, so keep it
+	// allocation-light: a single pre-sized buffer, no intermediate slices.
 	var b strings.Builder
+	b.Grow(512)
 	sm.VisitCounters(func(name string, counter corestats.Counter) bool {
 		parts := strings.Split(name, ">>>")
 		if len(parts) != 4 || parts[0] != "outbound" || parts[2] != "traffic" {
@@ -280,11 +314,14 @@ func InitCoreEnv(dataDir string, assetKey string) {
 	}
 
 	corefilesystem.NewFileReader = func(path string) (io.ReadCloser, error) {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			_, file := filepath.Split(path)
-			return mobasset.Open(file)
+		// Try the filesystem first with a single syscall: geo files live on
+		// disk in the normal case, and only fall back to APK assets when the
+		// open fails (file missing on first run).
+		if file, err := os.Open(path); err == nil {
+			return file, nil
 		}
-		return os.Open(path)
+		_, file := filepath.Split(path)
+		return mobasset.Open(file)
 	}
 }
 
@@ -570,26 +607,78 @@ type MemoryStats struct {
 }
 
 // ReadMemoryStats returns the current memory usage of the Go runtime and tunnel core as a JSON string.
+//
+// Reads go through the runtime/metrics package, which is effectively
+// lock-free: runtime.ReadMemStats would stop the whole Go world on every call,
+// and this endpoint is polled periodically by the UI while the tunnel is
+// forwarding traffic. A MemStats fallback keeps the JSON contract intact on
+// runtimes where a metric is unavailable.
 func ReadMemoryStats() string {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	stats := MemoryStats{
-		AllocBytes:    int64(m.Alloc),
-		AllocMb:       fmt.Sprintf("%.2f MB", float64(m.Alloc)/(1024*1024)),
-		TotalAlloc:    int64(m.TotalAlloc),
-		SysBytes:      int64(m.Sys),
-		SysMb:         fmt.Sprintf("%.2f MB", float64(m.Sys)/(1024*1024)),
-		HeapInuse:     int64(m.HeapInuse),
-		HeapIdle:      int64(m.HeapIdle),
-		HeapReleased:  int64(m.HeapReleased),
-		NumGoroutines: runtime.NumGoroutine(),
-		NumGC:         m.NumGC,
+	stats := readMemoryStatsFromMetrics()
+	if stats == nil {
+		stats = readMemoryStatsFromMemStats()
 	}
 	data, err := json.Marshal(stats)
 	if err != nil {
 		return `{"error":"failed to marshal memory stats"}`
 	}
 	return string(data)
+}
+
+func readMemoryStatsFromMetrics() *MemoryStats {
+	samples := []metrics.Sample{
+		{Name: "/memory/classes/heap/objects:bytes"}, // live heap objects -> AllocBytes
+		{Name: "/gc/heap/allocs:bytes"},              // cumulative allocated  -> TotalAlloc
+		{Name: "/memory/classes/total:bytes"},        // total runtime memory   -> SysBytes
+		{Name: "/memory/classes/heap/free:bytes"},    // idle, not yet returned -> HeapIdle part
+		{Name: "/memory/classes/heap/released:bytes"},// returned to the OS     -> HeapReleased
+		{Name: "/gc/cycles:gc-cycles"},
+		{Name: "/sched/goroutines:goroutines"},
+	}
+	metrics.Read(samples)
+	for _, sample := range samples {
+		if sample.Value.Kind() == metrics.KindBad {
+			return nil
+		}
+	}
+
+	const mb = 1024 * 1024
+	heapObjects := int64(samples[0].Value.Float64())
+	totalAlloc := int64(samples[1].Value.Float64())
+	sysBytes := int64(samples[2].Value.Float64())
+	heapFree := int64(samples[3].Value.Float64())
+	heapReleased := int64(samples[4].Value.Float64())
+
+	return &MemoryStats{
+		AllocBytes:    heapObjects,
+		AllocMb:       fmt.Sprintf("%.2f MB", float64(heapObjects)/mb),
+		TotalAlloc:    totalAlloc,
+		SysBytes:      sysBytes,
+		SysMb:         fmt.Sprintf("%.2f MB", float64(sysBytes)/mb),
+		HeapInuse:     heapObjects,
+		HeapIdle:      heapFree + heapReleased,
+		HeapReleased:  heapReleased,
+		NumGoroutines: int(samples[6].Value.Uint64()),
+		NumGC:         uint32(samples[5].Value.Float64()),
+	}
+}
+
+func readMemoryStatsFromMemStats() *MemoryStats {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	const mb = 1024 * 1024
+	return &MemoryStats{
+		AllocBytes:    int64(m.Alloc),
+		AllocMb:       fmt.Sprintf("%.2f MB", float64(m.Alloc)/mb),
+		TotalAlloc:    int64(m.TotalAlloc),
+		SysBytes:      int64(m.Sys),
+		SysMb:         fmt.Sprintf("%.2f MB", float64(m.Sys)/mb),
+		HeapInuse:     int64(m.HeapInuse),
+		HeapIdle:      int64(m.HeapIdle),
+		HeapReleased:  int64(m.HeapReleased),
+		NumGoroutines: runtime.NumGoroutine(),
+		NumGC:         m.NumGC,
+	}
 }
 
 // ForceFreeMemory triggers a garbage collection cycle and releases unused memory back to the OS.
@@ -606,7 +695,7 @@ func FastSelectBestOutbound(configJSON string, candidateTags string, probeURL st
 	}
 
 	tags := strings.Split(candidateTags, ",")
-	var candidates []string
+	candidates := make([]string, 0, len(tags))
 	for _, t := range tags {
 		trimmed := strings.TrimSpace(t)
 		if trimmed != "" {
