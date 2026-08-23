@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -261,6 +262,58 @@ func TestFastSelectBestOutbound(t *testing.T) {
 		t.Fatalf("expected 'direct' to be selected over dead-node, got: %s", best)
 	}
 	t.Logf("FastSelectBestOutbound correctly selected: %s", best)
+}
+
+func TestStartLoopPublishesAndStopLoopClearsTunFdEnv(t *testing.T) {
+	unsetEnvVariable(tunFdKey)
+	unsetEnvVariable(v2rayTunFdKey)
+
+	configJSON := `{
+		"log": { "loglevel": "none" },
+		"outbounds": [
+			{ "protocol": "freedom", "tag": "direct" }
+		]
+	}`
+
+	ctrl := NewCoreController(&dummyCallbackHandler{})
+	if err := ctrl.StartLoop(configJSON, 12345); err != nil {
+		t.Fatalf("StartLoop failed: %v", err)
+	}
+
+	if got := os.Getenv(tunFdKey); got != "12345" {
+		t.Fatalf("expected %s=12345 while running, got %q", tunFdKey, got)
+	}
+	if got := os.Getenv(v2rayTunFdKey); got != "12345" {
+		t.Fatalf("expected %s=12345 while running, got %q", v2rayTunFdKey, got)
+	}
+
+	if err := ctrl.StopLoop(); err != nil {
+		t.Fatalf("StopLoop failed: %v", err)
+	}
+
+	if got := os.Getenv(tunFdKey); got != "" {
+		t.Fatalf("expected %s cleared after StopLoop, got %q", tunFdKey, got)
+	}
+	if got := os.Getenv(v2rayTunFdKey); got != "" {
+		t.Fatalf("expected %s cleared after StopLoop, got %q", v2rayTunFdKey, got)
+	}
+}
+
+func TestStartLoopFailureDoesNotTouchTunFdEnv(t *testing.T) {
+	unsetEnvVariable(tunFdKey)
+	unsetEnvVariable(v2rayTunFdKey)
+
+	ctrl := NewCoreController(&dummyCallbackHandler{})
+	if err := ctrl.StartLoop("{not valid json", 5555); err == nil {
+		t.Fatal("expected StartLoop to fail on invalid config")
+	}
+
+	if got := os.Getenv(tunFdKey); got != "" {
+		t.Fatalf("failed start must not publish %s, got %q", tunFdKey, got)
+	}
+	if got := os.Getenv(v2rayTunFdKey); got != "" {
+		t.Fatalf("failed start must not publish %s, got %q", v2rayTunFdKey, got)
+	}
 }
 
 

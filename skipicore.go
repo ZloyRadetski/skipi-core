@@ -107,14 +107,20 @@ type CoreController struct {
 	isRunning    bool
 }
 
+var registerConsoleLogHandlerOnce sync.Once
+
 // NewCoreController creates a new CoreController with the provided callback handler.
 func NewCoreController(handler CoreCallbackHandler) *CoreController {
-	_ = coreapplog.RegisterHandlerCreator(
-		coreapplog.LogType_Console,
-		func(lt coreapplog.LogType, options coreapplog.HandlerCreatorOptions) (corecommlog.Handler, error) {
-			return corecommlog.NewLogger(createStdoutLogWriter()), nil
-		},
-	)
+	// Xray keeps a single global registry: register our console writer exactly
+	// once per process instead of on every controller creation.
+	registerConsoleLogHandlerOnce.Do(func() {
+		_ = coreapplog.RegisterHandlerCreator(
+			coreapplog.LogType_Console,
+			func(lt coreapplog.LogType, options coreapplog.HandlerCreatorOptions) (corecommlog.Handler, error) {
+				return corecommlog.NewLogger(createStdoutLogWriter()), nil
+			},
+		)
+	})
 
 	return &CoreController{
 		callback: handler,
@@ -123,15 +129,6 @@ func NewCoreController(handler CoreCallbackHandler) *CoreController {
 
 // StartLoop initializes and starts the Xray core instance with given JSON config and optional TUN file descriptor.
 func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
-	if tunFd > 0 {
-		fdStr := strconv.FormatInt(tunFd, 10)
-		setEnvVariable(tunFdKey, fdStr)
-		setEnvVariable(v2rayTunFdKey, fdStr)
-	} else {
-		unsetEnvVariable(tunFdKey)
-		unsetEnvVariable(v2rayTunFdKey)
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -142,6 +139,19 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	config, err := coreserial.LoadJSONConfig(strings.NewReader(configJSON))
 	if err != nil {
 		return fmt.Errorf("failed to load xray config: %w", err)
+	}
+
+	// Publish the TUN descriptor only after the config validated successfully so
+	// a failed start can never leave a stale/global fd visible to other
+	// instances created later in this process (env vars are process-wide).
+	// Must happen before core.New: features read the fd during construction.
+	if tunFd > 0 {
+		fdStr := strconv.FormatInt(tunFd, 10)
+		setEnvVariable(tunFdKey, fdStr)
+		setEnvVariable(v2rayTunFdKey, fdStr)
+	} else {
+		unsetEnvVariable(tunFdKey)
+		unsetEnvVariable(v2rayTunFdKey)
 	}
 
 	server, err := core.New(config)
@@ -184,6 +194,11 @@ func (c *CoreController) StopLoop() error {
 	c.instance = nil
 	c.statsManager = nil
 	c.isRunning = false
+
+	// Drop the TUN descriptor env vars so later instances (latency probes,
+	// URL-test racers) never observe an already-closed file descriptor.
+	unsetEnvVariable(tunFdKey)
+	unsetEnvVariable(v2rayTunFdKey)
 
 	if c.callback != nil {
 		c.callback.Shutdown()
