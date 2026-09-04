@@ -8,12 +8,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -336,4 +338,192 @@ func TestStartLoopFailureDoesNotTouchTunFdEnv(t *testing.T) {
 	}
 }
 
+
+
+type dummySocketProtector struct {
+	protectedCount int
+}
+
+func (p *dummySocketProtector) Protect(fd int) bool {
+	p.protectedCount++
+	return true
+}
+
+func TestOlcRtcParsing(t *testing.T) {
+	yamlConfig := `
+mode: cnc
+provider: jitsi
+transport: datachannel
+room: test-room-123
+key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+dns: 1.1.1.1:53
+socks5_listen: 127.0.0.1:10808
+`
+	cfg, err := ParseOlcRtcOptions(yamlConfig, 10808)
+	if err != nil {
+		t.Fatalf("ParseOlcRtcOptions failed: %v", err)
+	}
+	if cfg.Provider != "jitsi" {
+		t.Errorf("expected provider jitsi, got %s", cfg.Provider)
+	}
+	if cfg.Transport != "datachannel" {
+		t.Errorf("expected transport datachannel, got %s", cfg.Transport)
+	}
+	if cfg.Room != "test-room-123" {
+		t.Errorf("expected room test-room-123, got %s", cfg.Room)
+	}
+	if cfg.Key != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
+		t.Errorf("unexpected key: %s", cfg.Key)
+	}
+	if cfg.Socks.Port != 10808 {
+		t.Errorf("expected socks port 10808, got %d", cfg.Socks.Port)
+	}
+}
+
+func TestOlcRtcProtectorAndState(t *testing.T) {
+	protector := &dummySocketProtector{}
+	SetOlcRtcSocketProtector(protector)
+
+	if IsOlcRtcRunning() {
+		t.Fatal("expected olcrtc to not be running initially")
+	}
+	if state := OlcRtcState(); state != "stopped" && state != "idle" {
+		t.Fatalf("expected state stopped/idle, got %s", state)
+	}
+	if err := StopOlcRtc(); err != nil {
+		t.Fatalf("StopOlcRtc failed: %v", err)
+	}
+}
+
+func TestAmneziaWgConfigAndIpc(t *testing.T) {
+	awgJSON := `{
+		"protocol": "wireguard",
+		"settings": {
+			"secretKey": "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=",
+			"address": ["10.8.0.2/32"],
+			"peers": [
+				{
+					"publicKey": "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s=",
+					"endpoint": "192.0.2.1:51820",
+					"allowedIPs": ["0.0.0.0/0"],
+					"keepAlive": 25
+				}
+			],
+			"mtu": 1420,
+			"jc": 5,
+			"jmin": 30,
+			"jmax": 80,
+			"s1": 20,
+			"s2": 40,
+			"h1": 11111,
+			"h2": 22222,
+			"h3": 33333,
+			"h4": 44444
+		}
+	}`
+
+	settings, err := ParseAmneziaWgSettings(awgJSON)
+	if err != nil {
+		t.Fatalf("ParseAmneziaWgSettings failed: %v", err)
+	}
+	if !settings.HasAmneziaParams() {
+		t.Fatal("expected HasAmneziaParams to be true")
+	}
+	if settings.Jc != 5 || settings.Jmin != 30 || settings.Jmax != 80 {
+		t.Fatalf("unexpected Jc/Jmin/Jmax: %d/%d/%d", settings.Jc, settings.Jmin, settings.Jmax)
+	}
+	if settings.S1 != 20 || settings.S2 != 40 {
+		t.Fatalf("unexpected S1/S2: %d/%d", settings.S1, settings.S2)
+	}
+
+	ipc, err := settings.BuildIpcConfig()
+	if err != nil {
+		t.Fatalf("BuildIpcConfig failed: %v", err)
+	}
+	if !strings.Contains(ipc, "jc=5") {
+		t.Errorf("ipc missing jc=5: %s", ipc)
+	}
+	if !strings.Contains(ipc, "jmin=30") {
+		t.Errorf("ipc missing jmin=30: %s", ipc)
+	}
+	if !strings.Contains(ipc, "jmax=80") {
+		t.Errorf("ipc missing jmax=80: %s", ipc)
+	}
+	if !strings.Contains(ipc, "s1=20") {
+		t.Errorf("ipc missing s1=20: %s", ipc)
+	}
+	if !strings.Contains(ipc, "s2=40") {
+		t.Errorf("ipc missing s2=40: %s", ipc)
+	}
+	if !strings.Contains(ipc, "h1=11111") {
+		t.Errorf("ipc missing h1=11111: %s", ipc)
+	}
+
+	fullConfig := fmt.Sprintf(`{
+		"outbounds": [
+			%s
+		]
+	}`, awgJSON)
+	rewritten := RewriteWireguardOutboundToSocks(fullConfig, 10809)
+	if !strings.Contains(rewritten, `"protocol":"socks"`) {
+		t.Fatalf("expected rewritten config to contain protocol socks, got: %s", rewritten)
+	}
+	if !strings.Contains(rewritten, `10809`) {
+		t.Fatalf("expected rewritten config to contain port 10809, got: %s", rewritten)
+	}
+}
+
+func TestAmneziaWgRunnerLifecycle(t *testing.T) {
+	awgJSON := `{
+		"secretKey": "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=",
+		"address": ["10.8.0.2/32"],
+		"peers": [
+			{
+				"publicKey": "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s=",
+				"endpoint": "127.0.0.1:59999",
+				"allowedIPs": ["0.0.0.0/0"]
+			}
+		],
+		"jc": 3,
+		"jmin": 40,
+		"jmax": 70,
+		"s1": 15,
+		"s2": 25,
+		"h1": "12345"
+	}`
+
+	settings, err := ParseAmneziaWgSettings(awgJSON)
+	if err != nil {
+		t.Fatalf("ParseAmneziaWgSettings failed: %v", err)
+	}
+
+	runner, err := NewAmneziaWgRunner(settings, 0)
+	if err != nil {
+		t.Fatalf("NewAmneziaWgRunner failed: %v", err)
+	}
+
+	if err := runner.Start(); err != nil {
+		t.Fatalf("runner.Start failed: %v", err)
+	}
+	if runner.socksPort <= 0 {
+		t.Fatalf("expected positive socks port, got %d", runner.socksPort)
+	}
+
+	// SOCKS5 handshake test to verify listener is functioning
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", runner.socksPort))
+	if err != nil {
+		t.Fatalf("failed to dial socks listener: %v", err)
+	}
+	_, _ = conn.Write([]byte{0x05, 0x01, 0x00})
+	var reply [2]byte
+	_, _ = io.ReadFull(conn, reply[:])
+	conn.Close()
+	if reply[0] != 0x05 || reply[1] != 0x00 {
+		t.Fatalf("unexpected socks handshake reply: %v", reply)
+	}
+
+	if err := runner.Stop(); err != nil {
+		t.Fatalf("runner.Stop failed: %v", err)
+	}
+}
 
