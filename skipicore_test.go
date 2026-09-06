@@ -380,6 +380,91 @@ socks5_listen: 127.0.0.1:10808
 	}
 }
 
+func TestOlcRtcTransportOptionsParsing(t *testing.T) {
+	// Test VP8 with angle brackets in transport
+	vp8Yaml := `
+mode: cnc
+provider: telemost
+transport: vp8channel<vp8-fps=25&vp8-batch=1>
+room: 56026201482837
+key: 30330bd1da1c7ad6e7d518e423662b3bb2b53ca1bbb65612263a494610fa73e4
+socks5_listen: 127.0.0.1:10808
+`
+	cfg, err := ParseOlcRtcOptions(vp8Yaml, 10808)
+	if err != nil {
+		t.Fatalf("ParseOlcRtcOptions failed for vp8: %v", err)
+	}
+	if cfg.Transport != "vp8channel" {
+		t.Errorf("expected transport vp8channel, got %s", cfg.Transport)
+	}
+	if cfg.VP8.FPS != 25 {
+		t.Errorf("expected vp8.fps 25, got %d", cfg.VP8.FPS)
+	}
+	if cfg.VP8.BatchSize != 1 {
+		t.Errorf("expected vp8.batch_size 1, got %d", cfg.VP8.BatchSize)
+	}
+
+	// Test SEI with angle brackets in transport
+	seiYaml := `
+mode: cnc
+provider: wbstream
+transport: seichannel<fps=60&batch=64&frag=900&ack-ms=2000>
+room: room-01
+key: 30330bd1da1c7ad6e7d518e423662b3bb2b53ca1bbb65612263a494610fa73e4
+socks5_listen: 127.0.0.1:10808
+`
+	cfgSei, err := ParseOlcRtcOptions(seiYaml, 10808)
+	if err != nil {
+		t.Fatalf("ParseOlcRtcOptions failed for sei: %v", err)
+	}
+	if cfgSei.Transport != "seichannel" {
+		t.Errorf("expected transport seichannel, got %s", cfgSei.Transport)
+	}
+	if cfgSei.SEI.FPS != 60 || cfgSei.SEI.BatchSize != 64 || cfgSei.SEI.FragmentSize != 900 || cfgSei.SEI.AckTimeoutMS != 2000 {
+		t.Errorf("unexpected sei options: %+v", cfgSei.SEI)
+	}
+
+	// Test Video with angle brackets in transport
+	videoYaml := `
+mode: cnc
+provider: telemost
+transport: videochannel<video-w=1080&video-h=1080&video-fps=60&video-codec=qrcode>
+room: room-01
+key: 30330bd1da1c7ad6e7d518e423662b3bb2b53ca1bbb65612263a494610fa73e4
+socks5_listen: 127.0.0.1:10808
+`
+	cfgVideo, err := ParseOlcRtcOptions(videoYaml, 10808)
+	if err != nil {
+		t.Fatalf("ParseOlcRtcOptions failed for video: %v", err)
+	}
+	if cfgVideo.Transport != "videochannel" {
+		t.Errorf("expected transport videochannel, got %s", cfgVideo.Transport)
+	}
+	if cfgVideo.Video.Width != 1080 || cfgVideo.Video.Height != 1080 || cfgVideo.Video.FPS != 60 || cfgVideo.Video.Codec != "qrcode" {
+		t.Errorf("unexpected video options: %+v", cfgVideo.Video)
+	}
+
+	// Test VP8 with separate YAML block
+	vp8BlockYaml := `
+mode: cnc
+provider: telemost
+transport: vp8channel
+vp8:
+  fps: 25
+  batch_size: 1
+room: 56026201482837
+key: 30330bd1da1c7ad6e7d518e423662b3bb2b53ca1bbb65612263a494610fa73e4
+socks5_listen: 127.0.0.1:10808
+`
+	cfgBlock, err := ParseOlcRtcOptions(vp8BlockYaml, 10808)
+	if err != nil {
+		t.Fatalf("ParseOlcRtcOptions failed for vp8 block: %v", err)
+	}
+	if cfgBlock.VP8.FPS != 25 || cfgBlock.VP8.BatchSize != 1 {
+		t.Errorf("unexpected vp8 block options: %+v", cfgBlock.VP8)
+	}
+}
+
 func TestOlcRtcProtectorAndState(t *testing.T) {
 	protector := &dummySocketProtector{}
 	SetOlcRtcSocketProtector(protector)

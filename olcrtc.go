@@ -1,4 +1,4 @@
-﻿// Copyright 2026, Radetski
+// Copyright 2026, Radetski
 // SPDX-License-Identifier: GPL-3.0
 
 package skipicore
@@ -68,6 +68,27 @@ type OlcRtcConfigData struct {
 		Host string `yaml:"host"`
 		Port int    `yaml:"port"`
 	} `yaml:"socks"`
+
+	VP8 struct {
+		FPS       int `yaml:"fps"`
+		BatchSize int `yaml:"batch_size"`
+	} `yaml:"vp8"`
+	SEI struct {
+		FPS          int `yaml:"fps"`
+		BatchSize    int `yaml:"batch_size"`
+		FragmentSize int `yaml:"fragment_size"`
+		AckTimeoutMS int `yaml:"ack_timeout_ms"`
+	} `yaml:"sei"`
+	Video struct {
+		Width      int    `yaml:"width"`
+		Height     int    `yaml:"height"`
+		FPS        int    `yaml:"fps"`
+		Codec      string `yaml:"codec"`
+		QRSize     int    `yaml:"qr_size"`
+		QRRecovery string `yaml:"qr_recovery"`
+		TileModule int    `yaml:"tile_module"`
+		TileRS     int    `yaml:"tile_rs"`
+	} `yaml:"video"`
 }
 
 // ParseOlcRtcOptions parses YAML and extracts normalized parameters.
@@ -104,6 +125,22 @@ func ParseOlcRtcOptions(rawYaml string, fallbackPort int) (*OlcRtcConfigData, er
 				cfg.Channel = v
 			case "token":
 				cfg.Token = v
+			case "vp8_fps", "vp8-fps":
+				if n, err := strconv.Atoi(v); err == nil {
+					cfg.VP8.FPS = n
+				}
+			case "vp8_batch", "vp8-batch", "vp8_batch_size":
+				if n, err := strconv.Atoi(v); err == nil {
+					cfg.VP8.BatchSize = n
+				}
+			case "sei_fps", "sei-fps":
+				if n, err := strconv.Atoi(v); err == nil {
+					cfg.SEI.FPS = n
+				}
+			case "sei_batch", "sei-batch":
+				if n, err := strconv.Atoi(v); err == nil {
+					cfg.SEI.BatchSize = n
+				}
 			}
 		}
 	}
@@ -123,9 +160,94 @@ func ParseOlcRtcOptions(rawYaml string, fallbackPort int) (*OlcRtcConfigData, er
 	if cfg.Transport == "" {
 		cfg.Transport = "datachannel"
 	}
-	// If transport has payload like datachannel[...] or vp8channel[...], extract base transport
-	if idx := strings.Index(cfg.Transport, "["); idx > 0 {
-		cfg.Transport = cfg.Transport[:idx]
+
+	// If transport has payload like datachannel<...> or vp8channel[...], extract base transport & payload
+	var payloadStr string
+	if openIdx := strings.IndexAny(cfg.Transport, "<["); openIdx >= 0 {
+		closeChar := ">"
+		if cfg.Transport[openIdx] == '[' {
+			closeChar = "]"
+		}
+		closeIdx := strings.LastIndex(cfg.Transport, closeChar)
+		if closeIdx > openIdx {
+			payloadStr = cfg.Transport[openIdx+1 : closeIdx]
+		}
+		cfg.Transport = strings.TrimSpace(cfg.Transport[:openIdx])
+	}
+
+	if payloadStr != "" {
+		for _, part := range strings.Split(payloadStr, "&") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			kv := strings.SplitN(part, "=", 2)
+			k := strings.ToLower(strings.TrimSpace(kv[0]))
+			v := ""
+			if len(kv) == 2 {
+				v = strings.TrimSpace(kv[1])
+			}
+			switch k {
+			case "vp8-fps", "fps":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					if cfg.VP8.FPS <= 0 {
+						cfg.VP8.FPS = n
+					}
+					if cfg.SEI.FPS <= 0 {
+						cfg.SEI.FPS = n
+					}
+				}
+			case "vp8-batch", "batch":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 {
+					if cfg.VP8.BatchSize <= 0 {
+						cfg.VP8.BatchSize = n
+					}
+					if cfg.SEI.BatchSize <= 0 {
+						cfg.SEI.BatchSize = n
+					}
+				}
+			case "frag", "fragment_size":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 && cfg.SEI.FragmentSize <= 0 {
+					cfg.SEI.FragmentSize = n
+				}
+			case "ack-ms", "ack_timeout_ms":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 && cfg.SEI.AckTimeoutMS <= 0 {
+					cfg.SEI.AckTimeoutMS = n
+				}
+			case "video-w", "width":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 && cfg.Video.Width <= 0 {
+					cfg.Video.Width = n
+				}
+			case "video-h", "height":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 && cfg.Video.Height <= 0 {
+					cfg.Video.Height = n
+				}
+			case "video-fps":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 && cfg.Video.FPS <= 0 {
+					cfg.Video.FPS = n
+				}
+			case "video-codec", "codec":
+				if v != "" && cfg.Video.Codec == "" {
+					cfg.Video.Codec = v
+				}
+			case "video-qr-size", "qr_size":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 && cfg.Video.QRSize <= 0 {
+					cfg.Video.QRSize = n
+				}
+			case "video-qr-recovery", "qr_recovery":
+				if v != "" && cfg.Video.QRRecovery == "" {
+					cfg.Video.QRRecovery = v
+				}
+			case "video-tile-module", "tile_module":
+				if n, err := strconv.Atoi(v); err == nil && n > 0 && cfg.Video.TileModule <= 0 {
+					cfg.Video.TileModule = n
+				}
+			case "video-tile-rs", "tile_rs":
+				if n, err := strconv.Atoi(v); err == nil && cfg.Video.TileRS <= 0 {
+					cfg.Video.TileRS = n
+				}
+			}
+		}
 	}
 
 	// Normalize room
@@ -199,6 +321,71 @@ func StartOlcRtc(configYaml string, socksPort int) error {
 	}
 	if err := rt.SetTransport(cfg.Transport); err != nil {
 		return fmt.Errorf("set transport %q: %w", cfg.Transport, err)
+	}
+
+	switch strings.ToLower(cfg.Transport) {
+	case "vp8channel":
+		fps := cfg.VP8.FPS
+		if fps <= 0 {
+			fps = 30
+		}
+		batch := cfg.VP8.BatchSize
+		if batch <= 0 {
+			batch = 64
+		}
+		if err := rt.SetVP8Options(fps, batch); err != nil {
+			return fmt.Errorf("set vp8 options: %w", err)
+		}
+	case "seichannel":
+		fps := cfg.SEI.FPS
+		if fps <= 0 {
+			fps = 30
+		}
+		batch := cfg.SEI.BatchSize
+		if batch <= 0 {
+			batch = 64
+		}
+		frag := cfg.SEI.FragmentSize
+		if frag <= 0 {
+			frag = 900
+		}
+		ackMs := cfg.SEI.AckTimeoutMS
+		if ackMs <= 0 {
+			ackMs = 2000
+		}
+		if err := rt.SetSEIOptions(fps, batch, frag, ackMs); err != nil {
+			return fmt.Errorf("set sei options: %w", err)
+		}
+	case "videochannel":
+		w := cfg.Video.Width
+		if w <= 0 {
+			w = 1920
+		}
+		h := cfg.Video.Height
+		if h <= 0 {
+			h = 1080
+		}
+		fps := cfg.Video.FPS
+		if fps <= 0 {
+			fps = 30
+		}
+		codec := cfg.Video.Codec
+		if codec == "" {
+			codec = "qrcode"
+		}
+		qrSize := cfg.Video.QRSize
+		qrRec := cfg.Video.QRRecovery
+		if qrRec == "" {
+			qrRec = "low"
+		}
+		tileMod := cfg.Video.TileModule
+		if tileMod <= 0 {
+			tileMod = 4
+		}
+		tileRS := cfg.Video.TileRS
+		if err := rt.SetVideoOptions(w, h, fps, qrSize, qrRec, codec, tileMod, tileRS); err != nil {
+			return fmt.Errorf("set video options: %w", err)
+		}
 	}
 	if err := rt.SetRoom(cfg.Room); err != nil {
 		return fmt.Errorf("set room: %w", err)
