@@ -37,17 +37,41 @@ func SetOlcRtcSocketProtector(p SocketProtector) {
 	}
 }
 
+// OlcRtcRoom handles room specified either as a scalar string or as an object with id.
+type OlcRtcRoom struct {
+	ID string
+}
+
+func (r *OlcRtcRoom) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err == nil {
+		r.ID = s
+		return nil
+	}
+	var m struct {
+		ID string `yaml:"id"`
+	}
+	if err := unmarshal(&m); err == nil {
+		r.ID = m.ID
+		return nil
+	}
+	return nil
+}
+
 // OlcRtcConfigData models fields supported in YAML or flat configs.
 type OlcRtcConfigData struct {
-	Mode      string `yaml:"mode"`
-	Provider  string `yaml:"provider"`
-	Transport string `yaml:"transport"`
-	Room      string `yaml:"room"`
-	Key       string `yaml:"key"`
-	DNS       string `yaml:"dns"`
-	Local     string `yaml:"socks5_listen"`
-	Channel   string `yaml:"channel"`
-	Token     string `yaml:"token"`
+	Mode       string     `yaml:"mode"`
+	Provider   string     `yaml:"provider"`
+	Transport  string     `yaml:"transport"`
+	RoomRaw    OlcRtcRoom `yaml:"room"`
+	Room       string     `yaml:"-"`
+	Key        string     `yaml:"key"`
+	DNS        string     `yaml:"dns"`
+	Local      string     `yaml:"socks5_listen"`
+	Socks5User string     `yaml:"socks5_user"`
+	Socks5Pass string     `yaml:"socks5_pass"`
+	Channel    string     `yaml:"channel"`
+	Token      string     `yaml:"token"`
 
 	Auth struct {
 		Provider string `yaml:"provider"`
@@ -67,6 +91,8 @@ type OlcRtcConfigData struct {
 	Socks struct {
 		Host string `yaml:"host"`
 		Port int    `yaml:"port"`
+		User string `yaml:"user"`
+		Pass string `yaml:"pass"`
 	} `yaml:"socks"`
 
 	VP8 struct {
@@ -115,12 +141,20 @@ func ParseOlcRtcOptions(rawYaml string, fallbackPort int) (*OlcRtcConfigData, er
 				cfg.Transport = v
 			case "room":
 				cfg.Room = v
+			case "id":
+				if cfg.Room == "" {
+					cfg.Room = v
+				}
 			case "key":
 				cfg.Key = v
 			case "dns":
 				cfg.DNS = v
 			case "socks5_listen":
 				cfg.Local = v
+			case "socks5_user", "socks_user", "user":
+				cfg.Socks5User = v
+			case "socks5_pass", "socks_pass", "pass", "password":
+				cfg.Socks5Pass = v
 			case "channel":
 				cfg.Channel = v
 			case "token":
@@ -142,6 +176,10 @@ func ParseOlcRtcOptions(rawYaml string, fallbackPort int) (*OlcRtcConfigData, er
 					cfg.SEI.BatchSize = n
 				}
 			}
+		}
+	} else {
+		if cfg.Room == "" && cfg.RoomRaw.ID != "" {
+			cfg.Room = cfg.RoomRaw.ID
 		}
 	}
 
@@ -251,6 +289,9 @@ func ParseOlcRtcOptions(rawYaml string, fallbackPort int) (*OlcRtcConfigData, er
 	}
 
 	// Normalize room
+	if cfg.Room == "" && cfg.RoomRaw.ID != "" {
+		cfg.Room = cfg.RoomRaw.ID
+	}
 	if cfg.Room == "" && cfg.RoomObj.ID != "" {
 		cfg.Room = cfg.RoomObj.ID
 	}
@@ -258,6 +299,14 @@ func ParseOlcRtcOptions(rawYaml string, fallbackPort int) (*OlcRtcConfigData, er
 	// Normalize key
 	if cfg.Key == "" && cfg.Crypto.Key != "" {
 		cfg.Key = cfg.Crypto.Key
+	}
+
+	// Normalize SOCKS credentials
+	if cfg.Socks5User == "" && cfg.Socks.User != "" {
+		cfg.Socks5User = cfg.Socks.User
+	}
+	if cfg.Socks5Pass == "" && cfg.Socks.Pass != "" {
+		cfg.Socks5Pass = cfg.Socks.Pass
 	}
 
 	// Normalize DNS
@@ -330,7 +379,7 @@ func StartOlcRtc(configYaml string, socksPort int) error {
 			fps = 30
 		}
 		batch := cfg.VP8.BatchSize
-		if batch <= 0 {
+		if batch <= 1 {
 			batch = 64
 		}
 		if err := rt.SetVP8Options(fps, batch); err != nil {
@@ -342,7 +391,7 @@ func StartOlcRtc(configYaml string, socksPort int) error {
 			fps = 30
 		}
 		batch := cfg.SEI.BatchSize
-		if batch <= 0 {
+		if batch <= 1 {
 			batch = 64
 		}
 		frag := cfg.SEI.FragmentSize
@@ -408,6 +457,12 @@ func StartOlcRtc(configYaml string, socksPort int) error {
 		return fmt.Errorf("set socks port %d: %w", cfg.Socks.Port, err)
 	}
 
+	if cfg.Socks5User != "" || cfg.Socks5Pass != "" {
+		if err := rt.SetSocksCredentials(cfg.Socks5User, cfg.Socks5Pass); err != nil {
+			return fmt.Errorf("set socks credentials: %w", err)
+		}
+	}
+
 	if olcrtcProtector != nil {
 		rt.SetProtector(olcrtcProtector)
 	}
@@ -418,6 +473,18 @@ func StartOlcRtc(configYaml string, socksPort int) error {
 
 	olcrtcRuntime = rt
 	return nil
+}
+
+// WaitOlcRtcReady waits up to timeoutMillis for the active OLCRTC client runtime to become ready.
+func WaitOlcRtcReady(timeoutMillis int) error {
+	olcrtcMu.Lock()
+	rt := olcrtcRuntime
+	olcrtcMu.Unlock()
+
+	if rt == nil {
+		return errors.New("olcrtc runtime is not active")
+	}
+	return rt.WaitReady(timeoutMillis)
 }
 
 // StopOlcRtc stops any active OLCRTC client runtime.
