@@ -4,6 +4,7 @@
 package skipicore
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -14,6 +15,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +42,9 @@ type AmneziaWgSettings struct {
 	Address   any              `json:"address"`
 	Peers     []*AmneziaWgPeer `json:"peers"`
 	MTU       int              `json:"mtu"`
+	// DNSServers is a runtime-only list of raw IP resolvers for the internal
+	// netstack. It deliberately is not an Xray WireGuard setting.
+	DNSServers []string `json:"dnsServers"`
 
 	// AmneziaWG specific fields:
 	Jc   int `json:"jc"`
@@ -205,17 +210,36 @@ type AmneziaWgRunner struct {
 	mu        sync.Mutex
 	tun       tun.Device
 	dev       *device.Device
+	bind      conn.Bind
 	tnet      *netstack.Net
 	listener  net.Listener
 	socksPort int
 	running   bool
 	cancel    context.CancelFunc
+	protector SocketProtector
 }
 
 var (
-	awgGlobalMu     sync.Mutex
-	activeAwgRunner *AmneziaWgRunner
+	awgGlobalMu        sync.Mutex
+	activeAwgRunner    *AmneziaWgRunner
+	awgProtectorMu     sync.RWMutex
+	awgSocketProtector SocketProtector
 )
+
+// SetAmneziaWgSocketProtector registers Android's VpnService.protect bridge
+// for the UDP sockets used by the AmneziaWG peer. Without it the peer's own
+// packets can be routed back into the VPN TUN and never complete a handshake.
+func SetAmneziaWgSocketProtector(p SocketProtector) {
+	awgProtectorMu.Lock()
+	defer awgProtectorMu.Unlock()
+	awgSocketProtector = p
+}
+
+func currentAmneziaWgSocketProtector() SocketProtector {
+	awgProtectorMu.RLock()
+	defer awgProtectorMu.RUnlock()
+	return awgSocketProtector
+}
 
 // ParseAmneziaWgSettings extracts AmneziaWgSettings from full Xray config, outbound json, or settings json.
 func ParseAmneziaWgSettings(rawJSON string) (*AmneziaWgSettings, error) {
@@ -347,7 +371,10 @@ func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgR
 		mtu = 1420
 	}
 
-	dnsAddrs := []netip.Addr{netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("8.8.8.8")}
+	dnsAddrs, err := settings.netstackDNSAddresses()
+	if err != nil {
+		return nil, err
+	}
 
 	tunDev, tnet, err := netstack.CreateNetTUN(localAddrs, dnsAddrs, mtu)
 	if err != nil {
@@ -359,7 +386,8 @@ func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgR
 		Errorf:   func(format string, args ...any) {},
 	}
 
-	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), logger)
+	bind := conn.NewDefaultBind()
+	dev := device.NewDevice(tunDev, bind, logger)
 
 	ipcString, err := settings.BuildIpcConfig()
 	if err != nil {
@@ -375,9 +403,39 @@ func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgR
 	return &AmneziaWgRunner{
 		tun:       tunDev,
 		dev:       dev,
+		bind:      bind,
 		tnet:      tnet,
 		socksPort: socksPort,
+		protector: currentAmneziaWgSocketProtector(),
 	}, nil
+}
+
+// netstackDNSAddresses validates the resolvers used for names requested over
+// the native SOCKS bridge. A public fallback here would silently bypass the
+// application's DNS policy, so callers must pass at least one raw IP address.
+func (s *AmneziaWgSettings) netstackDNSAddresses() ([]netip.Addr, error) {
+	addresses := make([]netip.Addr, 0, len(s.DNSServers))
+	seen := make(map[netip.Addr]struct{}, len(s.DNSServers))
+	for _, raw := range s.DNSServers {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		address, err := netip.ParseAddr(value)
+		if err != nil || !address.IsValid() || address.IsUnspecified() {
+			return nil, fmt.Errorf("invalid AmneziaWG DNS server %q", raw)
+		}
+		address = address.Unmap()
+		if _, exists := seen[address]; exists {
+			continue
+		}
+		seen[address] = struct{}{}
+		addresses = append(addresses, address)
+	}
+	if len(addresses) == 0 {
+		return nil, errors.New("AmneziaWG dnsServers is required")
+	}
+	return addresses, nil
 }
 
 // Start brings up the AmneziaWG device and listens on the local SOCKS5 port.
@@ -392,9 +450,14 @@ func (r *AmneziaWgRunner) Start() error {
 	if err := r.dev.Up(); err != nil {
 		return fmt.Errorf("device Up failed: %w", err)
 	}
+	if err := r.protectPeerSockets(); err != nil {
+		r.dev.Close()
+		return err
+	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", r.socksPort))
 	if err != nil {
+		r.dev.Close()
 		return fmt.Errorf("listen on socks port %d: %w", r.socksPort, err)
 	}
 	r.listener = ln
@@ -405,6 +468,42 @@ func (r *AmneziaWgRunner) Start() error {
 	r.running = true
 
 	go r.serveSocks(ctx, ln)
+	return nil
+}
+
+// protectPeerSockets asks Android to exclude the WireGuard peer sockets from
+// the VPN TUN. The sockets only exist after device.Up(). The Android app
+// requires this bridge for active VPN sessions; standalone use has no TUN.
+func (r *AmneziaWgRunner) protectPeerSockets() error {
+	if r.protector == nil {
+		// Standalone use (for example, a pre-VPN latency check) has no Android
+		// TUN to escape. The Android app enforces a registered protector before
+		// it starts this runner as part of an active VPN session.
+		return nil
+	}
+
+	peek, ok := r.bind.(conn.PeekLookAtSocketFd)
+	if !ok {
+		if runtime.GOOS == "android" {
+			return errors.New("amneziawg bind does not expose peer socket descriptors")
+		}
+		return nil
+	}
+
+	protected := 0
+	for _, getFD := range []func() (int, error){peek.PeekLookAtSocketFd4, peek.PeekLookAtSocketFd6} {
+		fd, err := getFD()
+		if err != nil || fd < 0 {
+			continue
+		}
+		if !r.protector.Protect(fd) {
+			return fmt.Errorf("VpnService.protect rejected AmneziaWG socket fd %d", fd)
+		}
+		protected++
+	}
+	if protected == 0 && runtime.GOOS == "android" {
+		return errors.New("could not protect any AmneziaWG peer sockets")
+	}
 	return nil
 }
 
@@ -476,45 +575,23 @@ func (r *AmneziaWgRunner) handleSocksConn(ctx context.Context, c net.Conn) {
 	if _, err := io.ReadFull(c, reqHeader[:]); err != nil {
 		return
 	}
-	if reqHeader[0] != 0x05 || reqHeader[1] != 0x01 { // Only CONNECT command is forwarded to TCP
-		_ = sendSocksReply(c, 0x07) // Command not supported
+	if reqHeader[0] != 0x05 {
 		return
 	}
 
-	var destAddr string
-	switch reqHeader[3] {
-	case 0x01: // IPv4
-		var ip [4]byte
-		if _, err := io.ReadFull(c, ip[:]); err != nil {
-			return
-		}
-		destAddr = net.IP(ip[:]).String()
-	case 0x03: // Domain name
-		var lenByte [1]byte
-		if _, err := io.ReadFull(c, lenByte[:]); err != nil {
-			return
-		}
-		domainBytes := make([]byte, int(lenByte[0]))
-		if _, err := io.ReadFull(c, domainBytes); err != nil {
-			return
-		}
-		destAddr = string(domainBytes)
-	case 0x04: // IPv6
-		var ip [16]byte
-		if _, err := io.ReadFull(c, ip[:]); err != nil {
-			return
-		}
-		destAddr = net.IP(ip[:]).String()
-	default:
+	destAddr, destPort, err := readSocksAddress(c, reqHeader[3])
+	if err != nil {
 		_ = sendSocksReply(c, 0x08) // Address type not supported
 		return
 	}
-
-	var portBytes [2]byte
-	if _, err := io.ReadFull(c, portBytes[:]); err != nil {
+	if reqHeader[1] == 0x03 { // UDP ASSOCIATE
+		r.handleSocksUDPAssociate(ctx, c)
 		return
 	}
-	destPort := binary.BigEndian.Uint16(portBytes[:])
+	if reqHeader[1] != 0x01 { // CONNECT
+		_ = sendSocksReply(c, 0x07) // Command not supported
+		return
+	}
 
 	// 3. Dial target via AmneziaWG netstack
 	dialCtx, dialCancel := context.WithTimeout(ctx, 15*time.Second)
@@ -526,13 +603,8 @@ func (r *AmneziaWgRunner) handleSocksConn(ctx context.Context, c net.Conn) {
 	} else {
 		addrs, err := r.tnet.LookupHost(destAddr)
 		if err != nil || len(addrs) == 0 {
-			// Fallback local lookup if netstack lookup fails
-			ips, err2 := net.LookupHost(destAddr)
-			if err2 != nil || len(ips) == 0 {
-				_ = sendSocksReply(c, 0x04) // Host unreachable
-				return
-			}
-			addrs = ips
+			_ = sendSocksReply(c, 0x04) // Host unreachable
+			return
 		}
 		ip := net.ParseIP(addrs[0])
 		if ip == nil {
@@ -571,10 +643,224 @@ func (r *AmneziaWgRunner) handleSocksConn(ctx context.Context, c net.Conn) {
 	}
 }
 
+// readSocksAddress reads an RFC 1928 address from a TCP SOCKS request.
+func readSocksAddress(r io.Reader, atyp byte) (string, uint16, error) {
+	var host string
+	switch atyp {
+	case 0x01: // IPv4
+		var ip [4]byte
+		if _, err := io.ReadFull(r, ip[:]); err != nil {
+			return "", 0, err
+		}
+		host = net.IP(ip[:]).String()
+	case 0x03: // Domain name
+		var lenByte [1]byte
+		if _, err := io.ReadFull(r, lenByte[:]); err != nil {
+			return "", 0, err
+		}
+		if lenByte[0] == 0 {
+			return "", 0, errors.New("empty SOCKS domain")
+		}
+		domainBytes := make([]byte, int(lenByte[0]))
+		if _, err := io.ReadFull(r, domainBytes); err != nil {
+			return "", 0, err
+		}
+		host = string(domainBytes)
+	case 0x04: // IPv6
+		var ip [16]byte
+		if _, err := io.ReadFull(r, ip[:]); err != nil {
+			return "", 0, err
+		}
+		host = net.IP(ip[:]).String()
+	default:
+		return "", 0, fmt.Errorf("unsupported SOCKS address type %d", atyp)
+	}
+
+	var portBytes [2]byte
+	if _, err := io.ReadFull(r, portBytes[:]); err != nil {
+		return "", 0, err
+	}
+	return host, binary.BigEndian.Uint16(portBytes[:]), nil
+}
+
 func sendSocksReply(c net.Conn, rep byte) error {
-	reply := []byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	return sendSocksReplyWithAddress(c, rep, &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+}
+
+func sendSocksReplyWithAddress(c net.Conn, rep byte, addr *net.UDPAddr) error {
+	if addr == nil {
+		addr = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	}
+	ip := addr.IP
+	reply := []byte{0x05, rep, 0x00}
+	if ip4 := ip.To4(); ip4 != nil {
+		reply = append(reply, 0x01)
+		reply = append(reply, ip4...)
+	} else if ip16 := ip.To16(); ip16 != nil {
+		reply = append(reply, 0x04)
+		reply = append(reply, ip16...)
+	} else {
+		reply = append(reply, 0x01, 0, 0, 0, 0)
+	}
+	reply = binary.BigEndian.AppendUint16(reply, uint16(addr.Port))
 	_, err := c.Write(reply)
 	return err
+}
+
+// handleSocksUDPAssociate implements SOCKS5 UDP ASSOCIATE. Xray uses this
+// path for UDP traffic (including ordinary DNS), so accepting CONNECT alone
+// would make an AmneziaWG bridge only partially functional.
+func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control net.Conn) {
+	clientUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		_ = sendSocksReply(control, 0x01)
+		return
+	}
+	defer clientUDP.Close()
+
+	tunnelUDP, err := r.tnet.ListenUDP(nil)
+	if err != nil {
+		_ = sendSocksReply(control, 0x01)
+		return
+	}
+	defer tunnelUDP.Close()
+
+	if err := sendSocksReplyWithAddress(control, 0x00, clientUDP.LocalAddr().(*net.UDPAddr)); err != nil {
+		return
+	}
+
+	var (
+		clientMu   sync.RWMutex
+		clientAddr *net.UDPAddr
+		finishOnce sync.Once
+	)
+	finished := make(chan struct{})
+	finish := func() { finishOnce.Do(func() { close(finished) }) }
+
+	// RFC 1928 binds the association to the TCP client. On Android both are
+	// loopback sockets; accepting packets from a different source would expose
+	// the tunnel to unrelated local processes.
+	var controlIP net.IP
+	if addr, ok := control.RemoteAddr().(*net.TCPAddr); ok {
+		controlIP = addr.IP
+	}
+
+	go func() {
+		_, _ = io.Copy(io.Discard, control)
+		finish()
+	}()
+	go func() {
+		<-ctx.Done()
+		finish()
+	}()
+	go func() {
+		buffer := make([]byte, 64*1024)
+		for {
+			n, source, err := clientUDP.ReadFromUDP(buffer)
+			if err != nil {
+				finish()
+				return
+			}
+			if controlIP != nil && !source.IP.Equal(controlIP) {
+				continue
+			}
+			payload, destination, err := r.parseSocksUDPDatagram(buffer[:n])
+			if err != nil {
+				continue
+			}
+
+			clientMu.Lock()
+			if clientAddr == nil {
+				clientAddr = &net.UDPAddr{IP: append(net.IP(nil), source.IP...), Port: source.Port}
+			}
+			allowedSource := clientAddr.IP.Equal(source.IP) && clientAddr.Port == source.Port
+			clientMu.Unlock()
+			if !allowedSource {
+				continue
+			}
+
+			if _, err := tunnelUDP.WriteTo(payload, destination); err != nil {
+				continue
+			}
+		}
+	}()
+	go func() {
+		buffer := make([]byte, 64*1024)
+		for {
+			n, source, err := tunnelUDP.ReadFrom(buffer)
+			if err != nil {
+				finish()
+				return
+			}
+			remote, ok := source.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+			packet := buildSocksUDPDatagram(remote, buffer[:n])
+
+			clientMu.RLock()
+			destination := clientAddr
+			clientMu.RUnlock()
+			if destination != nil {
+				_, _ = clientUDP.WriteToUDP(packet, destination)
+			}
+		}
+	}()
+
+	<-finished
+}
+
+func (r *AmneziaWgRunner) parseSocksUDPDatagram(packet []byte) ([]byte, *net.UDPAddr, error) {
+	// RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR | DST.PORT | DATA
+	if len(packet) < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
+		return nil, nil, errors.New("invalid or fragmented SOCKS UDP datagram")
+	}
+	reader := bytes.NewReader(packet[3:])
+	host, port, err := readSocksAddress(reader, packet[3])
+	if err != nil {
+		return nil, nil, err
+	}
+	consumed := len(packet[3:]) - reader.Len()
+	if consumed <= 0 || 3+consumed > len(packet) {
+		return nil, nil, errors.New("invalid SOCKS UDP destination")
+	}
+	destination, err := r.resolveTunnelUDPAddress(host, port)
+	if err != nil {
+		return nil, nil, err
+	}
+	return packet[3+consumed:], destination, nil
+}
+
+func (r *AmneziaWgRunner) resolveTunnelUDPAddress(host string, port uint16) (*net.UDPAddr, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return &net.UDPAddr{IP: ip, Port: int(port)}, nil
+	}
+	addrs, err := r.tnet.LookupHost(host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %q through AmneziaWG: %w", host, err)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("resolve %q through AmneziaWG returned no addresses", host)
+	}
+	ip := net.ParseIP(addrs[0])
+	if ip == nil {
+		return nil, fmt.Errorf("resolve %q through AmneziaWG returned invalid address", host)
+	}
+	return &net.UDPAddr{IP: ip, Port: int(port)}, nil
+}
+
+func buildSocksUDPDatagram(source *net.UDPAddr, payload []byte) []byte {
+	packet := make([]byte, 0, 3+1+len(source.IP)+2+len(payload))
+	packet = append(packet, 0, 0, 0) // RSV and FRAG
+	if ip4 := source.IP.To4(); ip4 != nil {
+		packet = append(packet, 0x01)
+		packet = append(packet, ip4...)
+	} else {
+		packet = append(packet, 0x04)
+		packet = append(packet, source.IP.To16()...)
+	}
+	packet = binary.BigEndian.AppendUint16(packet, uint16(source.Port))
+	return append(packet, payload...)
 }
 
 // RewriteWireguardOutboundToSocks rewrites wireguard/amneziawg outbounds in Xray JSON to point to a local SOCKS5 listener.

@@ -309,16 +309,17 @@ func ParseOlcRtcOptions(rawYaml string, fallbackPort int) (*OlcRtcConfigData, er
 		cfg.Socks5Pass = cfg.Socks.Pass
 	}
 
-	// Normalize DNS
+	// Normalize DNS. The runtime must never silently choose a public resolver
+	// when the embedding app supplied no resolver: that can bypass the VPN's DNS
+	// policy and makes a configuration error look like a working connection.
 	if cfg.DNS == "" && cfg.Net.DNS != "" {
 		cfg.DNS = cfg.Net.DNS
 	}
-	if cfg.DNS == "" {
-		cfg.DNS = "8.8.8.8:53"
+	normalizedDNS, err := normalizeOlcRtcDNS(cfg.DNS)
+	if err != nil {
+		return nil, err
 	}
-	if !strings.Contains(cfg.DNS, ":") {
-		cfg.DNS = net.JoinHostPort(cfg.DNS, "53")
-	}
+	cfg.DNS = normalizedDNS
 
 	// Normalize socks port
 	if cfg.Socks.Port <= 0 {
@@ -340,6 +341,30 @@ func ParseOlcRtcOptions(rawYaml string, fallbackPort int) (*OlcRtcConfigData, er
 	}
 
 	return &cfg, nil
+}
+
+// normalizeOlcRtcDNS accepts a plain DNS host or host:port. olcrtc's mobile
+// runtime expects a raw resolver endpoint, not a DoH/DoQ URL.
+func normalizeOlcRtcDNS(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("olcrtc dns is required")
+	}
+	if strings.Contains(raw, "://") {
+		return "", fmt.Errorf("olcrtc dns must be a raw host:port, got %q", raw)
+	}
+	if _, _, err := net.SplitHostPort(raw); err == nil {
+		return raw, nil
+	}
+
+	// A bare IPv6 literal needs brackets before adding the default port.
+	if ip := net.ParseIP(strings.Trim(raw, "[]")); ip != nil {
+		return net.JoinHostPort(ip.String(), "53"), nil
+	}
+	if strings.Contains(raw, ":") {
+		return "", fmt.Errorf("invalid olcrtc dns endpoint %q", raw)
+	}
+	return net.JoinHostPort(raw, "53"), nil
 }
 
 // StartOlcRtc starts the OLCRTC client runtime using openlibrecommunity/olcrtc/mobile.
@@ -442,8 +467,8 @@ func StartOlcRtc(configYaml string, socksPort int) error {
 	if err := rt.SetKey(cfg.Key); err != nil {
 		return fmt.Errorf("set key: %w", err)
 	}
-	if cfg.DNS != "" {
-		_ = rt.SetDNS(cfg.DNS)
+	if err := rt.SetDNS(cfg.DNS); err != nil {
+		return fmt.Errorf("set dns %q: %w", cfg.DNS, err)
 	}
 	if cfg.Channel != "" {
 		rt.SetChannel(cfg.Channel)

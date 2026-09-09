@@ -338,8 +338,6 @@ func TestStartLoopFailureDoesNotTouchTunFdEnv(t *testing.T) {
 	}
 }
 
-
-
 type dummySocketProtector struct {
 	protectedCount int
 }
@@ -388,6 +386,7 @@ provider: telemost
 transport: vp8channel<vp8-fps=25&vp8-batch=1>
 room: 56026201482837
 key: 30330bd1da1c7ad6e7d518e423662b3bb2b53ca1bbb65612263a494610fa73e4
+dns: 1.1.1.1:53
 socks5_listen: 127.0.0.1:10808
 `
 	cfg, err := ParseOlcRtcOptions(vp8Yaml, 10808)
@@ -411,6 +410,7 @@ provider: wbstream
 transport: seichannel<fps=60&batch=64&frag=900&ack-ms=2000>
 room: room-01
 key: 30330bd1da1c7ad6e7d518e423662b3bb2b53ca1bbb65612263a494610fa73e4
+dns: 1.1.1.1:53
 socks5_listen: 127.0.0.1:10808
 `
 	cfgSei, err := ParseOlcRtcOptions(seiYaml, 10808)
@@ -431,6 +431,7 @@ provider: telemost
 transport: videochannel<video-w=1080&video-h=1080&video-fps=60&video-codec=qrcode>
 room: room-01
 key: 30330bd1da1c7ad6e7d518e423662b3bb2b53ca1bbb65612263a494610fa73e4
+dns: 1.1.1.1:53
 socks5_listen: 127.0.0.1:10808
 `
 	cfgVideo, err := ParseOlcRtcOptions(videoYaml, 10808)
@@ -454,6 +455,7 @@ vp8:
   batch_size: 1
 room: 56026201482837
 key: 30330bd1da1c7ad6e7d518e423662b3bb2b53ca1bbb65612263a494610fa73e4
+dns: 1.1.1.1:53
 socks5_listen: 127.0.0.1:10808
 `
 	cfgBlock, err := ParseOlcRtcOptions(vp8BlockYaml, 10808)
@@ -492,6 +494,7 @@ crypto:
   key: "30330bd1da1c7ad6e7d518e423662b3bb2b53ca1bbb65612263a494610fa73e4"
 net:
   transport: vp8channel
+  dns: 1.1.1.1:53
 socks:
   host: "127.0.0.1"
   port: 10808
@@ -525,6 +528,7 @@ provider: telemost
 transport: vp8channel
 room: 56026201482837
 key: 30330bd1da1c7ad6e7d518e423662b3bb2b53ca1bbb65612263a494610fa73e4
+dns: 1.1.1.1:53
 socks5_listen: 127.0.0.1:10808
 socks5_user: flat_user
 socks5_pass: flat_pass
@@ -557,6 +561,7 @@ func TestAmneziaWgConfigAndIpc(t *testing.T) {
 		"settings": {
 			"secretKey": "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=",
 			"address": ["10.8.0.2/32"],
+			"dnsServers": ["9.9.9.9"],
 			"peers": [
 				{
 					"publicKey": "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s=",
@@ -571,6 +576,8 @@ func TestAmneziaWgConfigAndIpc(t *testing.T) {
 			"jmax": 80,
 			"s1": 20,
 			"s2": 40,
+			"s3": 60,
+			"s4": 80,
 			"h1": 11111,
 			"h2": 22222,
 			"h3": 33333,
@@ -588,8 +595,11 @@ func TestAmneziaWgConfigAndIpc(t *testing.T) {
 	if settings.Jc != 5 || settings.Jmin != 30 || settings.Jmax != 80 {
 		t.Fatalf("unexpected Jc/Jmin/Jmax: %d/%d/%d", settings.Jc, settings.Jmin, settings.Jmax)
 	}
-	if settings.S1 != 20 || settings.S2 != 40 {
-		t.Fatalf("unexpected S1/S2: %d/%d", settings.S1, settings.S2)
+	if settings.S1 != 20 || settings.S2 != 40 || settings.S3 != 60 || settings.S4 != 80 {
+		t.Fatalf("unexpected S1/S2/S3/S4: %d/%d/%d/%d", settings.S1, settings.S2, settings.S3, settings.S4)
+	}
+	if len(settings.DNSServers) != 1 || settings.DNSServers[0] != "9.9.9.9" {
+		t.Fatalf("unexpected DNS servers: %#v", settings.DNSServers)
 	}
 
 	ipc, err := settings.BuildIpcConfig()
@@ -611,6 +621,9 @@ func TestAmneziaWgConfigAndIpc(t *testing.T) {
 	if !strings.Contains(ipc, "s2=40") {
 		t.Errorf("ipc missing s2=40: %s", ipc)
 	}
+	if !strings.Contains(ipc, "s3=60") || !strings.Contains(ipc, "s4=80") {
+		t.Errorf("ipc missing s3/s4: %s", ipc)
+	}
 	if !strings.Contains(ipc, "h1=11111") {
 		t.Errorf("ipc missing h1=11111: %s", ipc)
 	}
@@ -630,9 +643,14 @@ func TestAmneziaWgConfigAndIpc(t *testing.T) {
 }
 
 func TestAmneziaWgRunnerLifecycle(t *testing.T) {
+	protector := &dummySocketProtector{}
+	SetAmneziaWgSocketProtector(protector)
+	defer SetAmneziaWgSocketProtector(nil)
+
 	awgJSON := `{
 		"secretKey": "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=",
 		"address": ["10.8.0.2/32"],
+		"dnsServers": ["1.1.1.1"],
 		"peers": [
 			{
 				"publicKey": "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s=",
@@ -664,6 +682,9 @@ func TestAmneziaWgRunnerLifecycle(t *testing.T) {
 	if runner.socksPort <= 0 {
 		t.Fatalf("expected positive socks port, got %d", runner.socksPort)
 	}
+	if protector.protectedCount == 0 {
+		t.Fatal("expected AmneziaWG peer sockets to be passed through the protector")
+	}
 
 	// SOCKS5 handshake test to verify listener is functioning
 	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", runner.socksPort))
@@ -683,3 +704,23 @@ func TestAmneziaWgRunnerLifecycle(t *testing.T) {
 	}
 }
 
+func TestAmneziaWgRequiresExplicitDNS(t *testing.T) {
+	_, err := (&AmneziaWgSettings{}).netstackDNSAddresses()
+	if err == nil || !strings.Contains(err.Error(), "dnsServers is required") {
+		t.Fatalf("expected missing DNS error, got %v", err)
+	}
+
+	_, err = (&AmneziaWgSettings{DNSServers: []string{"https://dns.example/dns-query"}}).netstackDNSAddresses()
+	if err == nil || !strings.Contains(err.Error(), "invalid AmneziaWG DNS server") {
+		t.Fatalf("expected raw-IP DNS validation error, got %v", err)
+	}
+}
+
+func TestOlcRtcRequiresRawDNS(t *testing.T) {
+	if _, err := ParseOlcRtcOptions("dns: ''", 10808); err == nil || !strings.Contains(err.Error(), "dns is required") {
+		t.Fatalf("expected required DNS error, got %v", err)
+	}
+	if _, err := ParseOlcRtcOptions("dns: 'https://dns.example/dns-query'", 10808); err == nil || !strings.Contains(err.Error(), "raw host:port") {
+		t.Fatalf("expected DoH DNS validation error, got %v", err)
+	}
+}
