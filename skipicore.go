@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"runtime/metrics"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -131,11 +132,24 @@ func unsetEnvVariable(key string) {
 
 // CoreController manages the lifecycle, stats, and real-time monitoring of an Xray-core instance.
 type CoreController struct {
-	mu           sync.Mutex
-	instance     *core.Instance
-	statsManager corestats.Manager
-	callback     CoreCallbackHandler
-	isRunning    bool
+	mu                 sync.Mutex
+	instance           *core.Instance
+	statsManager       corestats.Manager
+	trafficStatsTotals map[string]int64
+	callback           CoreCallbackHandler
+	isRunning          bool
+}
+
+// trafficStatsBytes is deliberately kept private: the mobile binding only
+// exposes the compact JSON snapshot returned by QueryTrafficStats.
+type trafficStatsBytes struct {
+	Uplink   int64 `json:"uplink"`
+	Downlink int64 `json:"downlink"`
+}
+
+type trafficStatsSnapshot struct {
+	Inbound  map[string]trafficStatsBytes `json:"inbound"`
+	Outbound map[string]trafficStatsBytes `json:"outbound"`
 }
 
 var registerConsoleLogHandlerOnce sync.Once
@@ -166,6 +180,8 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	if c.isRunning {
 		return errors.New("core instance is already running")
 	}
+	c.statsManager = nil
+	c.trafficStatsTotals = make(map[string]int64)
 
 	config, err := coreserial.LoadJSONConfig(strings.NewReader(configJSON))
 	if err != nil {
@@ -198,6 +214,7 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 
 	if err := server.Start(); err != nil {
 		c.statsManager = nil
+		c.trafficStatsTotals = nil
 		return fmt.Errorf("failed to start xray instance: %w", err)
 	}
 
@@ -224,6 +241,7 @@ func (c *CoreController) StopLoop() error {
 	err := c.instance.Close()
 	c.instance = nil
 	c.statsManager = nil
+	c.trafficStatsTotals = nil
 	c.isRunning = false
 
 	// Drop the TUN descriptor env vars so later instances (latency probes,
@@ -262,44 +280,147 @@ func (c *CoreController) MeasureDelay(targetURL string) (int64, error) {
 	return measureInstanceDelay(ctx, inst, targetURL)
 }
 
-// QueryAllOutboundTrafficStats retrieves and resets all outbound traffic counters in memory.
-// Returns a compact string: "tag,direction,value;tag,direction,value;".
+// QueryTrafficStats atomically drains Xray's in-memory counters into a
+// process-private cumulative snapshot. It never opens an Xray API listener.
+//
+// Multiple Android UI consumers may call this safely: every call receives the
+// same totals accumulated since this CoreController was started, rather than
+// stealing a delta from another consumer.
+func (c *CoreController) QueryTrafficStats() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	snapshot := c.collectTrafficStatsLocked()
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return emptyTrafficStatsSnapshotJSON
+	}
+	return string(encoded)
+}
+
+// QueryAllOutboundTrafficStats is retained for binary compatibility with
+// older callers. New callers should use QueryTrafficStats, which includes
+// inbound counters and is safe for concurrent readers.
+// It retains the legacy delta semantics: each reported counter is reset after
+// it is read. Returns a compact string: "tag,direction,value;tag,direction,value;".
 func (c *CoreController) QueryAllOutboundTrafficStats() string {
 	c.mu.Lock()
-	sm := c.statsManager
-	c.mu.Unlock()
+	defer c.mu.Unlock()
 
-	if sm == nil {
-		return ""
-	}
-
-	// Called roughly once per second by the traffic stats service, so keep it
-	// allocation-light: a single pre-sized buffer, no intermediate slices.
+	snapshot := trafficStatsSnapshotFromTotals(c.drainTrafficStatsLocked())
 	var b strings.Builder
 	b.Grow(512)
-	sm.VisitCounters(func(name string, counter corestats.Counter) bool {
-		parts := strings.Split(name, ">>>")
-		if len(parts) != 4 || parts[0] != "outbound" || parts[2] != "traffic" {
-			return true
+	for _, tag := range sortedTrafficStatTags(snapshot.Outbound) {
+		bytes := snapshot.Outbound[tag]
+		for _, entry := range []struct {
+			direction string
+			value     int64
+		}{
+			{direction: "uplink", value: bytes.Uplink},
+			{direction: "downlink", value: bytes.Downlink},
+		} {
+			if entry.value <= 0 {
+				continue
+			}
+			b.WriteString(tag)
+			b.WriteByte(',')
+			b.WriteString(entry.direction)
+			b.WriteByte(',')
+			b.WriteString(strconv.FormatInt(entry.value, 10))
+			b.WriteByte(';')
 		}
-
-		tag := parts[1]
-		direct := parts[3]
-		value := counter.Set(0)
-		if value <= 0 {
-			return true
-		}
-
-		b.WriteString(tag)
-		b.WriteByte(',')
-		b.WriteString(direct)
-		b.WriteByte(',')
-		b.WriteString(strconv.FormatInt(value, 10))
-		b.WriteByte(';')
-		return true
-	})
+	}
 	return b.String()
 }
+
+func (c *CoreController) collectTrafficStatsLocked() trafficStatsSnapshot {
+	c.drainTrafficStatsLocked()
+	return trafficStatsSnapshotFromTotals(c.trafficStatsTotals)
+}
+
+// drainTrafficStatsLocked moves the new Xray counter values into the
+// cumulative process-private totals and returns just this drain's deltas. The
+// caller must hold c.mu.
+func (c *CoreController) drainTrafficStatsLocked() map[string]int64 {
+	deltas := make(map[string]int64)
+	if c.statsManager == nil {
+		return deltas
+	}
+	if c.trafficStatsTotals == nil {
+		c.trafficStatsTotals = make(map[string]int64)
+	}
+
+	c.statsManager.VisitCounters(func(name string, counter corestats.Counter) bool {
+		if !isTrafficStatCounter(name) {
+			return true
+		}
+		if value := counter.Set(0); value > 0 {
+			c.trafficStatsTotals[name] += value
+			deltas[name] = value
+		}
+		return true
+	})
+	return deltas
+}
+
+func trafficStatsSnapshotFromTotals(totals map[string]int64) trafficStatsSnapshot {
+	snapshot := newTrafficStatsSnapshot()
+	for name, value := range totals {
+		if value <= 0 {
+			continue
+		}
+		kind, tag, direction, ok := parseTrafficStatCounterName(name)
+		if !ok {
+			continue
+		}
+		stats := snapshot.Outbound
+		if kind == "inbound" {
+			stats = snapshot.Inbound
+		}
+		bytes := stats[tag]
+		if direction == "uplink" {
+			bytes.Uplink += value
+		} else {
+			bytes.Downlink += value
+		}
+		stats[tag] = bytes
+	}
+	return snapshot
+}
+
+func newTrafficStatsSnapshot() trafficStatsSnapshot {
+	return trafficStatsSnapshot{
+		Inbound:  make(map[string]trafficStatsBytes),
+		Outbound: make(map[string]trafficStatsBytes),
+	}
+}
+
+func isTrafficStatCounter(name string) bool {
+	_, _, _, ok := parseTrafficStatCounterName(name)
+	return ok
+}
+
+func parseTrafficStatCounterName(name string) (kind, tag, direction string, ok bool) {
+	parts := strings.Split(name, ">>>")
+	if len(parts) != 4 || (parts[0] != "inbound" && parts[0] != "outbound") || parts[2] != "traffic" {
+		return "", "", "", false
+	}
+	if parts[1] == "" || (parts[3] != "uplink" && parts[3] != "downlink") {
+		return "", "", "", false
+	}
+	return parts[0], parts[1], parts[3], true
+}
+
+func sortedTrafficStatTags(stats map[string]trafficStatsBytes) []string {
+	tags := make([]string, 0, len(stats))
+	for tag := range stats {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	return tags
+}
+
+const emptyTrafficStatsSnapshotJSON = `{"inbound":{},"outbound":{}}`
 
 // InitCoreEnv configures environment variables (assets and certificate path) and sets up
 // the fallback file reader to directly read assets from Android APK if missing on disk.
@@ -627,11 +748,11 @@ func ReadMemoryStats() string {
 
 func readMemoryStatsFromMetrics() *MemoryStats {
 	samples := []metrics.Sample{
-		{Name: "/memory/classes/heap/objects:bytes"}, // live heap objects -> AllocBytes
-		{Name: "/gc/heap/allocs:bytes"},              // cumulative allocated  -> TotalAlloc
-		{Name: "/memory/classes/total:bytes"},        // total runtime memory   -> SysBytes
-		{Name: "/memory/classes/heap/free:bytes"},    // idle, not yet returned -> HeapIdle part
-		{Name: "/memory/classes/heap/released:bytes"},// returned to the OS     -> HeapReleased
+		{Name: "/memory/classes/heap/objects:bytes"},  // live heap objects -> AllocBytes
+		{Name: "/gc/heap/allocs:bytes"},               // cumulative allocated  -> TotalAlloc
+		{Name: "/memory/classes/total:bytes"},         // total runtime memory   -> SysBytes
+		{Name: "/memory/classes/heap/free:bytes"},     // idle, not yet returned -> HeapIdle part
+		{Name: "/memory/classes/heap/released:bytes"}, // returned to the OS     -> HeapReleased
 		{Name: "/gc/cycles:gc-cycles"},
 		{Name: "/sched/goroutines:goroutines"},
 	}
@@ -824,5 +945,3 @@ func FastSelectBestOutbound(configJSON string, candidateTags string, probeURL st
 	}
 	return candidates[0]
 }
-
-
