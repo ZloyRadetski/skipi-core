@@ -1,6 +1,7 @@
 package skipicore
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"runtime"
 	"strings"
@@ -753,6 +755,85 @@ func TestAmneziaWgRequiresExplicitDNS(t *testing.T) {
 	_, err = (&AmneziaWgSettings{DNSServers: []string{"https://dns.example/dns-query"}}).netstackDNSAddresses()
 	if err == nil || !strings.Contains(err.Error(), "invalid AmneziaWG DNS server") {
 		t.Fatalf("expected raw-IP DNS validation error, got %v", err)
+	}
+}
+
+func TestAmneziaWgSupportsHeaderRangesAndObfuscationChains(t *testing.T) {
+	settings := &AmneziaWgSettings{
+		SecretKey:  "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=",
+		DNSServers: []string{"9.9.9.9"},
+		Jc:         9,
+		Jmin:       30,
+		Jmax:       90,
+		S1:         110,
+		S2:         120,
+		S3:         47,
+		S4:         23,
+		H1:         "7291435-486117520",
+		H2:         "602843917-1157629843",
+		H3:         "1249871566-1680354947",
+		H4:         "1781926002-2106438100",
+		I1:         "<b 0x0003><r 2><b 0x2112A442><r 12><r 20>",
+		I2:         "<b 0x0103><r 2><b 0x2112A442><r 12><r 24>",
+		I3:         "<b 0x0008><r 2><b 0x2112A442><r 12><r 16>",
+		Peers: []*AmneziaWgPeer{{
+			PublicKey:  "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s=",
+			Endpoint:   "198.51.100.2:50125",
+			AllowedIPs: []string{"0.0.0.0/0", "::/0"},
+		}},
+	}
+
+	if err := settings.validateNativeRunnerCompatibility(); err != nil {
+		t.Fatalf("valid AmneziaWG ranges/chains were rejected: %v", err)
+	}
+	if !settings.HasAmneziaParams() {
+		t.Fatal("expected I/H settings to count as AmneziaWG parameters")
+	}
+	ipc, err := settings.BuildIpcConfig()
+	if err != nil {
+		t.Fatalf("BuildIpcConfig failed: %v", err)
+	}
+	for _, expected := range []string{
+		"h1=7291435-486117520",
+		"h4=1781926002-2106438100",
+		"i1=<b 0x0003><r 2><b 0x2112A442><r 12><r 20>",
+		"i3=<b 0x0008><r 2><b 0x2112A442><r 12><r 16>",
+	} {
+		if !strings.Contains(ipc, expected) {
+			t.Errorf("IPC config is missing %q: %s", expected, ipc)
+		}
+	}
+}
+
+func TestAmneziaWgRejectsUnsafeJunkCountBeforeRunnerStartup(t *testing.T) {
+	settings := &AmneziaWgSettings{
+		Jc: 129,
+		Peers: []*AmneziaWgPeer{{
+			Endpoint: "198.51.100.2:51820",
+		}},
+	}
+
+	err := settings.validateNativeRunnerCompatibility()
+	if err == nil || !strings.Contains(err.Error(), "jc") {
+		t.Fatalf("expected unsafe jc to be rejected, got %v", err)
+	}
+}
+
+func TestResolveAmneziaWgEndpointPrefersIPv4Literal(t *testing.T) {
+	endpoint, err := resolveAmneziaWgEndpoint("relay.example:50125", func(_ context.Context, host string) ([]netip.Addr, error) {
+		if host != "relay.example" {
+			t.Fatalf("unexpected lookup host %q", host)
+		}
+		return []netip.Addr{
+			netip.MustParseAddr("2001:db8::10"),
+			netip.MustParseAddr("198.51.100.25"),
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("resolveAmneziaWgEndpoint failed: %v", err)
+	}
+	if endpoint != "198.51.100.25:50125" {
+		t.Fatalf("unexpected resolved endpoint %q", endpoint)
 	}
 }
 

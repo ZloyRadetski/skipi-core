@@ -47,17 +47,22 @@ type AmneziaWgSettings struct {
 	DNSServers []string `json:"dnsServers"`
 
 	// AmneziaWG specific fields:
-	Jc   int `json:"jc"`
-	Jmin int `json:"jmin"`
-	Jmax int `json:"jmax"`
-	S1   int `json:"s1"`
-	S2   int `json:"s2"`
-	S3   int `json:"s3"`
-	S4   int `json:"s4"`
-	H1   any `json:"h1"`
-	H2   any `json:"h2"`
-	H3   any `json:"h3"`
-	H4   any `json:"h4"`
+	Jc   int    `json:"jc"`
+	Jmin int    `json:"jmin"`
+	Jmax int    `json:"jmax"`
+	S1   int    `json:"s1"`
+	S2   int    `json:"s2"`
+	S3   int    `json:"s3"`
+	S4   int    `json:"s4"`
+	H1   any    `json:"h1"`
+	H2   any    `json:"h2"`
+	H3   any    `json:"h3"`
+	H4   any    `json:"h4"`
+	I1   string `json:"i1"`
+	I2   string `json:"i2"`
+	I3   string `json:"i3"`
+	I4   string `json:"i4"`
+	I5   string `json:"i5"`
 }
 
 // HasAmneziaParams returns true if any AmneziaWG obfuscation parameter is configured.
@@ -76,6 +81,11 @@ func (s *AmneziaWgSettings) HasAmneziaParams() bool {
 	}
 	if stringVal(s.H4) != "" && stringVal(s.H4) != "0" {
 		return true
+	}
+	for _, spec := range []string{s.I1, s.I2, s.I3, s.I4, s.I5} {
+		if strings.TrimSpace(spec) != "" {
+			return true
+		}
 	}
 	return false
 }
@@ -96,6 +106,218 @@ func stringVal(v any) string {
 	default:
 		return fmt.Sprintf("%v", v)
 	}
+}
+
+const (
+	amneziaWgMaxJunkCount             = 128
+	amneziaWgMaxJunkOrPaddingSize     = 1280
+	amneziaWgMaxObfuscationChainBytes = 4096
+	amneziaWgEndpointLookupTimeout    = 3 * time.Second
+)
+
+// validateNativeRunnerCompatibility rejects values which the upstream AWG
+// runtime cannot safely recover from. In particular, jc above 128 has caused
+// an Android Go-runtime abort rather than a normal configuration error.
+func (s *AmneziaWgSettings) validateNativeRunnerCompatibility() error {
+	if s == nil {
+		return errors.New("AmneziaWG settings are required")
+	}
+	if s.Jc < 0 || s.Jc > amneziaWgMaxJunkCount {
+		return fmt.Errorf("AmneziaWG jc must be between 0 and %d", amneziaWgMaxJunkCount)
+	}
+	for _, value := range []struct {
+		name  string
+		value int
+	}{
+		{"jmin", s.Jmin},
+		{"jmax", s.Jmax},
+		{"s1", s.S1},
+		{"s2", s.S2},
+		{"s3", s.S3},
+		{"s4", s.S4},
+	} {
+		if value.value < 0 || value.value > amneziaWgMaxJunkOrPaddingSize {
+			return fmt.Errorf("AmneziaWG %s must be between 0 and %d", value.name, amneziaWgMaxJunkOrPaddingSize)
+		}
+	}
+	if s.Jmin > 0 && s.Jmax > 0 && s.Jmin > s.Jmax {
+		return errors.New("AmneziaWG jmin must not be greater than jmax")
+	}
+	for _, value := range []struct {
+		name  string
+		value any
+	}{
+		{"H1", s.H1},
+		{"H2", s.H2},
+		{"H3", s.H3},
+		{"H4", s.H4},
+	} {
+		if err := validateAmneziaWgHeaderRange(value.name, stringVal(value.value)); err != nil {
+			return err
+		}
+	}
+	for _, value := range []struct {
+		name  string
+		value string
+	}{
+		{"I1", s.I1},
+		{"I2", s.I2},
+		{"I3", s.I3},
+		{"I4", s.I4},
+		{"I5", s.I5},
+	} {
+		if err := validateAmneziaWgObfuscationChain(value.name, value.value); err != nil {
+			return err
+		}
+	}
+	if len(s.Peers) == 0 {
+		return errors.New("AmneziaWG requires a peer")
+	}
+	for index, peer := range s.Peers {
+		if peer == nil {
+			return fmt.Errorf("AmneziaWG peer %d is missing", index)
+		}
+	}
+	return nil
+}
+
+func validateAmneziaWgHeaderRange(name, value string) error {
+	if value == "" || value == "0" {
+		return nil
+	}
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf("AmneziaWG %s must not contain surrounding whitespace", name)
+	}
+	parts := strings.Split(value, "-")
+	if len(parts) < 1 || len(parts) > 2 || parts[0] == "" || (len(parts) == 2 && parts[1] == "") {
+		return fmt.Errorf("AmneziaWG %s must be a uint32 or uint32 range", name)
+	}
+	lower, err := strconv.ParseUint(parts[0], 10, 32)
+	if err != nil {
+		return fmt.Errorf("AmneziaWG %s has an invalid lower bound: %w", name, err)
+	}
+	upper := lower
+	if len(parts) == 2 {
+		upper, err = strconv.ParseUint(parts[1], 10, 32)
+		if err != nil {
+			return fmt.Errorf("AmneziaWG %s has an invalid upper bound: %w", name, err)
+		}
+	}
+	if upper < lower {
+		return fmt.Errorf("AmneziaWG %s range is descending", name)
+	}
+	return nil
+}
+
+func validateAmneziaWgObfuscationChain(name, spec string) error {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil
+	}
+	if len(spec) > amneziaWgMaxObfuscationChainBytes {
+		return fmt.Errorf("AmneziaWG %s chain is too large", name)
+	}
+	remaining := spec
+	totalFixedBytes := 0
+	for remaining != "" {
+		if !strings.HasPrefix(remaining, "<") {
+			return fmt.Errorf("AmneziaWG %s chain has text outside a tag", name)
+		}
+		end := strings.IndexByte(remaining, '>')
+		if end < 0 {
+			return fmt.Errorf("AmneziaWG %s chain has an unterminated tag", name)
+		}
+		parts := strings.Fields(remaining[1:end])
+		if len(parts) == 0 || len(parts) > 2 {
+			return fmt.Errorf("AmneziaWG %s chain has an invalid tag", name)
+		}
+		kind := parts[0]
+		argument := ""
+		if len(parts) == 2 {
+			argument = parts[1]
+		}
+		switch kind {
+		case "b":
+			bytesText := strings.TrimPrefix(argument, "0x")
+			if argument == "" || bytesText == "" || len(bytesText)%2 != 0 {
+				return fmt.Errorf("AmneziaWG %s chain has an invalid byte tag", name)
+			}
+			if _, err := hex.DecodeString(bytesText); err != nil {
+				return fmt.Errorf("AmneziaWG %s chain has an invalid byte tag: %w", name, err)
+			}
+			totalFixedBytes += len(bytesText) / 2
+		case "r", "rc", "rd", "dz":
+			length, err := strconv.ParseUint(argument, 10, 16)
+			if err != nil || length > amneziaWgMaxObfuscationChainBytes {
+				return fmt.Errorf("AmneziaWG %s chain has an invalid %s length", name, kind)
+			}
+			totalFixedBytes += int(length)
+		case "t", "d", "ds":
+			if argument != "" {
+				return fmt.Errorf("AmneziaWG %s chain tag <%s> must not have an argument", name, kind)
+			}
+		default:
+			return fmt.Errorf("AmneziaWG %s chain has unsupported tag <%s>", name, kind)
+		}
+		if totalFixedBytes > amneziaWgMaxObfuscationChainBytes {
+			return fmt.Errorf("AmneziaWG %s chain is too large", name)
+		}
+		remaining = remaining[end+1:]
+	}
+	return nil
+}
+
+func (s *AmneziaWgSettings) resolvePeerEndpoints() error {
+	for index, peer := range s.Peers {
+		endpoint, err := resolveAmneziaWgEndpoint(peer.Endpoint, func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		})
+		if err != nil {
+			return fmt.Errorf("resolve AmneziaWG peer %d endpoint: %w", index, err)
+		}
+		peer.Endpoint = endpoint
+	}
+	return nil
+}
+
+func resolveAmneziaWgEndpoint(
+	raw string,
+	lookup func(context.Context, string) ([]netip.Addr, error),
+) (string, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(raw))
+	if err != nil || strings.TrimSpace(host) == "" {
+		return "", fmt.Errorf("invalid endpoint %q", raw)
+	}
+	portValue, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || portValue == 0 {
+		return "", fmt.Errorf("invalid endpoint port in %q", raw)
+	}
+	if address, err := netip.ParseAddr(host); err == nil && address.IsValid() && !address.IsUnspecified() {
+		return net.JoinHostPort(address.Unmap().String(), port), nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), amneziaWgEndpointLookupTimeout)
+	defer cancel()
+	addresses, err := lookup(ctx, host)
+	if err != nil {
+		return "", fmt.Errorf("lookup %q: %w", host, err)
+	}
+	var firstIPv6 netip.Addr
+	for _, address := range addresses {
+		address = address.Unmap()
+		if !address.IsValid() || address.IsUnspecified() {
+			continue
+		}
+		if address.Is4() {
+			return net.JoinHostPort(address.String(), port), nil
+		}
+		if !firstIPv6.IsValid() {
+			firstIPv6 = address
+		}
+	}
+	if firstIPv6.IsValid() {
+		return net.JoinHostPort(firstIPv6.String(), port), nil
+	}
+	return "", fmt.Errorf("lookup %q returned no usable IP addresses", host)
 }
 
 // decodeKeyToHex normalizes a WireGuard key from Base64 or Hex to 32-byte Hex.
@@ -171,7 +393,16 @@ func (s *AmneziaWgSettings) BuildIpcConfig() (string, error) {
 		b.WriteString("h4=" + h4 + "\n")
 	}
 
+	for index, spec := range []string{s.I1, s.I2, s.I3, s.I4, s.I5} {
+		if spec = strings.TrimSpace(spec); spec != "" {
+			b.WriteString(fmt.Sprintf("i%d=%s\n", index+1, spec))
+		}
+	}
+
 	for _, peer := range s.Peers {
+		if peer == nil {
+			return "", errors.New("AmneziaWG peer is missing")
+		}
 		pubHex, err := decodeKeyToHex(peer.PublicKey)
 		if err != nil {
 			return "", fmt.Errorf("invalid peer public key: %w", err)
@@ -341,6 +572,14 @@ func IsAmneziaWgRunning() bool {
 func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgRunner, error) {
 	if socksPort <= 0 {
 		socksPort = 10809
+	}
+	if err := settings.validateNativeRunnerCompatibility(); err != nil {
+		return nil, err
+	}
+	// The UAPI endpoint parser accepts address literals only. Resolve a domain
+	// before IpcSet rather than passing an opaque hostname through to it.
+	if err := settings.resolvePeerEndpoints(); err != nil {
+		return nil, err
 	}
 
 	var localAddrs []netip.Addr

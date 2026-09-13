@@ -10,8 +10,12 @@
 ```bash
 go install golang.org/x/mobile/cmd/gomobile@latest
 gomobile init
-gomobile bind -target=android -androidapi 24 -javapkg=app.skipi.core -o skipicore.aar .
+# github.com/wlynxg/anet requires this linker flag with Go 1.23+.
+gomobile bind -target=android -androidapi 24 -javapkg=app.skipi.core -ldflags=-checklinkname=0 -o skipicore.aar .
 ```
+
+In PowerShell, quote `'-javapkg=app.skipi.core'` so the dotted Java package
+prefix is passed to `gomobile` as one argument.
 
 ---
 
