@@ -535,16 +535,17 @@ func (s *AmneziaWgSettings) BuildIpcConfig() (string, error) {
 
 // AmneziaWgRunner manages the lifecycle of an AmneziaWG netstack tunnel with a local SOCKS5 listener.
 type AmneziaWgRunner struct {
-	mu        sync.Mutex
-	tun       tun.Device
-	dev       *device.Device
-	bind      conn.Bind
-	tnet      *netstack.Net
-	listener  net.Listener
-	socksPort int
-	running   bool
-	cancel    context.CancelFunc
-	protector SocketProtector
+	mu         sync.Mutex
+	tun        tun.Device
+	dev        *device.Device
+	bind       conn.Bind
+	tnet       *netstack.Net
+	localAddrs []netip.Addr
+	listener   net.Listener
+	socksPort  int
+	running    bool
+	cancel     context.CancelFunc
+	protector  SocketProtector
 }
 
 var (
@@ -736,12 +737,13 @@ func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgR
 	}
 
 	return &AmneziaWgRunner{
-		tun:       tunDev,
-		dev:       dev,
-		bind:      bind,
-		tnet:      tnet,
-		socksPort: socksPort,
-		protector: currentAmneziaWgSocketProtector(),
+		tun:        tunDev,
+		dev:        dev,
+		bind:       bind,
+		tnet:       tnet,
+		localAddrs: append([]netip.Addr(nil), localAddrs...),
+		socksPort:  socksPort,
+		protector:  currentAmneziaWgSocketProtector(),
 	}, nil
 }
 
@@ -1053,24 +1055,28 @@ func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control n
 	}
 	defer clientUDP.Close()
 
-	tunnelUDP, err := r.tnet.ListenUDP(nil)
-	if err != nil {
-		_ = sendSocksReply(control, 0x01)
-		return
-	}
-	defer tunnelUDP.Close()
-
 	if err := sendSocksReplyWithAddress(control, 0x00, clientUDP.LocalAddr().(*net.UDPAddr)); err != nil {
 		return
 	}
 
 	var (
-		clientMu   sync.RWMutex
-		clientAddr *net.UDPAddr
-		finishOnce sync.Once
+		clientMu      sync.RWMutex
+		clientAddr    *net.UDPAddr
+		tunnelMu      sync.Mutex
+		tunnelUDPs    = make(map[string]net.PacketConn)
+		tunnelsClosed bool
+		finishOnce    sync.Once
 	)
 	finished := make(chan struct{})
 	finish := func() { finishOnce.Do(func() { close(finished) }) }
+	defer func() {
+		tunnelMu.Lock()
+		defer tunnelMu.Unlock()
+		tunnelsClosed = true
+		for _, tunnelUDP := range tunnelUDPs {
+			_ = tunnelUDP.Close()
+		}
+	}()
 
 	// RFC 1928 binds the association to the TCP client. On Android both are
 	// loopback sockets; accepting packets from a different source would expose
@@ -1088,6 +1094,56 @@ func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control n
 		<-ctx.Done()
 		finish()
 	}()
+
+	startTunnelResponseLoop := func(tunnelUDP net.PacketConn) {
+		go func() {
+			buffer := make([]byte, 64*1024)
+			for {
+				n, source, err := tunnelUDP.ReadFrom(buffer)
+				if err != nil {
+					finish()
+					return
+				}
+				remote, ok := source.(*net.UDPAddr)
+				if !ok {
+					continue
+				}
+				packet := buildSocksUDPDatagram(remote, buffer[:n])
+
+				clientMu.RLock()
+				destination := clientAddr
+				clientMu.RUnlock()
+				if destination != nil {
+					_, _ = clientUDP.WriteToUDP(packet, destination)
+				}
+			}
+		}()
+	}
+
+	tunnelFor := func(destination *net.UDPAddr) (net.PacketConn, error) {
+		bindAddress, family, err := amneziaWgUDPBindAddress(destination, r.localAddrs)
+		if err != nil {
+			return nil, err
+		}
+
+		tunnelMu.Lock()
+		defer tunnelMu.Unlock()
+		if tunnelsClosed {
+			return nil, net.ErrClosed
+		}
+		if tunnelUDP := tunnelUDPs[family]; tunnelUDP != nil {
+			return tunnelUDP, nil
+		}
+
+		tunnelUDP, err := r.tnet.ListenUDP(bindAddress)
+		if err != nil {
+			return nil, err
+		}
+		tunnelUDPs[family] = tunnelUDP
+		startTunnelResponseLoop(tunnelUDP)
+		return tunnelUDP, nil
+	}
+
 	go func() {
 		buffer := make([]byte, 64*1024)
 		for {
@@ -1100,6 +1156,10 @@ func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control n
 				continue
 			}
 			payload, destination, err := r.parseSocksUDPDatagram(buffer[:n])
+			if err != nil {
+				continue
+			}
+			tunnelUDP, err := tunnelFor(destination)
 			if err != nil {
 				continue
 			}
@@ -1119,30 +1179,37 @@ func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control n
 			}
 		}
 	}()
-	go func() {
-		buffer := make([]byte, 64*1024)
-		for {
-			n, source, err := tunnelUDP.ReadFrom(buffer)
-			if err != nil {
-				finish()
-				return
-			}
-			remote, ok := source.(*net.UDPAddr)
-			if !ok {
-				continue
-			}
-			packet := buildSocksUDPDatagram(remote, buffer[:n])
-
-			clientMu.RLock()
-			destination := clientAddr
-			clientMu.RUnlock()
-			if destination != nil {
-				_, _ = clientUDP.WriteToUDP(packet, destination)
-			}
-		}
-	}()
 
 	<-finished
+}
+
+// amneziaWgUDPBindAddress selects the configured local address matching the
+// destination family before creating a netstack UDP endpoint. Passing nil to
+// amneziawg-go's ListenUDP leaves gVisor with protocol number 0, which panics
+// the whole Android process on the first UDP ASSOCIATE packet. An IPv6 wildcard
+// is also not accepted by this netstack, so use the explicit tunnel address.
+func amneziaWgUDPBindAddress(destination *net.UDPAddr, localAddrs []netip.Addr) (*net.UDPAddr, string, error) {
+	if destination == nil || len(destination.IP) == 0 {
+		return nil, "", errors.New("missing UDP destination")
+	}
+
+	isIPv4 := destination.IP.To4() != nil
+	if !isIPv4 && destination.IP.To16() == nil {
+		return nil, "", errors.New("invalid UDP destination IP")
+	}
+
+	family := "ipv6"
+	if isIPv4 {
+		family = "ipv4"
+	}
+	for _, localAddr := range localAddrs {
+		localAddr = localAddr.Unmap()
+		if !localAddr.IsValid() || localAddr.IsUnspecified() || localAddr.Is4() != isIPv4 {
+			continue
+		}
+		return &net.UDPAddr{IP: append(net.IP(nil), localAddr.AsSlice()...), Port: 0}, family, nil
+	}
+	return nil, "", fmt.Errorf("no local AmneziaWG %s address configured for UDP", family)
 }
 
 func (r *AmneziaWgRunner) parseSocksUDPDatagram(packet []byte) ([]byte, *net.UDPAddr, error) {
