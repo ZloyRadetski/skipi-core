@@ -837,6 +837,38 @@ func TestResolveAmneziaWgEndpointPrefersIPv4Literal(t *testing.T) {
 	}
 }
 
+func TestAmneziaWgEndpointLookupFallsBackToConfiguredDNS(t *testing.T) {
+	systemLookups := 0
+	configuredDNSLookups := 0
+	addresses, err := lookupAmneziaWgHostWithFallback(
+		context.Background(),
+		"relay.example",
+		func(_ context.Context, host string) ([]netip.Addr, error) {
+			systemLookups++
+			if host != "relay.example" {
+				t.Fatalf("unexpected system lookup host %q", host)
+			}
+			return nil, fmt.Errorf("system resolver unavailable")
+		},
+		func(_ context.Context, host string) ([]netip.Addr, error) {
+			configuredDNSLookups++
+			if host != "relay.example" {
+				t.Fatalf("unexpected configured DNS lookup host %q", host)
+			}
+			return []netip.Addr{netip.MustParseAddr("198.51.100.25")}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("configured DNS fallback failed: %v", err)
+	}
+	if systemLookups != 1 || configuredDNSLookups != 1 {
+		t.Fatalf("expected one system and one configured DNS lookup, got system=%d configured=%d", systemLookups, configuredDNSLookups)
+	}
+	if len(addresses) != 1 || addresses[0].String() != "198.51.100.25" {
+		t.Fatalf("unexpected fallback addresses %v", addresses)
+	}
+}
+
 func TestOlcRtcRequiresRawDNS(t *testing.T) {
 	if _, err := ParseOlcRtcOptions("dns: ''", 10808); err == nil || !strings.Contains(err.Error(), "dns is required") {
 		t.Fatalf("expected required DNS error, got %v", err)

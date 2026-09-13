@@ -109,10 +109,12 @@ func stringVal(v any) string {
 }
 
 const (
-	amneziaWgMaxJunkCount             = 128
-	amneziaWgMaxJunkOrPaddingSize     = 1280
-	amneziaWgMaxObfuscationChainBytes = 4096
-	amneziaWgEndpointLookupTimeout    = 3 * time.Second
+	amneziaWgMaxJunkCount               = 128
+	amneziaWgMaxJunkOrPaddingSize       = 1280
+	amneziaWgMaxObfuscationChainBytes   = 4096
+	amneziaWgEndpointLookupTimeout      = 3 * time.Second
+	amneziaWgSystemDNSLookupTimeout     = time.Second
+	amneziaWgConfiguredDNSLookupTimeout = time.Second
 )
 
 // validateNativeRunnerCompatibility rejects values which the upstream AWG
@@ -267,10 +269,22 @@ func validateAmneziaWgObfuscationChain(name, spec string) error {
 	return nil
 }
 
-func (s *AmneziaWgSettings) resolvePeerEndpoints() error {
+func (s *AmneziaWgSettings) resolvePeerEndpoints(dnsServers []netip.Addr) error {
 	for index, peer := range s.Peers {
+		if peer == nil {
+			return fmt.Errorf("AmneziaWG peer %d is missing", index)
+		}
 		endpoint, err := resolveAmneziaWgEndpoint(peer.Endpoint, func(ctx context.Context, host string) ([]netip.Addr, error) {
-			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			return lookupAmneziaWgHostWithFallback(
+				ctx,
+				host,
+				func(systemCtx context.Context, lookupHost string) ([]netip.Addr, error) {
+					return net.DefaultResolver.LookupNetIP(systemCtx, "ip", lookupHost)
+				},
+				func(configuredDnsCtx context.Context, lookupHost string) ([]netip.Addr, error) {
+					return lookupAmneziaWgHostWithConfiguredDNS(configuredDnsCtx, lookupHost, dnsServers)
+				},
+			)
 		})
 		if err != nil {
 			return fmt.Errorf("resolve AmneziaWG peer %d endpoint: %w", index, err)
@@ -278,6 +292,89 @@ func (s *AmneziaWgSettings) resolvePeerEndpoints() error {
 		peer.Endpoint = endpoint
 	}
 	return nil
+}
+
+type amneziaWgHostLookup func(context.Context, string) ([]netip.Addr, error)
+
+// lookupAmneziaWgHostWithFallback gives Android's resolver a short first
+// chance, then queries the raw DNS addresses configured for the AWG netstack.
+// This matters on networks whose system resolver censors or cannot reach an
+// otherwise valid peer hostname. The caller's deadline still bounds both
+// attempts together.
+func lookupAmneziaWgHostWithFallback(
+	ctx context.Context,
+	host string,
+	systemLookup amneziaWgHostLookup,
+	configuredDNSLookup amneziaWgHostLookup,
+) ([]netip.Addr, error) {
+	systemCtx, cancelSystemLookup := context.WithTimeout(ctx, amneziaWgSystemDNSLookupTimeout)
+	systemAddresses, systemErr := systemLookup(systemCtx, host)
+	cancelSystemLookup()
+	if usable := usableAmneziaWgAddresses(systemAddresses); len(usable) > 0 {
+		return usable, nil
+	}
+	if systemErr == nil {
+		systemErr = errors.New("returned no usable IP addresses")
+	}
+
+	configuredAddresses, configuredErr := configuredDNSLookup(ctx, host)
+	if usable := usableAmneziaWgAddresses(configuredAddresses); len(usable) > 0 {
+		return usable, nil
+	}
+	if configuredErr == nil {
+		configuredErr = errors.New("returned no usable IP addresses")
+	}
+	return nil, fmt.Errorf("system DNS: %w; configured DNS: %w", systemErr, configuredErr)
+}
+
+func lookupAmneziaWgHostWithConfiguredDNS(
+	ctx context.Context,
+	host string,
+	dnsServers []netip.Addr,
+) ([]netip.Addr, error) {
+	var lookupErrors []error
+	for _, server := range dnsServers {
+		server = server.Unmap()
+		if !server.IsValid() || server.IsUnspecified() {
+			continue
+		}
+		resolverAddress := net.JoinHostPort(server.String(), "53")
+		resolver := &net.Resolver{
+			PreferGo:     true,
+			StrictErrors: true,
+			Dial: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(dialCtx, network, resolverAddress)
+			},
+		}
+		lookupCtx, cancelLookup := context.WithTimeout(ctx, amneziaWgConfiguredDNSLookupTimeout)
+		addresses, err := resolver.LookupNetIP(lookupCtx, "ip", host)
+		cancelLookup()
+		if usable := usableAmneziaWgAddresses(addresses); len(usable) > 0 {
+			return usable, nil
+		}
+		if err == nil {
+			err = errors.New("returned no usable IP addresses")
+		}
+		lookupErrors = append(lookupErrors, fmt.Errorf("%s: %w", server, err))
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if len(lookupErrors) == 0 {
+		return nil, errors.New("no usable configured DNS servers")
+	}
+	return nil, errors.Join(lookupErrors...)
+}
+
+func usableAmneziaWgAddresses(addresses []netip.Addr) []netip.Addr {
+	usable := make([]netip.Addr, 0, len(addresses))
+	for _, address := range addresses {
+		address = address.Unmap()
+		if address.IsValid() && !address.IsUnspecified() {
+			usable = append(usable, address)
+		}
+	}
+	return usable
 }
 
 func resolveAmneziaWgEndpoint(
@@ -576,9 +673,13 @@ func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgR
 	if err := settings.validateNativeRunnerCompatibility(); err != nil {
 		return nil, err
 	}
+	dnsAddrs, err := settings.netstackDNSAddresses()
+	if err != nil {
+		return nil, err
+	}
 	// The UAPI endpoint parser accepts address literals only. Resolve a domain
 	// before IpcSet rather than passing an opaque hostname through to it.
-	if err := settings.resolvePeerEndpoints(); err != nil {
+	if err := settings.resolvePeerEndpoints(dnsAddrs); err != nil {
 		return nil, err
 	}
 
@@ -608,11 +709,6 @@ func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgR
 	mtu := settings.MTU
 	if mtu <= 0 {
 		mtu = 1420
-	}
-
-	dnsAddrs, err := settings.netstackDNSAddresses()
-	if err != nil {
-		return nil, err
 	}
 
 	tunDev, tnet, err := netstack.CreateNetTUN(localAddrs, dnsAddrs, mtu)
