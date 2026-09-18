@@ -465,9 +465,106 @@ func ReconcileBrowserDialer(dialerAddr string) {
 // MeasureOutboundDelay tests the latency of an outbound proxy configuration against a target URL.
 // It optimizes performance by stripping inbounds and non-essential app modules.
 func MeasureOutboundDelay(configJSON string, targetURL string) (int64, error) {
+	server, err := startOutboundTestInstance(configJSON)
+	if err != nil {
+		return -1, err
+	}
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+
+	return measureInstanceDelay(ctx, server, targetURL)
+}
+
+// outboundDownloadResult is deliberately encoded as JSON at the mobile
+// boundary. Returning a string keeps the gomobile surface stable and lets the
+// Android UI add fields without coupling itself to a generated Go object.
+type outboundDownloadResult struct {
+	BytesDownloaded int64 `json:"bytesDownloaded"`
+	ElapsedMillis   int64 `json:"elapsedMillis"`
+	TtfbMillis      int64 `json:"ttfbMillis"`
+	StatusCode      int   `json:"statusCode"`
+}
+
+var outboundDownloadCancels sync.Map // map[string]context.CancelFunc
+
+const (
+	maxOutboundDownloadBytes         int64 = 100 << 20
+	minOutboundDownloadTimeoutMillis int64 = 10_000
+	maxOutboundDownloadTimeoutMillis int64 = 10 * 60 * 1000
+)
+
+// MeasureOutboundDownload downloads exactly maxBytes through an isolated
+// outbound configuration and returns a JSON result containing the measured
+// payload, elapsed time, first-byte time and HTTP status. requestID is optional
+// but, when supplied, allows CancelOutboundDownload to stop a running request.
+func MeasureOutboundDownload(
+	configJSON string,
+	targetURL string,
+	maxBytes int64,
+	timeoutMillis int64,
+	requestID string,
+) (string, error) {
+	if maxBytes <= 0 || maxBytes > maxOutboundDownloadBytes {
+		return "", fmt.Errorf("download byte limit must be between 1 and %d", maxOutboundDownloadBytes)
+	}
+	if timeoutMillis < minOutboundDownloadTimeoutMillis || timeoutMillis > maxOutboundDownloadTimeoutMillis {
+		return "", fmt.Errorf(
+			"download timeout must be between %d and %d ms",
+			minOutboundDownloadTimeoutMillis,
+			maxOutboundDownloadTimeoutMillis,
+		)
+	}
+	if strings.TrimSpace(targetURL) == "" {
+		return "", errors.New("download target URL is empty")
+	}
+
+	server, err := startOutboundTestInstance(configJSON)
+	if err != nil {
+		return "", err
+	}
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		time.Duration(timeoutMillis)*time.Millisecond,
+	)
+	defer cancel()
+	if requestID != "" {
+		outboundDownloadCancels.Store(requestID, context.CancelFunc(cancel))
+		defer outboundDownloadCancels.Delete(requestID)
+	}
+
+	result, err := measureInstanceDownload(ctx, server, targetURL, maxBytes)
+	if err != nil {
+		return "", err
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode download result: %w", err)
+	}
+	return string(encoded), nil
+}
+
+// CancelOutboundDownload cancels an isolated download test previously started
+// with the same requestID. It is safe to call for an already-finished or
+// unknown request.
+func CancelOutboundDownload(requestID string) {
+	if requestID == "" {
+		return
+	}
+	if cancel, ok := outboundDownloadCancels.Load(requestID); ok {
+		cancel.(context.CancelFunc)()
+	}
+}
+
+// startOutboundTestInstance strips a normal app configuration down to the
+// dispatcher and outbound pieces required by an isolated test instance.
+func startOutboundTestInstance(configJSON string) (*core.Instance, error) {
 	config, err := coreserial.LoadJSONConfig(strings.NewReader(configJSON))
 	if err != nil {
-		return -1, fmt.Errorf("failed to parse test config: %w", err)
+		return nil, fmt.Errorf("failed to parse test config: %w", err)
 	}
 
 	// Optimize test instance by removing inbounds and non-essential apps
@@ -484,18 +581,14 @@ func MeasureOutboundDelay(configJSON string, targetURL string) (int64, error) {
 
 	server, err := core.New(config)
 	if err != nil {
-		return -1, fmt.Errorf("failed to create test instance: %w", err)
+		return nil, fmt.Errorf("failed to create test instance: %w", err)
 	}
 
 	if err := server.Start(); err != nil {
-		return -1, fmt.Errorf("failed to start test instance: %w", err)
+		_ = server.Close()
+		return nil, fmt.Errorf("failed to start test instance: %w", err)
 	}
-	defer server.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-	defer cancel()
-
-	return measureInstanceDelay(ctx, server, targetURL)
+	return server, nil
 }
 
 // measureInstanceDelay measures network latency for an instance to a given target URL with 2 attempts and jitter reduction.
@@ -579,6 +672,74 @@ func measureInstanceDelay(ctx context.Context, inst *core.Instance, targetURL st
 		return -1, lastErr
 	}
 	return minDuration, nil
+}
+
+// measureInstanceDownload reads exactly maxBytes from targetURL through the
+// supplied Xray instance. The body is deliberately not drained beyond that
+// limit: test size is a hard network budget, not merely a reporting hint.
+func measureInstanceDownload(
+	ctx context.Context,
+	inst *core.Instance,
+	targetURL string,
+	maxBytes int64,
+) (outboundDownloadResult, error) {
+	if inst == nil {
+		return outboundDownloadResult{}, errors.New("core instance is nil")
+	}
+
+	tr := &http.Transport{
+		TLSHandshakeTimeout: 6 * time.Second,
+		DisableKeepAlives:   true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dest, err := corenet.ParseDestination(fmt.Sprintf("%s:%s", network, addr))
+			if err != nil {
+				return nil, err
+			}
+			return core.Dial(ctx, inst, dest)
+		},
+	}
+	defer tr.CloseIdleConnections()
+
+	client := &http.Client{Transport: tr}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return outboundDownloadResult{}, fmt.Errorf("failed to create download request: %w", err)
+	}
+	req.Header.Set("User-Agent", "SKIPI-SpeedTest/1.0")
+	req.Header.Set("Cache-Control", "no-cache")
+	// The byte budget must apply to the actual response body. Asking for an
+	// identity response avoids a transport transparently decompressing a
+	// smaller on-wire payload into maxBytes of decoded data.
+	req.Header.Set("Accept-Encoding", "identity")
+
+	startedAt := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return outboundDownloadResult{}, fmt.Errorf("download request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	ttfbMillis := time.Since(startedAt).Milliseconds()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return outboundDownloadResult{}, fmt.Errorf("invalid download status code: %s", resp.Status)
+	}
+
+	bytesDownloaded, err := io.CopyN(io.Discard, resp.Body, maxBytes)
+	if err != nil {
+		return outboundDownloadResult{}, fmt.Errorf(
+			"download ended before %d bytes (%d bytes received): %w",
+			maxBytes,
+			bytesDownloaded,
+			err,
+		)
+	}
+
+	return outboundDownloadResult{
+		BytesDownloaded: bytesDownloaded,
+		ElapsedMillis:   time.Since(startedAt).Milliseconds(),
+		TtfbMillis:      ttfbMillis,
+		StatusCode:      resp.StatusCode,
+	}, nil
 }
 
 type certSha256Request struct {
