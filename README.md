@@ -11,6 +11,8 @@
 go install golang.org/x/mobile/cmd/gomobile@latest
 gomobile init
 # github.com/wlynxg/anet requires this linker flag with Go 1.23+.
+# Align native library to 16 KB page size for Android 15+ compatibility:
+export CGO_LDFLAGS="-Wl,-z,max-page-size=16384"
 gomobile bind -target=android -androidapi 24 -javapkg=app.skipi.core -ldflags=-checklinkname=0 -o skipicore.aar .
 ```
 

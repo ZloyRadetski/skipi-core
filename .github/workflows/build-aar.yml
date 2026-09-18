@@ -55,6 +55,7 @@ jobs:
         # No `go get @latest` here on purpose: release builds must use the
         # exact dependency versions pinned in go.mod / go.sum.
         run: |
+          export CGO_LDFLAGS="-Wl,-z,max-page-size=16384"
           gomobile bind -v -target=android -androidapi 24 -javapkg=app.skipi.core -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o skipicore.aar .
 
       - name: Upload AAR Artifact
