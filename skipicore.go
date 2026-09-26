@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"runtime/metrics"
@@ -30,7 +29,6 @@ import (
 	coreapplog "github.com/xtls/xray-core/app/log"
 	corecommlog "github.com/xtls/xray-core/common/log"
 	corenet "github.com/xtls/xray-core/common/net"
-	corefilesystem "github.com/xtls/xray-core/common/platform/filesystem"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
@@ -38,7 +36,6 @@ import (
 	coreserial "github.com/xtls/xray-core/infra/conf/serial"
 	_ "github.com/xtls/xray-core/main/distro/all"
 	browser_dialer "github.com/xtls/xray-core/transport/internet/browser_dialer"
-	mobasset "golang.org/x/mobile/asset"
 )
 
 // Constants for environment variables and core identification
@@ -422,8 +419,9 @@ func sortedTrafficStatTags(stats map[string]trafficStatsBytes) []string {
 
 const emptyTrafficStatsSnapshotJSON = `{"inbound":{},"outbound":{}}`
 
-// InitCoreEnv configures environment variables (assets and certificate path) and sets up
-// the fallback file reader to directly read assets from Android APK if missing on disk.
+// InitCoreEnv configures environment variables (assets and certificate path) and installs
+// the host-appropriate Xray asset reader. Android may fall back to APK assets; desktop
+// hosts intentionally use only the configured filesystem directory.
 func InitCoreEnv(dataDir string, assetKey string) {
 	if len(dataDir) > 0 {
 		setEnvVariable(coreAsset, dataDir)
@@ -433,17 +431,7 @@ func InitCoreEnv(dataDir string, assetKey string) {
 	if len(assetKey) > 0 {
 		setEnvVariable(xudpBaseKey, assetKey)
 	}
-
-	corefilesystem.NewFileReader = func(path string) (io.ReadCloser, error) {
-		// Try the filesystem first with a single syscall: geo files live on
-		// disk in the normal case, and only fall back to APK assets when the
-		// open fails (file missing on first run).
-		if file, err := os.Open(path); err == nil {
-			return file, nil
-		}
-		_, file := filepath.Split(path)
-		return mobasset.Open(file)
-	}
+	configureCoreAssetReader()
 }
 
 // CoreVersion returns the version of the underlying Xray-core engine.

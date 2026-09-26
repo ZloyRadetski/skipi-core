@@ -1,6 +1,7 @@
 *.aar
 *.jar
 *.so
+dist/
 .DS_Store
 .idea/
 .vscode/

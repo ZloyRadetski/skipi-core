@@ -1,0 +1,86 @@
+name: Build SKIPI Core Desktop
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-amd64:
+    name: Build desktop DLL (Windows x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      - name: Set up GCC
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+          path-type: inherit
+
+      - name: Test and build shared library
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export CGO_ENABLED=1
+          export CC=gcc
+          export CXX=g++
+          go test ./...
+          mkdir -p dist
+          go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o dist/skipicore.dll ./cmd/skipicore-desktop
+          cp desktop/include/skipicore_desktop.h dist/
+
+      - name: Upload desktop library
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipicore-desktop-windows-amd64
+          path: dist/
+          if-no-files-found: error
+
+  linux-amd64:
+    name: Build desktop shared object (Linux x64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      - name: Test and build shared library
+        run: |
+          export CGO_ENABLED=1
+          export CC=gcc
+          export CXX=g++
+          go test ./...
+          mkdir -p dist
+          go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o dist/libskipicore.so ./cmd/skipicore-desktop
+          cp desktop/include/skipicore_desktop.h dist/
+
+      - name: Upload desktop library
+        uses: actions/upload-artifact@v4
+        with:
+          name: skipicore-desktop-linux-amd64
+          path: dist/
+          if-no-files-found: error
