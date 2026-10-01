@@ -44,8 +44,9 @@ assets before creating a session. Strings returned by the API must be released
 with `SkipiCoreDesktopFreeString`.
 
 GitHub Actions builds and tests the native library on every pull request and
-push to `main`. The Windows build uses MSYS2; the artifacts are
-`skipicore-desktop-windows-amd64` and `skipicore-desktop-linux-amd64`.
+push to `main`. When tagging a release (`v*`), the desktop binaries and packages
+(`skipicore.dll`, `libskipicore.so`, `skipicore-windows-amd64.zip`,
+`skipicore-linux-amd64.tar.gz`) are automatically published to the GitHub Release.
 
 ---
 

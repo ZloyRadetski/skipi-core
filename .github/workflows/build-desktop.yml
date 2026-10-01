@@ -7,6 +7,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to publish release assets to (e.g. v1.0.18). Leave blank to skip release publishing.'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -84,3 +90,38 @@ jobs:
           name: skipicore-desktop-linux-amd64
           path: dist/
           if-no-files-found: error
+
+  release:
+    name: Release SKIPI Core Desktop
+    needs: [windows-amd64, linux-amd64]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: skipicore-desktop-windows-amd64
+          path: dist-windows
+
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: skipicore-desktop-linux-amd64
+          path: dist-linux
+
+      - name: Package Release Assets
+        run: |
+          mkdir -p release-assets
+          find dist-windows -name "skipicore.dll" -exec cp {} release-assets/ \;
+          (cd dist-windows && zip -9 -r ../release-assets/skipicore-windows-amd64.zip .)
+          find dist-linux -name "libskipicore.so" -exec cp {} release-assets/ \;
+          (cd dist-linux && tar -czvf ../release-assets/skipicore-linux-amd64.tar.gz .)
+          (cd release-assets && sha256sum * > sha256sums-desktop.txt)
+
+      - name: Release Desktop Binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name != '' && inputs.tag_name || github.ref_name }}
+          files: release-assets/*
