@@ -78,6 +78,7 @@ func init() {
 		}
 	}
 	debug.SetMemoryLimit(memoryLimit)
+	applyMaxProcs()
 }
 
 // CoreCallbackHandler handles lifecycle and logging events from the core.
@@ -179,6 +180,14 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	}
 	c.statsManager = nil
 	c.trafficStatsTotals = make(map[string]int64)
+
+	// Loading routing/geo data is a one-off allocation burst: keep the GC out of its way, then
+	// collect the leftovers once in the background.
+	resumeGC := pauseGCForStartup()
+	defer func() {
+		resumeGC()
+		go runtime.GC()
+	}()
 
 	config, err := coreserial.LoadJSONConfig(strings.NewReader(configJSON))
 	if err != nil {
