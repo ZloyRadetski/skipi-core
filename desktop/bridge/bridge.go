@@ -225,10 +225,7 @@ func (r *Runtime) IsRunning(handle Handle) (bool, error) {
 
 // QueryTrafficStats returns the core's cumulative structured traffic snapshot.
 func (r *Runtime) QueryTrafficStats(handle Handle) (string, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	controller, err := r.controllerLocked(handle)
+	controller, err := r.controller(handle)
 	if err != nil {
 		return "", err
 	}
@@ -236,16 +233,15 @@ func (r *Runtime) QueryTrafficStats(handle Handle) (string, error) {
 }
 
 // MeasureDelay performs the existing in-process delay probe through a running
-// controller. The target URL is validated by SKIPI Core itself.
+// controller. The target URL is validated by SKIPI Core itself. The probe can take
+// seconds, so it runs without holding the runtime locks: state reads and Stop
+// must stay responsive while it is in flight.
 func (r *Runtime) MeasureDelay(handle Handle, targetURL string) (int64, error) {
 	if strings.TrimSpace(targetURL) == "" {
 		return -1, errors.New("SKIPI Core desktop delay target must not be blank")
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	controller, err := r.controllerLocked(handle)
+	controller, err := r.controller(handle)
 	if err != nil {
 		return -1, err
 	}
@@ -276,6 +272,14 @@ func (r *Runtime) ActiveHandle() Handle {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.active
+}
+
+// controller looks a handle up under the runtime lock and releases it before the caller
+// uses the controller, which synchronizes itself.
+func (r *Runtime) controller(handle Handle) (*skipicore.CoreController, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.controllerLocked(handle)
 }
 
 func (r *Runtime) controllerLocked(handle Handle) (*skipicore.CoreController, error) {

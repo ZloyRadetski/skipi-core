@@ -785,6 +785,7 @@ func (r *AmneziaWgRunner) Start() error {
 	}
 
 	if err := r.dev.Up(); err != nil {
+		r.dev.Close()
 		return fmt.Errorf("device Up failed: %w", err)
 	}
 	if err := r.protectPeerSockets(); err != nil {

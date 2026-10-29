@@ -200,6 +200,7 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 
 	server, err := core.New(config)
 	if err != nil {
+		clearTunFdEnv()
 		return fmt.Errorf("failed to create xray instance: %w", err)
 	}
 
@@ -210,6 +211,10 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	}
 
 	if err := server.Start(); err != nil {
+		// Xray does not roll back features that started before the failing one, so
+		// inbounds already listening would keep their ports until the process exits.
+		_ = server.Close()
+		clearTunFdEnv()
 		c.statsManager = nil
 		c.trafficStatsTotals = nil
 		return fmt.Errorf("failed to start xray instance: %w", err)
@@ -224,6 +229,12 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	}
 
 	return nil
+}
+
+// clearTunFdEnv removes the process-wide TUN descriptor published for a core start.
+func clearTunFdEnv() {
+	unsetEnvVariable(tunFdKey)
+	unsetEnvVariable(v2rayTunFdKey)
 }
 
 // StopLoop gracefully shuts down the running Xray instance.
@@ -243,8 +254,7 @@ func (c *CoreController) StopLoop() error {
 
 	// Drop the TUN descriptor env vars so later instances (latency probes,
 	// URL-test racers) never observe an already-closed file descriptor.
-	unsetEnvVariable(tunFdKey)
-	unsetEnvVariable(v2rayTunFdKey)
+	clearTunFdEnv()
 
 	if c.callback != nil {
 		c.callback.Shutdown()
@@ -999,6 +1009,7 @@ func FastSelectBestOutbound(configJSON string, candidateTags string, probeURL st
 	}
 
 	if err := server.Start(); err != nil {
+		_ = server.Close()
 		return candidates[0]
 	}
 	defer server.Close()

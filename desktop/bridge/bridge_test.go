@@ -8,7 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestRuntimeRequiresAssetsBeforeStart(t *testing.T) {
@@ -143,6 +146,55 @@ func TestDestroyControllerStopsActiveCore(t *testing.T) {
 	}
 	if _, err := runtime.IsRunning(handle); !errors.Is(err, ErrControllerNotFound) {
 		t.Fatalf("expected destroyed handle error, got %v", err)
+	}
+}
+
+// A delay probe can take seconds; the UI must still be able to read the state and disconnect meanwhile.
+func TestStopAndStateAreNotBlockedByARunningDelayProbe(t *testing.T) {
+	runtime := initializedRuntime(t)
+	handle := runtime.CreateController()
+	t.Cleanup(func() {
+		_ = runtime.DestroyController(handle)
+	})
+	if err := runtime.Start(handle, testXrayConfig(t), 0); err != nil {
+		t.Fatalf("start core: %v", err)
+	}
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case probeStarted <- struct{}{}:
+		default:
+		}
+		<-releaseProbe
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	defer close(releaseProbe)
+
+	go func() { _, _ = runtime.MeasureDelay(handle, server.URL) }()
+	select {
+	case <-probeStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the delay probe never reached the test server")
+	}
+
+	stopped := make(chan error, 1)
+	go func() {
+		if _, err := runtime.IsRunning(handle); err != nil {
+			stopped <- err
+			return
+		}
+		stopped <- runtime.Stop(handle)
+	}()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("state read / stop during a probe: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("IsRunning/Stop are blocked while a delay probe is in flight")
 	}
 }
 

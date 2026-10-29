@@ -482,6 +482,63 @@ func TestStartLoopFailureDoesNotTouchTunFdEnv(t *testing.T) {
 	}
 }
 
+// A start that fails after some inbounds are already listening must give those listeners back,
+// otherwise every retry reports "address already in use" until the process exits.
+func TestStartLoopFailureReleasesListenersAndTunFdEnv(t *testing.T) {
+	unsetEnvVariable(tunFdKey)
+	unsetEnvVariable(v2rayTunFdKey)
+
+	freePort := reserveLocalPort(t)
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy port: %v", err)
+	}
+	defer busy.Close()
+	busyPort := busy.Addr().(*net.TCPAddr).Port
+
+	configJSON := fmt.Sprintf(`{
+		"log": { "loglevel": "none" },
+		"inbounds": [
+			{ "listen": "127.0.0.1", "port": %d, "protocol": "socks", "settings": { "auth": "noauth" } },
+			{ "listen": "127.0.0.1", "port": %d, "protocol": "socks", "settings": { "auth": "noauth" } }
+		],
+		"outbounds": [ { "protocol": "freedom", "tag": "direct" } ]
+	}`, freePort, busyPort)
+
+	ctrl := NewCoreController(&dummyCallbackHandler{})
+	if err := ctrl.StartLoop(configJSON, 7777); err == nil {
+		t.Fatal("expected StartLoop to fail because one inbound port is taken")
+	}
+
+	if ctrl.IsRunning() {
+		t.Fatal("a failed start must not leave the controller running")
+	}
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", freePort))
+	if err != nil {
+		t.Fatalf("the inbound that did start was not released: %v", err)
+	}
+	_ = listener.Close()
+	if got := os.Getenv(tunFdKey); got != "" {
+		t.Fatalf("failed start must not leave %s set, got %q", tunFdKey, got)
+	}
+	if got := os.Getenv(v2rayTunFdKey); got != "" {
+		t.Fatalf("failed start must not leave %s set, got %q", v2rayTunFdKey, got)
+	}
+}
+
+func reserveLocalPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve local port: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release local port: %v", err)
+	}
+	return port
+}
+
 type dummySocketProtector struct {
 	protectedCount int
 }
