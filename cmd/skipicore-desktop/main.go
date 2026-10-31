@@ -17,6 +17,8 @@ import (
 	"unsafe"
 
 	"github.com/ZloyRadetski/skipi-core/desktop/bridge"
+	"github.com/ZloyRadetski/skipi-core/desktop/notify"
+	"github.com/ZloyRadetski/skipi-core/desktop/tunhost"
 )
 
 const desktopAPIVersion = "1"
@@ -110,6 +112,72 @@ func SkipiCoreDesktopStop(handle C.uint64_t) *C.char {
 	return cError(func() error {
 		return desktopRuntime.Stop(desktopbridge.Handle(handle))
 	})
+}
+
+// SkipiCoreDesktopTunOpen brings up the TUN interface described by a JSON plan
+// ({"name","mtu","addresses","routes"}) and returns the attached tun file
+// descriptor, or -1 with SkipiCoreDesktopLastError set. The descriptor stays owned
+// by SKIPI Core until SkipiCoreDesktopTunClose.
+//
+//export SkipiCoreDesktopTunOpen
+func SkipiCoreDesktopTunOpen(planJSON *C.char) C.int64_t {
+	return cInt64(func() (int64, error) {
+		plan, err := requiredCString(planJSON, "TUN plan")
+		if err != nil {
+			return -1, err
+		}
+		fd, err := tunhost.Open(plan)
+		return int64(fd), err
+	})
+}
+
+// SkipiCoreDesktopTunProbe returns NULL when a TUN session can be opened on this machine,
+// otherwise an owned string explaining why not.
+//
+//export SkipiCoreDesktopTunProbe
+func SkipiCoreDesktopTunProbe() *C.char {
+	return cError(tunhost.Probe)
+}
+
+// SkipiCoreDesktopTunPrepare binds SKIPI Core's own outbound sockets to the physical interface.
+// Call it before SkipiCoreDesktopStart so no connection of the session is made without the
+// binding; SkipiCoreDesktopTunClose undoes it. It returns NULL on success.
+//
+//export SkipiCoreDesktopTunPrepare
+func SkipiCoreDesktopTunPrepare(interfaceName *C.char) *C.char {
+	return cError(func() error {
+		name, err := requiredCString(interfaceName, "interface name")
+		if err != nil {
+			return err
+		}
+		return tunhost.Prepare(name)
+	})
+}
+
+// SkipiCoreDesktopNotify shows a desktop notification. It returns NULL
+// on success, otherwise why it could not be shown (for example, no notification service runs).
+//
+//export SkipiCoreDesktopNotify
+func SkipiCoreDesktopNotify(summary *C.char, body *C.char) *C.char {
+	return cError(func() error {
+		title, err := requiredCString(summary, "notification summary")
+		if err != nil {
+			return err
+		}
+		text := ""
+		if body != nil {
+			text = C.GoString(body)
+		}
+		return notify.Show(title, text)
+	})
+}
+
+// SkipiCoreDesktopTunClose ends the TUN session. It returns NULL on success
+// and is a no-op when no session is open.
+//
+//export SkipiCoreDesktopTunClose
+func SkipiCoreDesktopTunClose() *C.char {
+	return cError(tunhost.Close)
 }
 
 // SkipiCoreDesktopIsRunning returns 1 for a running controller, 0 for a
