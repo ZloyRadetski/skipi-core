@@ -548,6 +548,11 @@ type AmneziaWgRunner struct {
 	protector  SocketProtector
 }
 
+// SocketProtector matches the gomobile interface for Android VpnService.protect(int).
+type SocketProtector interface {
+	Protect(fd int) bool
+}
+
 var (
 	awgGlobalMu        sync.Mutex
 	activeAwgRunner    *AmneziaWgRunner
