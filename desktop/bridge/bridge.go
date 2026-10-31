@@ -267,6 +267,28 @@ func (r *Runtime) CoreVersion() string {
 	return skipicore.CoreVersion()
 }
 
+// StartAmneziaWg starts the process-wide AmneziaWG runner and its private loopback
+// SOCKS listener on socksPort. The host points a SOCKS outbound at that port and
+// starts Core afterwards. A desktop process has no VpnService, so no socket
+// protector is installed.
+func (r *Runtime) StartAmneziaWg(configJSON string, socksPort int) error {
+	if socksPort <= 0 {
+		return errors.New("AmneziaWG SOCKS port must be positive")
+	}
+	skipicore.SetAmneziaWgSocketProtector(nil)
+	return skipicore.StartAmneziaWg(configJSON, socksPort)
+}
+
+// StopAmneziaWg stops the AmneziaWG runner. Stopping a stopped runner is not an error.
+func (r *Runtime) StopAmneziaWg() error {
+	return skipicore.StopAmneziaWg()
+}
+
+// IsAmneziaWgRunning reports whether the AmneziaWG runner is active.
+func (r *Runtime) IsAmneziaWgRunning() bool {
+	return skipicore.IsAmneziaWgRunning()
+}
+
 // ActiveHandle returns the currently running controller, or zero.
 func (r *Runtime) ActiveHandle() Handle {
 	r.mu.Lock()

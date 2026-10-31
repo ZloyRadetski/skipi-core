@@ -130,6 +130,42 @@ func SkipiCoreDesktopIsRunning(handle C.uint64_t) C.int32_t {
 	})
 }
 
+// SkipiCoreDesktopStartAmneziaWg starts the AmneziaWG runner and its loopback SOCKS
+// listener on socksPort, before Core is started. It returns NULL on success,
+// otherwise an owned error string.
+//
+//export SkipiCoreDesktopStartAmneziaWg
+func SkipiCoreDesktopStartAmneziaWg(configJSON *C.char, socksPort C.int32_t) *C.char {
+	return cError(func() error {
+		config, err := requiredCString(configJSON, "AmneziaWG configuration")
+		if err != nil {
+			return err
+		}
+		return desktopRuntime.StartAmneziaWg(config, int(socksPort))
+	})
+}
+
+// SkipiCoreDesktopStopAmneziaWg stops the AmneziaWG runner. It returns NULL on
+// success, otherwise an owned error string.
+//
+//export SkipiCoreDesktopStopAmneziaWg
+func SkipiCoreDesktopStopAmneziaWg() *C.char {
+	return cError(func() error {
+		return desktopRuntime.StopAmneziaWg()
+	})
+}
+
+// SkipiCoreDesktopIsAmneziaWgRunning returns 1 while the AmneziaWG runner is
+// active and 0 otherwise.
+//
+//export SkipiCoreDesktopIsAmneziaWgRunning
+func SkipiCoreDesktopIsAmneziaWgRunning() C.int32_t {
+	if desktopRuntime.IsAmneziaWgRunning() {
+		return 1
+	}
+	return 0
+}
+
 // SkipiCoreDesktopQueryTrafficStats returns an owned JSON traffic snapshot, or
 // NULL on error. Consult SkipiCoreDesktopLastError after a NULL result.
 //

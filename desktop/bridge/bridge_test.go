@@ -222,3 +222,85 @@ func testXrayConfig(t *testing.T) string {
 		port,
 	)
 }
+
+const testAmneziaWgConfig = `{
+	"secretKey": "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=",
+	"address": ["10.8.0.2/32"],
+	"dnsServers": ["1.1.1.1"],
+	"peers": [
+		{
+			"publicKey": "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s=",
+			"endpoint": "127.0.0.1:59999",
+			"allowedIPs": ["0.0.0.0/0"]
+		}
+	],
+	"jc": 3,
+	"jmin": 40,
+	"jmax": 70,
+	"s1": 15,
+	"s2": 25,
+	"h1": "12345"
+}`
+
+func freeLoopbackPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
+func TestAmneziaWgBridgeStartsServesSocksAndStops(t *testing.T) {
+	runtime := NewRuntime()
+	port := freeLoopbackPort(t)
+	t.Cleanup(func() { _ = runtime.StopAmneziaWg() })
+
+	if runtime.IsAmneziaWgRunning() {
+		t.Fatal("AmneziaWG must not be running before it is started")
+	}
+	if err := runtime.StartAmneziaWg(testAmneziaWgConfig, port); err != nil {
+		t.Fatalf("StartAmneziaWg failed: %v", err)
+	}
+	if !runtime.IsAmneziaWgRunning() {
+		t.Fatal("AmneziaWG should be running after a successful start")
+	}
+
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
+	if err != nil {
+		t.Fatalf("the SOCKS listener must accept connections: %v", err)
+	}
+	_, _ = conn.Write([]byte{0x05, 0x01, 0x00})
+	reply := make([]byte, 2)
+	_, _ = conn.Read(reply)
+	conn.Close()
+	if reply[0] != 0x05 || reply[1] != 0x00 {
+		t.Fatalf("unexpected SOCKS handshake reply: %v", reply)
+	}
+
+	if err := runtime.StopAmneziaWg(); err != nil {
+		t.Fatalf("StopAmneziaWg failed: %v", err)
+	}
+	if runtime.IsAmneziaWgRunning() {
+		t.Fatal("AmneziaWG should be stopped")
+	}
+	if err := runtime.StopAmneziaWg(); err != nil {
+		t.Fatalf("stopping a stopped AmneziaWG must not fail: %v", err)
+	}
+}
+
+func TestAmneziaWgBridgeRejectsBadConfigAndStaysStopped(t *testing.T) {
+	runtime := NewRuntime()
+	t.Cleanup(func() { _ = runtime.StopAmneziaWg() })
+
+	if err := runtime.StartAmneziaWg("{not json", freeLoopbackPort(t)); err == nil {
+		t.Fatal("an invalid configuration must be rejected")
+	}
+	if err := runtime.StartAmneziaWg(testAmneziaWgConfig, 0); err == nil {
+		t.Fatal("a missing SOCKS port must be rejected")
+	}
+	if runtime.IsAmneziaWgRunning() {
+		t.Fatal("a rejected start must leave AmneziaWG stopped")
+	}
+}
