@@ -190,6 +190,25 @@ func SkipiCoreDesktopMeasureDelay(handle C.uint64_t, targetURL *C.char) C.int64_
 	})
 }
 
+// SkipiCoreDesktopMeasureOutboundDelay returns the delay of one outbound, in
+// milliseconds, through an isolated Core instance, or -1 on error. Consult
+// SkipiCoreDesktopLastError after -1.
+//
+//export SkipiCoreDesktopMeasureOutboundDelay
+func SkipiCoreDesktopMeasureOutboundDelay(configJSON *C.char, targetURL *C.char) C.int64_t {
+	return cInt64(func() (int64, error) {
+		config, err := requiredCString(configJSON, "probe configuration")
+		if err != nil {
+			return -1, err
+		}
+		target, err := requiredCString(targetURL, "delay target URL")
+		if err != nil {
+			return -1, err
+		}
+		return desktopRuntime.MeasureOutboundDelay(config, target)
+	})
+}
+
 // SkipiCoreDesktopReadMemoryStats returns an owned JSON memory snapshot.
 //
 //export SkipiCoreDesktopReadMemoryStats

@@ -252,6 +252,23 @@ func (r *Runtime) MeasureDelay(handle Handle, targetURL string) (int64, error) {
 	return delayMillis, nil
 }
 
+// MeasureOutboundDelay measures the latency of one outbound through an isolated Core
+// instance, without a controller and without touching the running session. The probe can
+// take seconds and holds no runtime lock.
+func (r *Runtime) MeasureOutboundDelay(configJSON string, targetURL string) (int64, error) {
+	if strings.TrimSpace(configJSON) == "" {
+		return -1, errors.New("SKIPI Core desktop probe configuration must not be blank")
+	}
+	if strings.TrimSpace(targetURL) == "" {
+		return -1, errors.New("SKIPI Core desktop delay target must not be blank")
+	}
+	delayMillis, err := skipicore.MeasureOutboundDelay(configJSON, targetURL)
+	if err != nil {
+		return -1, fmt.Errorf("measure SKIPI Core outbound delay: %w", err)
+	}
+	return delayMillis, nil
+}
+
 // ReadMemoryStats delegates to the process-wide SKIPI Core memory snapshot.
 func (r *Runtime) ReadMemoryStats() string {
 	return skipicore.ReadMemoryStats()

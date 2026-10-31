@@ -304,3 +304,36 @@ func TestAmneziaWgBridgeRejectsBadConfigAndStaysStopped(t *testing.T) {
 		t.Fatal("a rejected start must leave AmneziaWG stopped")
 	}
 }
+
+func TestMeasureOutboundDelayReachesTheTargetThroughTheGivenOutbound(t *testing.T) {
+	runtime := NewRuntime()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	delay, err := runtime.MeasureOutboundDelay(
+		`{"log":{"loglevel":"none"},"outbounds":[{"tag":"probe","protocol":"freedom"}]}`,
+		server.URL,
+	)
+	if err != nil {
+		t.Fatalf("MeasureOutboundDelay failed: %v", err)
+	}
+	if delay < 0 {
+		t.Fatalf("expected a non-negative delay, got %d", delay)
+	}
+}
+
+func TestMeasureOutboundDelayRejectsBlankInputAndBadConfig(t *testing.T) {
+	runtime := NewRuntime()
+
+	if _, err := runtime.MeasureOutboundDelay("{}", " "); err == nil {
+		t.Fatal("a blank target must be rejected")
+	}
+	if _, err := runtime.MeasureOutboundDelay(" ", "http://127.0.0.1:1/"); err == nil {
+		t.Fatal("a blank configuration must be rejected")
+	}
+	if _, err := runtime.MeasureOutboundDelay("{not json", "http://127.0.0.1:1/"); err == nil {
+		t.Fatal("an invalid configuration must be rejected")
+	}
+}

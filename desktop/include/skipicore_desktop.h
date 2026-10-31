@@ -37,6 +37,7 @@ SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopStopAmneziaWg(void);
 SKIPI_CORE_DESKTOP_API int32_t SkipiCoreDesktopIsAmneziaWgRunning(void);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopQueryTrafficStats(uint64_t handle);
 SKIPI_CORE_DESKTOP_API int64_t SkipiCoreDesktopMeasureDelay(uint64_t handle, const char *target_url);
+SKIPI_CORE_DESKTOP_API int64_t SkipiCoreDesktopMeasureOutboundDelay(const char *config_json, const char *target_url);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopReadMemoryStats(void);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopForceFreeMemory(void);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopLastError(void);
