@@ -7,14 +7,18 @@
 package desktopbridge
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	skipicore "github.com/ZloyRadetski/skipi-core"
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport/internet"
 )
 
 // Handle identifies a controller owned by a Runtime. It is opaque to callers.
@@ -267,6 +271,33 @@ func (r *Runtime) MeasureOutboundDelay(configJSON string, targetURL string) (int
 		return -1, fmt.Errorf("measure SKIPI Core outbound delay: %w", err)
 	}
 	return delayMillis, nil
+}
+
+// MeasureTcpDelay measures one TCP connect to host:port, in milliseconds. It dials the way Core's
+// own outbound sockets do, so while a tunnel is up the registered dialer controllers pin it to the
+// physical interface: the number is the path to the server, not the tunnel's own answer.
+func (r *Runtime) MeasureTcpDelay(host string, port int, timeoutMillis int) (int64, error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return -1, errors.New("SKIPI Core desktop TCP probe host must not be blank")
+	}
+	if port < 1 || port > 65535 {
+		return -1, fmt.Errorf("SKIPI Core desktop TCP probe port %d is out of range", port)
+	}
+	if timeoutMillis < 1 {
+		return -1, errors.New("SKIPI Core desktop TCP probe timeout must be positive")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMillis)*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	conn, err := internet.DialSystem(ctx, xnet.TCPDestination(xnet.ParseAddress(host), xnet.Port(port)), nil)
+	if err != nil {
+		return -1, fmt.Errorf("connect to %s:%d: %w", host, port, err)
+	}
+	elapsed := time.Since(started).Milliseconds()
+	_ = conn.Close()
+	return elapsed, nil
 }
 
 // ReadMemoryStats delegates to the process-wide SKIPI Core memory snapshot.

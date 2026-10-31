@@ -10,8 +10,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/xtls/xray-core/transport/internet"
 )
 
 func TestRuntimeRequiresAssetsBeforeStart(t *testing.T) {
@@ -335,5 +339,100 @@ func TestMeasureOutboundDelayRejectsBlankInputAndBadConfig(t *testing.T) {
 	}
 	if _, err := runtime.MeasureOutboundDelay("{not json", "http://127.0.0.1:1/"); err == nil {
 		t.Fatal("an invalid configuration must be rejected")
+	}
+}
+
+// dialedAddresses records every destination Core's own dialer was asked for. The controller
+// registry is process-wide and cannot be undone, so one recorder serves the whole test binary.
+var (
+	dialedMu        sync.Mutex
+	dialedAddresses []string
+	recordDials     sync.Once
+)
+
+func recordedDials(t *testing.T) func() []string {
+	t.Helper()
+	recordDials.Do(func() {
+		err := internet.RegisterDialerController(func(network, address string, c syscall.RawConn) error {
+			dialedMu.Lock()
+			dialedAddresses = append(dialedAddresses, address)
+			dialedMu.Unlock()
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("register dialer controller: %v", err)
+		}
+	})
+	return func() []string {
+		dialedMu.Lock()
+		defer dialedMu.Unlock()
+		return append([]string(nil), dialedAddresses...)
+	}
+}
+
+func TestMeasureTcpDelayConnectsToAListeningPort(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	delay, err := NewRuntime().MeasureTcpDelay("127.0.0.1", port, 2000)
+	if err != nil {
+		t.Fatalf("MeasureTcpDelay failed: %v", err)
+	}
+	if delay < 0 || delay > 2000 {
+		t.Fatalf("delay = %d ms, want within the timeout", delay)
+	}
+}
+
+func TestMeasureTcpDelayDialsThroughTheControllersThatKeepSocketsOffTheTunnel(t *testing.T) {
+	dialed := recordedDials(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	address := listener.Addr().String()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	if _, err := NewRuntime().MeasureTcpDelay("127.0.0.1", port, 2000); err != nil {
+		t.Fatalf("MeasureTcpDelay failed: %v", err)
+	}
+
+	for _, seen := range dialed() {
+		if seen == address {
+			return
+		}
+	}
+	t.Fatalf("the probe never reached the dialer controllers (the physical-interface binding); saw %v", dialed())
+}
+
+func TestMeasureTcpDelayReportsAnUnreachablePortAsAnError(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+
+	delay, err := NewRuntime().MeasureTcpDelay("127.0.0.1", port, 2000)
+	if err == nil || delay != -1 {
+		t.Fatalf("closed port: delay=%d err=%v, want -1 and an error", delay, err)
+	}
+}
+
+func TestMeasureTcpDelayRejectsInvalidInput(t *testing.T) {
+	runtime := NewRuntime()
+	for name, call := range map[string]func() (int64, error){
+		"blank host":        func() (int64, error) { return runtime.MeasureTcpDelay("  ", 443, 1000) },
+		"port zero":         func() (int64, error) { return runtime.MeasureTcpDelay("example.org", 0, 1000) },
+		"port out of range": func() (int64, error) { return runtime.MeasureTcpDelay("example.org", 70000, 1000) },
+		"no timeout":        func() (int64, error) { return runtime.MeasureTcpDelay("example.org", 443, 0) },
+	} {
+		if delay, err := call(); err == nil || delay != -1 {
+			t.Errorf("%s: delay=%d err=%v, want -1 and an error", name, delay, err)
+		}
 	}
 }

@@ -277,6 +277,22 @@ func SkipiCoreDesktopMeasureOutboundDelay(configJSON *C.char, targetURL *C.char)
 	})
 }
 
+// SkipiCoreDesktopMeasureTcpDelay returns the time of one TCP connect to
+// host:port in milliseconds, dialed like Core's own sockets (so the physical
+// interface binding of a tunnel session applies), or -1 on error. Consult
+// SkipiCoreDesktopLastError after -1.
+//
+//export SkipiCoreDesktopMeasureTcpDelay
+func SkipiCoreDesktopMeasureTcpDelay(host *C.char, port C.int32_t, timeoutMillis C.int32_t) C.int64_t {
+	return cInt64(func() (int64, error) {
+		target, err := requiredCString(host, "TCP probe host")
+		if err != nil {
+			return -1, err
+		}
+		return desktopRuntime.MeasureTcpDelay(target, int(port), int(timeoutMillis))
+	})
+}
+
 // SkipiCoreDesktopReadMemoryStats returns an owned JSON memory snapshot.
 //
 //export SkipiCoreDesktopReadMemoryStats
