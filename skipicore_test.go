@@ -900,3 +900,97 @@ func TestAmneziaWgUDPBindAddressCreatesUsableNetstackEndpoints(t *testing.T) {
 	}
 }
 
+
+func TestAmneziaWg3SettingsReachTheRunnerIpcConfig(t *testing.T) {
+	const headerKey = "c29tZSBoZWFkZXIgcHJvdGVjdGlvbiBrZXkgb2shISE="
+	settings, err := ParseAmneziaWgSettings(`{
+		"protocol": "wireguard",
+		"settings": {
+			"secretKey": "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=",
+			"address": ["10.8.0.2/32"],
+			"peers": [{
+				"publicKey": "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s=",
+		"endpoint": "192.0.2.1:51820",
+				"keepAlive": "20-30"
+			}],
+			"headerProtectionKey": "`+headerKey+`",
+			"contentPaddingAddition": "16-64",
+			"rekeyAfterTime": 120,
+			"rekeyTimeout": "5-10",
+			"rejectAfterTime": 180,
+			"keepaliveTimeout": 10,
+			"maxHandshakeAttempts": "20-90"
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("ParseAmneziaWgSettings failed: %v", err)
+	}
+	if !settings.HasAmneziaParams() {
+		t.Fatal("AmneziaWG 3.0 settings alone must count as AmneziaWG parameters")
+	}
+	if err := settings.validateNativeRunnerCompatibility(); err != nil {
+		t.Fatalf("valid AmneziaWG 3.0 settings were rejected: %v", err)
+	}
+	ipc, err := settings.BuildIpcConfig()
+	if err != nil {
+		t.Fatalf("BuildIpcConfig failed: %v", err)
+	}
+	headerHex, err := decodeKeyToHex(headerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"header_protection_key=" + headerHex + "\n",
+		"content_padding_addition=16-64\n",
+		"rekey_after_time=120\n",
+		"rekey_timeout=5-10\n",
+		"reject_after_time=180\n",
+		"keepalive_timeout=10\n",
+		"max_handshake_attempts=20-90\n",
+		"persistent_keepalive_interval=20-30\n",
+	} {
+		if !strings.Contains(ipc, expected) {
+			t.Errorf("IPC config is missing %q: %s", expected, ipc)
+		}
+	}
+}
+
+func TestAmneziaWg3UnsetSettingsAddNothingToTheIpcConfig(t *testing.T) {
+	settings := &AmneziaWgSettings{
+		SecretKey: "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=",
+		Jc:        4,
+		Peers: []*AmneziaWgPeer{{
+			PublicKey: "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s=",
+			Endpoint:  "192.0.2.1:51820",
+		}},
+	}
+	ipc, err := settings.BuildIpcConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"header_protection_key", "content_padding", "rekey_", "reject_after", "keepalive_timeout", "max_handshake", "persistent_keepalive"} {
+		if strings.Contains(ipc, key) {
+			t.Errorf("unset AmneziaWG 3.0 setting %q leaked into the IPC config: %s", key, ipc)
+		}
+	}
+}
+
+func TestAmneziaWg3RejectsInvalidRangesAndKeyBeforeRunnerStartup(t *testing.T) {
+	peers := []*AmneziaWgPeer{{Endpoint: "198.51.100.2:51820"}}
+	cases := map[string]*AmneziaWgSettings{
+		"ContentPaddingAddition": {ContentPaddingAddition: "9-3", Peers: peers},
+		"RekeyAfterTime":         {RekeyAfterTime: "65536", Peers: peers},
+		"RekeyTimeout":           {RekeyTimeout: "abc", Peers: peers},
+		"RejectAfterTime":        {RejectAfterTime: "1-2-3", Peers: peers},
+		"KeepaliveTimeout":       {KeepaliveTimeout: "-1", Peers: peers},
+		"MaxHandshakeAttempts":   {MaxHandshakeAttempts: "5-", Peers: peers},
+		"HeaderProtectionKey":    {HeaderProtectionKey: "not-a-key", Peers: peers},
+		"PersistentKeepalive":    {Peers: []*AmneziaWgPeer{{Endpoint: "198.51.100.2:51820", KeepAlive: "7-1"}}},
+	}
+	for name, settings := range cases {
+		err := settings.validateNativeRunnerCompatibility()
+		if err == nil || !strings.Contains(err.Error(), name) {
+			t.Errorf("%s: expected a rejection naming the field, got %v", name, err)
+		}
+	}
+}

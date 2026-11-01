@@ -63,6 +63,62 @@ type AmneziaWgSettings struct {
 	I3   string `json:"i3"`
 	I4   string `json:"i4"`
 	I5   string `json:"i5"`
+
+	// AmneziaWG 3.0. Ranges are a number or an "N-M" string, 0..65535.
+	HeaderProtectionKey    string `json:"headerProtectionKey"`
+	ContentPaddingAddition any    `json:"contentPaddingAddition"`
+	RekeyAfterTime         any    `json:"rekeyAfterTime"`
+	RekeyTimeout           any    `json:"rekeyTimeout"`
+	RejectAfterTime        any    `json:"rejectAfterTime"`
+	KeepaliveTimeout       any    `json:"keepaliveTimeout"`
+	MaxHandshakeAttempts   any    `json:"maxHandshakeAttempts"`
+}
+
+// version3Ranges lists the AmneziaWG 3.0 range settings with their JSON and UAPI names.
+func (s *AmneziaWgSettings) version3Ranges() []struct {
+	name, uapi string
+	value      any
+} {
+	return []struct {
+		name, uapi string
+		value      any
+	}{
+		{"ContentPaddingAddition", "content_padding_addition", s.ContentPaddingAddition},
+		{"RekeyAfterTime", "rekey_after_time", s.RekeyAfterTime},
+		{"RekeyTimeout", "rekey_timeout", s.RekeyTimeout},
+		{"RejectAfterTime", "reject_after_time", s.RejectAfterTime},
+		{"KeepaliveTimeout", "keepalive_timeout", s.KeepaliveTimeout},
+		{"MaxHandshakeAttempts", "max_handshake_attempts", s.MaxHandshakeAttempts},
+	}
+}
+
+// rangeSet reports whether an AmneziaWG 3.0 range value is configured ("", "0" and "off" are not).
+func rangeSet(v any) (string, bool) {
+	text := stringVal(v)
+	return text, text != "" && text != "0" && !strings.EqualFold(text, "off")
+}
+
+// validateAmneziaWgU16Range accepts "N" or "N-M" with 0 <= N <= M <= 65535.
+func validateAmneziaWgU16Range(name, value string) error {
+	parts := strings.Split(value, "-")
+	if len(parts) > 2 {
+		return fmt.Errorf("AmneziaWG %s must be a number or a range", name)
+	}
+	var bounds []uint64
+	for _, part := range parts {
+		if part == "" || strings.TrimSpace(part) != part || part[0] == '+' {
+			return fmt.Errorf("AmneziaWG %s must be a number or a range", name)
+		}
+		n, err := strconv.ParseUint(part, 10, 16)
+		if err != nil {
+			return fmt.Errorf("AmneziaWG %s must be between 0 and 65535: %w", name, err)
+		}
+		bounds = append(bounds, n)
+	}
+	if bounds[0] > bounds[len(bounds)-1] {
+		return fmt.Errorf("AmneziaWG %s range is descending", name)
+	}
+	return nil
 }
 
 // HasAmneziaParams returns true if any AmneziaWG obfuscation parameter is configured.
@@ -84,6 +140,14 @@ func (s *AmneziaWgSettings) HasAmneziaParams() bool {
 	}
 	for _, spec := range []string{s.I1, s.I2, s.I3, s.I4, s.I5} {
 		if strings.TrimSpace(spec) != "" {
+			return true
+		}
+	}
+	if strings.TrimSpace(s.HeaderProtectionKey) != "" {
+		return true
+	}
+	for _, r := range s.version3Ranges() {
+		if _, set := rangeSet(r.value); set {
 			return true
 		}
 	}
@@ -172,12 +236,29 @@ func (s *AmneziaWgSettings) validateNativeRunnerCompatibility() error {
 			return err
 		}
 	}
+	if key := strings.TrimSpace(s.HeaderProtectionKey); key != "" {
+		if _, err := decodeKeyToHex(key); err != nil {
+			return fmt.Errorf("AmneziaWG HeaderProtectionKey is invalid: %w", err)
+		}
+	}
+	for _, r := range s.version3Ranges() {
+		if text, set := rangeSet(r.value); set {
+			if err := validateAmneziaWgU16Range(r.name, text); err != nil {
+				return err
+			}
+		}
+	}
 	if len(s.Peers) == 0 {
 		return errors.New("AmneziaWG requires a peer")
 	}
 	for index, peer := range s.Peers {
 		if peer == nil {
 			return fmt.Errorf("AmneziaWG peer %d is missing", index)
+		}
+		if text, set := rangeSet(peer.KeepAlive); set {
+			if err := validateAmneziaWgU16Range("PersistentKeepalive", text); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -496,6 +577,19 @@ func (s *AmneziaWgSettings) BuildIpcConfig() (string, error) {
 		}
 	}
 
+	if key := strings.TrimSpace(s.HeaderProtectionKey); key != "" {
+		keyHex, err := decodeKeyToHex(key)
+		if err != nil {
+			return "", fmt.Errorf("invalid header protection key: %w", err)
+		}
+		b.WriteString("header_protection_key=" + keyHex + "\n")
+	}
+	for _, r := range s.version3Ranges() {
+		if text, set := rangeSet(r.value); set {
+			b.WriteString(r.uapi + "=" + text + "\n")
+		}
+	}
+
 	for _, peer := range s.Peers {
 		if peer == nil {
 			return "", errors.New("AmneziaWG peer is missing")
@@ -525,7 +619,7 @@ func (s *AmneziaWgSettings) BuildIpcConfig() (string, error) {
 			b.WriteString("allowed_ip=" + ip + "\n")
 		}
 
-		if ka := stringVal(peer.KeepAlive); ka != "" && ka != "0" {
+		if ka, set := rangeSet(peer.KeepAlive); set {
 			b.WriteString("persistent_keepalive_interval=" + ka + "\n")
 		}
 	}
