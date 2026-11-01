@@ -1,7 +1,7 @@
 // Copyright 2026, Radetski
 // SPDX-License-Identifier: GPL-3.0
 
-//go:build linux || windows
+//go:build linux || windows || darwin
 
 package tunhost
 
