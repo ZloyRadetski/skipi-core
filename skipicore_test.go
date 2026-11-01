@@ -1078,3 +1078,98 @@ func TestHeaderProtectionKeyNeedsEveryPaddingOfAtLeast12(t *testing.T) {
 		t.Fatalf("small paddings without a header key must stay valid: %v", err)
 	}
 }
+
+func TestAmneziaWg31FlagsReachTheRunnerIpcConfig(t *testing.T) {
+	for name, tc := range map[string]struct {
+		json string
+		want []string
+	}{
+		"both on":          {`"randomTrailers": true, "disableCookies": true`, []string{"random_trailers=true\n", "disable_cookies=true\n"}},
+		"explicit off":     {`"randomTrailers": false, "disableCookies": false`, []string{"random_trailers=false\n", "disable_cookies=false\n"}},
+		"strings and nums": {`"randomTrailers": "on", "disableCookies": 1`, []string{"random_trailers=true\n", "disable_cookies=true\n"}},
+		"off spellings":    {`"randomTrailers": "OFF", "disableCookies": "0"`, []string{"random_trailers=false\n", "disable_cookies=false\n"}},
+	} {
+		settings, err := ParseAmneziaWgSettings(`{"protocol":"wireguard","settings":{
+			"secretKey": "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=",
+			"peers": [{"publicKey": "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s=", "endpoint": "192.0.2.1:51820"}],
+			` + tc.json + `}}`)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", name, err)
+		}
+		if !settings.HasAmneziaParams() {
+			t.Errorf("%s: a 3.1 flag alone must count as an AmneziaWG parameter", name)
+		}
+		if err := settings.validateNativeRunnerCompatibility(); err != nil {
+			t.Fatalf("%s: rejected: %v", name, err)
+		}
+		ipc, err := settings.BuildIpcConfig()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		for _, want := range tc.want {
+			if !strings.Contains(ipc, want) {
+				t.Errorf("%s: IPC config is missing %q: %s", name, want, ipc)
+			}
+		}
+	}
+}
+
+func TestAmneziaWg31UnsetFlagsAddNothingAndBadOnesAreRejected(t *testing.T) {
+	peers := []*AmneziaWgPeer{{Endpoint: "198.51.100.2:51820", PublicKey: "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s="}}
+	plain := &AmneziaWgSettings{SecretKey: "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=", Jc: 4, Peers: peers}
+	ipc, err := plain.BuildIpcConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(ipc, "random_trailers") || strings.Contains(ipc, "disable_cookies") {
+		t.Errorf("unset 3.1 flags leaked into the IPC config: %s", ipc)
+	}
+	for name, settings := range map[string]*AmneziaWgSettings{
+		"RandomTrailers": {RandomTrailers: "sometimes", Peers: peers},
+		"DisableCookies": {DisableCookies: 2, Peers: peers},
+	} {
+		err := settings.validateNativeRunnerCompatibility()
+		if err == nil || !strings.Contains(err.Error(), name) {
+			t.Errorf("%s: expected a rejection naming the field, got %v", name, err)
+		}
+	}
+}
+
+// The real runner must accept what the builder emits for the 3.1 flags.
+func TestAmneziaWg31FlagsAreAcceptedByTheRealRunner(t *testing.T) {
+	settings := &AmneziaWgSettings{
+		SecretKey:      "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=",
+		Jc:             4,
+		RandomTrailers: true,
+		DisableCookies: "on",
+		Peers: []*AmneziaWgPeer{{
+			PublicKey: "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s=",
+			Endpoint:  "192.0.2.1:51820",
+		}},
+	}
+	ipc, err := settings.BuildIpcConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunDev, _, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.8.0.2")}, nil, 1420)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), &device.Logger{
+		Verbosef: func(string, ...any) {}, Errorf: func(string, ...any) {},
+	})
+	defer dev.Close()
+	if err := dev.IpcSet(ipc); err != nil {
+		t.Fatalf("the runner rejected the AmneziaWG 3.1 config: %v\n%s", err, ipc)
+	}
+	got, err := dev.IpcGet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// IpcGet prints booleans as 1/0.
+	for _, want := range []string{"random_trailers=1", "disable_cookies=1"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the runner did not keep %q: %s", want, got)
+		}
+	}
+}

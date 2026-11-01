@@ -72,6 +72,44 @@ type AmneziaWgSettings struct {
 	RejectAfterTime        any    `json:"rejectAfterTime"`
 	KeepaliveTimeout       any    `json:"keepaliveTimeout"`
 	MaxHandshakeAttempts   any    `json:"maxHandshakeAttempts"`
+
+	// AmneziaWG 3.1 flags: true/false, "on"/"off" (any letter case) or 1/0.
+	RandomTrailers any `json:"randomTrailers"`
+	DisableCookies any `json:"disableCookies"`
+}
+
+// version31Flags lists the AmneziaWG 3.1 boolean settings with their JSON and UAPI names.
+func (s *AmneziaWgSettings) version31Flags() []struct {
+	name, uapi string
+	value      any
+} {
+	return []struct {
+		name, uapi string
+		value      any
+	}{
+		{"RandomTrailers", "random_trailers", s.RandomTrailers},
+		{"DisableCookies", "disable_cookies", s.DisableCookies},
+	}
+}
+
+// parseAmneziaWgFlag reads a 3.1 flag. set is false for an absent or empty value; err for anything that is
+// not true/false, on/off or 1/0.
+func parseAmneziaWgFlag(v any) (value, set bool, err error) {
+	switch val := v.(type) {
+	case nil:
+		return false, false, nil
+	case bool:
+		return val, true, nil
+	}
+	switch strings.ToLower(stringVal(v)) {
+	case "":
+		return false, false, nil
+	case "on", "true", "1":
+		return true, true, nil
+	case "off", "false", "0":
+		return false, true, nil
+	}
+	return false, true, fmt.Errorf("must be on/off, true/false or 1/0, got %q", stringVal(v))
 }
 
 // version3Ranges lists the AmneziaWG 3.0 range settings with their JSON and UAPI names.
@@ -145,6 +183,11 @@ func (s *AmneziaWgSettings) HasAmneziaParams() bool {
 	}
 	if strings.TrimSpace(s.HeaderProtectionKey) != "" {
 		return true
+	}
+	for _, f := range s.version31Flags() {
+		if _, set, _ := parseAmneziaWgFlag(f.value); set {
+			return true
+		}
 	}
 	for _, r := range s.version3Ranges() {
 		if _, set := rangeSet(r.value); set {
@@ -256,6 +299,11 @@ func (s *AmneziaWgSettings) validateNativeRunnerCompatibility() error {
 			if err := validateAmneziaWgU16Range(r.name, text); err != nil {
 				return err
 			}
+		}
+	}
+	for _, f := range s.version31Flags() {
+		if _, _, err := parseAmneziaWgFlag(f.value); err != nil {
+			return fmt.Errorf("AmneziaWG %s %w", f.name, err)
 		}
 	}
 	if len(s.Peers) == 0 {
@@ -597,6 +645,15 @@ func (s *AmneziaWgSettings) BuildIpcConfig() (string, error) {
 	for _, r := range s.version3Ranges() {
 		if text, set := rangeSet(r.value); set {
 			b.WriteString(r.uapi + "=" + text + "\n")
+		}
+	}
+	for _, f := range s.version31Flags() {
+		value, set, err := parseAmneziaWgFlag(f.value)
+		if err != nil {
+			return "", fmt.Errorf("AmneziaWG %s %w", f.name, err)
+		}
+		if set {
+			b.WriteString(f.uapi + "=" + strconv.FormatBool(value) + "\n")
 		}
 	}
 
