@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 )
 
@@ -914,6 +916,7 @@ func TestAmneziaWg3SettingsReachTheRunnerIpcConfig(t *testing.T) {
 				"keepAlive": "20-30"
 			}],
 			"headerProtectionKey": "`+headerKey+`",
+			"s1": 12, "s2": 20, "s3": 30, "s4": 40,
 			"contentPaddingAddition": "16-64",
 			"rekeyAfterTime": 120,
 			"rekeyTimeout": "5-10",
@@ -992,5 +995,86 @@ func TestAmneziaWg3RejectsInvalidRangesAndKeyBeforeRunnerStartup(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), name) {
 			t.Errorf("%s: expected a rejection naming the field, got %v", name, err)
 		}
+	}
+}
+
+// The real AmneziaWG runner, not just the string builder, must accept the 3.0 IPC config.
+func TestAmneziaWg3IpcConfigIsAcceptedByTheRealRunner(t *testing.T) {
+	settings := &AmneziaWgSettings{
+		SecretKey:              "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHZhbGlkIGtleSE=",
+		HeaderProtectionKey:    "c29tZSBoZWFkZXIgcHJvdGVjdGlvbiBrZXkgb2shISE=",
+		ContentPaddingAddition: "16-64",
+		RekeyAfterTime:         120,
+		RekeyTimeout:           "5-10",
+		RejectAfterTime:        180,
+		KeepaliveTimeout:       10,
+		MaxHandshakeAttempts:   "20-90",
+		Jc:                     4,
+		S1:                     12,
+		S2:                     20,
+		S3:                     30,
+		S4:                     40,
+		Peers: []*AmneziaWgPeer{{
+			PublicKey: "YW5vdGhlciB2YWxpZCBrZXkgZm9yIHRlc3Rpbmcgb2s=",
+			Endpoint:  "192.0.2.1:51820",
+			KeepAlive: "20-30",
+		}},
+	}
+	ipc, err := settings.BuildIpcConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunDev, _, err := netstack.CreateNetTUN([]netip.Addr{netip.MustParseAddr("10.8.0.2")}, nil, 1420)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev := device.NewDevice(tunDev, conn.NewDefaultBind(), &device.Logger{
+		Verbosef: func(string, ...any) {}, Errorf: func(string, ...any) {},
+	})
+	defer dev.Close()
+	if err := dev.IpcSet(ipc); err != nil {
+		t.Fatalf("the runner rejected the AmneziaWG 3.0 config: %v\n%s", err, ipc)
+	}
+	got, err := dev.IpcGet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"content_padding_addition=16-64", "rekey_after_time=120", "rekey_timeout=5-10",
+		"reject_after_time=180", "keepalive_timeout=10", "max_handshake_attempts=20-90",
+		"persistent_keepalive_interval=20-30",
+	} {
+		if !strings.Contains(got, expected) {
+			t.Errorf("the runner did not keep %q: %s", expected, got)
+		}
+	}
+}
+
+// The runner refuses a header protection key unless S1..S4 each leave room for the 12-byte nonce.
+func TestHeaderProtectionKeyNeedsEveryPaddingOfAtLeast12(t *testing.T) {
+	const headerKey = "c29tZSBoZWFkZXIgcHJvdGVjdGlvbiBrZXkgb2shISE="
+	peers := []*AmneziaWgPeer{{Endpoint: "198.51.100.2:51820"}}
+	full := func() *AmneziaWgSettings {
+		return &AmneziaWgSettings{HeaderProtectionKey: headerKey, S1: 12, S2: 12, S3: 12, S4: 12, Peers: peers}
+	}
+	if err := full().validateNativeRunnerCompatibility(); err != nil {
+		t.Fatalf("paddings of exactly 12 must be accepted: %v", err)
+	}
+	for name, mutate := range map[string]func(*AmneziaWgSettings){
+		"s1": func(s *AmneziaWgSettings) { s.S1 = 11 },
+		"s2": func(s *AmneziaWgSettings) { s.S2 = 0 },
+		"s3": func(s *AmneziaWgSettings) { s.S3 = 0 },
+		"s4": func(s *AmneziaWgSettings) { s.S4 = 5 },
+	} {
+		settings := full()
+		mutate(settings)
+		err := settings.validateNativeRunnerCompatibility()
+		if err == nil || !strings.Contains(err.Error(), name) {
+			t.Errorf("%s below 12 must be rejected naming the field, got %v", name, err)
+		}
+	}
+	// Without the key small paddings stay valid.
+	if err := (&AmneziaWgSettings{S1: 1, Peers: peers}).validateNativeRunnerCompatibility(); err != nil {
+		t.Fatalf("small paddings without a header key must stay valid: %v", err)
 	}
 }

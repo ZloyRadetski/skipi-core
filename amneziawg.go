@@ -174,6 +174,7 @@ func stringVal(v any) string {
 
 const (
 	amneziaWgMaxJunkCount               = 128
+	amneziaWgHeaderProtectionMinPadding = 12
 	amneziaWgMaxJunkOrPaddingSize       = 1280
 	amneziaWgMaxObfuscationChainBytes   = 4096
 	amneziaWgEndpointLookupTimeout      = 3 * time.Second
@@ -239,6 +240,15 @@ func (s *AmneziaWgSettings) validateNativeRunnerCompatibility() error {
 	if key := strings.TrimSpace(s.HeaderProtectionKey); key != "" {
 		if _, err := decodeKeyToHex(key); err != nil {
 			return fmt.Errorf("AmneziaWG HeaderProtectionKey is invalid: %w", err)
+		}
+		// The runner encrypts the header with a 12-byte nonce carried in the S1..S4 padding.
+		for _, padding := range []struct {
+			name  string
+			value int
+		}{{"s1", s.S1}, {"s2", s.S2}, {"s3", s.S3}, {"s4", s.S4}} {
+			if padding.value < amneziaWgHeaderProtectionMinPadding {
+				return fmt.Errorf("AmneziaWG %s must be at least %d to use HeaderProtectionKey", padding.name, amneziaWgHeaderProtectionMinPadding)
+			}
 		}
 	}
 	for _, r := range s.version3Ranges() {
