@@ -121,7 +121,20 @@ jobs:
           (cd release-assets && sha256sum * > sha256sums-desktop.txt)
 
       - name: Release Desktop Binaries
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag_name != '' && inputs.tag_name || github.ref_name }}
-          files: release-assets/*
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag_name != '' && inputs.tag_name || github.ref_name }}
+        run: |
+          # The AAR workflow creates the same release at the same moment, so creation must
+          # tolerate "already exists", and an upload must survive a dropped connection.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes || { sleep 20; gh release view "$TAG" >/dev/null; }
+          fi
+          for file in release-assets/*; do
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "$TAG" "$file" --clobber; then break; fi
+              if [ "$attempt" = 5 ]; then echo "::error::Upload of $file failed"; exit 1; fi
+              echo "Upload of $file failed (attempt $attempt), retrying"; sleep $((attempt * 10))
+            done
+          done
