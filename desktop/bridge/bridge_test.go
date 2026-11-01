@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"syscall"
 	"testing"
@@ -342,27 +343,30 @@ func TestMeasureOutboundDelayRejectsBlankInputAndBadConfig(t *testing.T) {
 	}
 }
 
-// dialedAddresses records every destination Core's own dialer was asked for. The controller
-// registry is process-wide and cannot be undone, so one recorder serves the whole test binary.
+// dialedAddresses records every destination Core's own dialer was asked for. Xray's controller
+// registry is a process-wide slice that its dialers read without a lock and that cannot be undone,
+// so the one recorder is registered in TestMain, before any test (and any goroutine a test leaves
+// dialing in the background) exists. Registering it from inside a test raced with such dials.
 var (
 	dialedMu        sync.Mutex
 	dialedAddresses []string
-	recordDials     sync.Once
 )
+
+func TestMain(m *testing.M) {
+	if err := internet.RegisterDialerController(func(network, address string, c syscall.RawConn) error {
+		dialedMu.Lock()
+		dialedAddresses = append(dialedAddresses, address)
+		dialedMu.Unlock()
+		return nil
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "register dialer controller: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
 
 func recordedDials(t *testing.T) func() []string {
 	t.Helper()
-	recordDials.Do(func() {
-		err := internet.RegisterDialerController(func(network, address string, c syscall.RawConn) error {
-			dialedMu.Lock()
-			dialedAddresses = append(dialedAddresses, address)
-			dialedMu.Unlock()
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("register dialer controller: %v", err)
-		}
-	})
 	return func() []string {
 		dialedMu.Lock()
 		defer dialedMu.Unlock()
