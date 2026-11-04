@@ -440,3 +440,27 @@ func TestMeasureTcpDelayRejectsInvalidInput(t *testing.T) {
 		}
 	}
 }
+
+func TestConnectionLogIsReachableThroughAHandleOnly(t *testing.T) {
+	runtime := NewRuntime()
+	handle := runtime.CreateController()
+
+	if err := runtime.SetConnectionLogEnabled(handle, true); err != nil {
+		t.Fatalf("enable connection log: %v", err)
+	}
+	snapshot, err := runtime.ReadConnectionLog(handle, 0)
+	if err != nil {
+		t.Fatalf("read connection log: %v", err)
+	}
+	if snapshot != `{"seq":0,"entries":[]}` {
+		t.Fatalf("unexpected snapshot: %s", snapshot)
+	}
+
+	unknown := handle + 1000
+	if err := runtime.SetConnectionLogEnabled(unknown, true); !errors.Is(err, ErrControllerNotFound) {
+		t.Fatalf("expected ErrControllerNotFound, got %v", err)
+	}
+	if _, err := runtime.ReadConnectionLog(unknown, 0); !errors.Is(err, ErrControllerNotFound) {
+		t.Fatalf("expected ErrControllerNotFound, got %v", err)
+	}
+}

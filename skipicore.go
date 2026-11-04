@@ -136,6 +136,7 @@ type CoreController struct {
 	trafficStatsTotals map[string]int64
 	callback           CoreCallbackHandler
 	isRunning          bool
+	connections        *connectionRecorder
 }
 
 // trafficStatsBytes is deliberately kept private: the mobile binding only
@@ -166,7 +167,8 @@ func NewCoreController(handler CoreCallbackHandler) *CoreController {
 	})
 
 	return &CoreController{
-		callback: handler,
+		callback:    handler,
+		connections: newConnectionRecorder(),
 	}
 }
 
@@ -212,6 +214,8 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 		clearTunFdEnv()
 		return fmt.Errorf("failed to create xray instance: %w", err)
 	}
+	c.connections.reset()
+	installSessionLogHandler(server, c.connections)
 
 	if mgr := server.GetFeature(corestats.ManagerType()); mgr != nil {
 		if sm, ok := mgr.(corestats.Manager); ok {
@@ -223,6 +227,7 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 		// Xray does not roll back features that started before the failing one, so
 		// inbounds already listening would keep their ports until the process exits.
 		_ = server.Close()
+		clearSessionLogHandler()
 		clearTunFdEnv()
 		c.statsManager = nil
 		c.trafficStatsTotals = nil
@@ -256,6 +261,7 @@ func (c *CoreController) StopLoop() error {
 	}
 
 	err := c.instance.Close()
+	clearSessionLogHandler()
 	c.instance = nil
 	c.statsManager = nil
 	c.trafficStatsTotals = nil
@@ -587,6 +593,7 @@ func startOutboundTestInstance(configJSON string) (*core.Instance, error) {
 	config.App = essentialApps
 
 	server, err := core.New(config)
+	restoreSessionLogHandler()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create test instance: %w", err)
 	}
@@ -1013,6 +1020,7 @@ func FastSelectBestOutbound(configJSON string, candidateTags string, probeURL st
 	config.Inbound = nil
 
 	server, err := core.New(config)
+	restoreSessionLogHandler()
 	if err != nil {
 		return candidates[0]
 	}
