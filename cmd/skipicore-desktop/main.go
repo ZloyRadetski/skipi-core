@@ -244,6 +244,26 @@ func SkipiCoreDesktopQueryTrafficStats(handle C.uint64_t) *C.char {
 	})
 }
 
+// SkipiCoreDesktopSetConnectionLogEnabled switches the connection log of a controller.
+// Returns NULL on success.
+//
+//export SkipiCoreDesktopSetConnectionLogEnabled
+func SkipiCoreDesktopSetConnectionLogEnabled(handle C.uint64_t, enabled C.int32_t) *C.char {
+	return cError(func() error {
+		return desktopRuntime.SetConnectionLogEnabled(desktopbridge.Handle(handle), enabled != 0)
+	})
+}
+
+// SkipiCoreDesktopReadConnectionLog returns an owned JSON snapshot of the routed connections
+// newer than afterSeq, or NULL on error.
+//
+//export SkipiCoreDesktopReadConnectionLog
+func SkipiCoreDesktopReadConnectionLog(handle C.uint64_t, afterSeq C.int64_t) *C.char {
+	return cString(func() (string, error) {
+		return desktopRuntime.ReadConnectionLog(desktopbridge.Handle(handle), int64(afterSeq))
+	})
+}
+
 // SkipiCoreDesktopMeasureDelay returns the in-process delay result in
 // milliseconds, or -1 on error. Consult SkipiCoreDesktopLastError after -1.
 //

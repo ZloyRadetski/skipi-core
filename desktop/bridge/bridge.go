@@ -236,6 +236,25 @@ func (r *Runtime) QueryTrafficStats(handle Handle) (string, error) {
 	return controller.QueryTrafficStats(), nil
 }
 
+// SetConnectionLogEnabled switches the connection log of a controller.
+func (r *Runtime) SetConnectionLogEnabled(handle Handle, enabled bool) error {
+	controller, err := r.controller(handle)
+	if err != nil {
+		return err
+	}
+	controller.SetConnectionLogEnabled(enabled)
+	return nil
+}
+
+// ReadConnectionLog returns the routed connections newer than afterSeq as JSON.
+func (r *Runtime) ReadConnectionLog(handle Handle, afterSeq int64) (string, error) {
+	controller, err := r.controller(handle)
+	if err != nil {
+		return "", err
+	}
+	return controller.ReadConnectionLog(afterSeq), nil
+}
+
 // MeasureDelay performs the existing in-process delay probe through a running
 // controller. The target URL is validated by SKIPI Core itself. The probe can take
 // seconds, so it runs without holding the runtime locks: state reads and Stop
