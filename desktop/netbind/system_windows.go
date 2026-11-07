@@ -89,6 +89,7 @@ func systemAdapters() ([]Adapter, error) {
 			return nil, err
 		}
 	}
+	routeMetrics, routeErr := windowsDefaultRouteMetrics()
 	var adapters []Adapter
 	for current := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0])); current != nil; current = current.Next {
 		adapters = append(adapters, Adapter{
@@ -97,7 +98,7 @@ func systemAdapters() ([]Adapter, error) {
 			Up:         current.OperStatus == windows.IfOperStatusUp,
 			HasGateway: hasIPv4Gateway(current),
 			Loopback:   current.IfType == windows.IF_TYPE_SOFTWARE_LOOPBACK,
-			Metric:     current.Ipv4Metric,
+			Metric:     effectiveMetric(current.IfIndex, current.Ipv4Metric, routeMetrics, routeErr == nil),
 		})
 	}
 	return adapters, nil
@@ -110,4 +111,38 @@ func hasIPv4Gateway(adapter *windows.IpAdapterAddresses) bool {
 		}
 	}
 	return false
+}
+
+var (
+	iphlpapi               = windows.NewLazySystemDLL("iphlpapi.dll")
+	procGetIpForwardTable2 = iphlpapi.NewProc("GetIpForwardTable2")
+	procFreeMibTable       = iphlpapi.NewProc("FreeMibTable")
+)
+
+// windowsDefaultRouteMetrics reads the IPv4 forwarding table and returns each interface's lowest
+// default-route metric.
+func windowsDefaultRouteMetrics() (map[uint32]uint32, error) {
+	var table unsafe.Pointer
+	if r, _, _ := procGetIpForwardTable2.Call(uintptr(windows.AF_INET), uintptr(unsafe.Pointer(&table))); r != 0 {
+		return nil, windows.Errno(r)
+	}
+	defer procFreeMibTable.Call(uintptr(table))
+	count := int(*(*uint32)(table))
+	raw := unsafe.Slice((*byte)(table), forwardTableHeader+count*forwardRowSize)
+	return defaultRouteMetrics(append([]byte(nil), raw...)), nil
+}
+
+// effectiveMetric is what Windows ranks routes by: the default route's metric plus the interface
+// metric. A VPN adapter often has interface metric 1 but a default route metric in the thousands,
+// so ranking by the interface metric alone would pick it over the physical link. An adapter without
+// a default route in a table that was read ranks last; without the table the interface metric stays.
+func effectiveMetric(index, interfaceMetric uint32, routeMetrics map[uint32]uint32, haveTable bool) uint32 {
+	if !haveTable {
+		return interfaceMetric
+	}
+	routeMetric, ok := routeMetrics[index]
+	if !ok {
+		return ^uint32(0)
+	}
+	return interfaceMetric + routeMetric
 }

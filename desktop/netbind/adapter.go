@@ -15,7 +15,8 @@ type Adapter struct {
 	Up         bool
 	HasGateway bool
 	Loopback   bool
-	// Metric is the adapter's IPv4 interface metric; lower wins.
+	// Metric ranks the adapters; lower wins. On Windows it is the default route's metric plus the
+	// interface metric, as the system adds them.
 	Metric uint32
 }
 

@@ -244,8 +244,8 @@ func SkipiCoreDesktopQueryTrafficStats(handle C.uint64_t) *C.char {
 	})
 }
 
-// SkipiCoreDesktopSetConnectionLogEnabled switches the session's in-memory
-// connection log; a non-zero value enables it. Returns an owned error string.
+// SkipiCoreDesktopSetConnectionLogEnabled switches the connection log of a controller.
+// Returns NULL on success.
 //
 //export SkipiCoreDesktopSetConnectionLogEnabled
 func SkipiCoreDesktopSetConnectionLogEnabled(handle C.uint64_t, enabled C.int32_t) *C.char {
@@ -254,8 +254,8 @@ func SkipiCoreDesktopSetConnectionLogEnabled(handle C.uint64_t, enabled C.int32_
 	})
 }
 
-// SkipiCoreDesktopReadConnectionLog returns owned JSON with the connections newer
-// than after_seq, or NULL on error. Consult SkipiCoreDesktopLastError after NULL.
+// SkipiCoreDesktopReadConnectionLog returns an owned JSON snapshot of the routed connections
+// newer than afterSeq, or NULL on error.
 //
 //export SkipiCoreDesktopReadConnectionLog
 func SkipiCoreDesktopReadConnectionLog(handle C.uint64_t, afterSeq C.int64_t) *C.char {

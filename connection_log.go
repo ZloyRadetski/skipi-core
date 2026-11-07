@@ -5,33 +5,26 @@ package skipicore
 
 import (
 	"encoding/json"
-	"net"
-	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	coreapplog "github.com/xtls/xray-core/app/log"
 	corecommlog "github.com/xtls/xray-core/common/log"
-	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/core"
 )
 
-const (
-	// connectionLogCapacity bounds the in-memory history a host can scroll back through.
-	connectionLogCapacity = 512
-	// connectionLogPendingLimit bounds names waiting for an access record that may never come.
-	connectionLogPendingLimit = 2048
+// connectionLogCapacity bounds the entries kept for a client that polls slowly.
+const connectionLogCapacity = 1000
 
-	dispatcherLogPrefix = "app/dispatcher: "
-	sniffedDomainPrefix = "sniffed domain: "
-	defaultRoutePrefix  = "default route for "
-	detourMarker        = "taking detour ["
-	detourTargetMarker  = "] for ["
-)
+// connectionLogPendingLimit bounds sniffed names waiting for their routing line.
+const connectionLogPendingLimit = 4096
 
-// connectionEntry is one connection the running session accepted. It only ever lives in memory.
-type connectionEntry struct {
+// ConnectionLogEntry is one routed connection: where it goes and through which outbound.
+type ConnectionLogEntry struct {
 	Seq      int64  `json:"seq"`
 	Time     int64  `json:"time"`
 	Host     string `json:"host"`
@@ -41,243 +34,168 @@ type connectionEntry struct {
 }
 
 type connectionLogSnapshot struct {
-	Seq     int64             `json:"seq"`
-	Entries []connectionEntry `json:"entries"`
+	Seq     int64                `json:"seq"`
+	Entries []ConnectionLogEntry `json:"entries"`
 }
 
-// routedName is a sniffed domain waiting for the access record of its connection.
-type routedName struct {
-	domain      string
-	destination string
-}
+var (
+	sniffedDomainPattern = regexp.MustCompile(`\[(\d+)\] .*?sniffed domain: (\S+)`)
+	routedPattern        = regexp.MustCompile(`\[(\d+)\] .*?taking detour \[(.+?)\] for \[(.+?)\]`)
+	defaultRoutePattern  = regexp.MustCompile(`\[(\d+)\] .*?default route for (\S+)`)
+)
 
-// connectionRecorder turns Xray's log stream into connection entries. Xray writes an access record
-// with the address the client asked for, which is a bare IP for a TUN client: the sniffed name exists
-// only in the dispatcher's Info messages of that session, so the two are joined here.
-type connectionRecorder struct {
+// connectionLog joins the dispatcher's Info lines of one session into routed connections.
+// Xray records the address before sniffing, so only these lines carry the real domain.
+type connectionLog struct {
 	enabled atomic.Bool
 
 	mu      sync.Mutex
-	nextSeq int64
-	entries []connectionEntry
-	sniffed map[string]string
-	routed  map[string][]routedName
-	pending int
+	seq     int64
+	entries []ConnectionLogEntry
+	pending map[string]string
 }
 
-func newConnectionRecorder() *connectionRecorder {
-	return &connectionRecorder{
-		sniffed: make(map[string]string),
-		routed:  make(map[string][]routedName),
+func newConnectionLog(enabled bool) *connectionLog {
+	l := &connectionLog{pending: make(map[string]string)}
+	l.enabled.Store(enabled)
+	return l
+}
+
+// record reads one log line; lines that are not about routing are ignored.
+func (l *connectionLog) record(line string) {
+	if !l.enabled.Load() {
+		return
 	}
-}
-
-// reset forgets the previous session. Sequence numbers keep growing so a host's cursor stays valid.
-func (r *connectionRecorder) reset() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.entries = nil
-	r.forgetPendingLocked()
-}
-
-func (r *connectionRecorder) forgetPendingLocked() {
-	r.sniffed = make(map[string]string)
-	r.routed = make(map[string][]routedName)
-	r.pending = 0
-}
-
-func (r *connectionRecorder) observe(message corecommlog.Message) {
-	switch typed := message.(type) {
-	case *corecommlog.AccessMessage:
-		r.record(typed)
-	case *corecommlog.GeneralMessage:
-		if typed.Severity == corecommlog.Severity_Info {
-			r.observeDispatcher(serial.ToString(typed.Content))
+	if m := sniffedDomainPattern.FindStringSubmatch(line); m != nil {
+		l.mu.Lock()
+		if len(l.pending) >= connectionLogPendingLimit {
+			l.pending = make(map[string]string)
 		}
+		l.pending[m[1]] = m[2]
+		l.mu.Unlock()
+		return
+	}
+	if m := routedPattern.FindStringSubmatch(line); m != nil {
+		l.add(m[1], m[3], m[2])
+		return
+	}
+	if m := defaultRoutePattern.FindStringSubmatch(line); m != nil {
+		l.add(m[1], m[2], "default")
 	}
 }
 
-func (r *connectionRecorder) observeDispatcher(text string) {
-	session, body, found := strings.Cut(text, dispatcherLogPrefix)
-	if !found {
+func (l *connectionLog) add(id, destination, outbound string) {
+	network, host, port := splitDestination(destination)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if name, ok := l.pending[id]; ok {
+		host = name
+		delete(l.pending, id)
+	}
+	if host == "" {
 		return
 	}
-	session = strings.TrimSpace(session)
-
-	if domain, ok := strings.CutPrefix(body, sniffedDomainPrefix); ok {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		if len(r.sniffed)+r.pending >= connectionLogPendingLimit {
-			r.forgetPendingLocked()
-		}
-		r.sniffed[session] = domain
-		return
-	}
-
-	destination, ok := routedDestination(body)
-	if !ok {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	domain, ok := r.sniffed[session]
-	if !ok {
-		return
-	}
-	delete(r.sniffed, session)
-	key := routedKey(destination)
-	r.routed[key] = append(r.routed[key], routedName{domain: domain, destination: destination})
-	r.pending++
-}
-
-// routedDestination reads the destination out of the dispatcher's routing messages.
-func routedDestination(body string) (string, bool) {
-	if destination, ok := strings.CutPrefix(body, defaultRoutePrefix); ok {
-		return destination, true
-	}
-	index := strings.Index(body, detourMarker)
-	if index < 0 {
-		return "", false
-	}
-	rest := body[index+len(detourMarker):]
-	start := strings.LastIndex(rest, detourTargetMarker)
-	if start < 0 || !strings.HasSuffix(rest, "]") {
-		return "", false
-	}
-	return rest[start+len(detourTargetMarker) : len(rest)-1], true
-}
-
-// routedKey groups a destination by network and port, which sniffing never changes.
-func routedKey(destination string) string {
-	network, _, port, ok := parseConnectionTarget(destination)
-	if !ok {
-		return destination
-	}
-	return network + ":" + strconv.Itoa(port)
-}
-
-func (r *connectionRecorder) record(message *corecommlog.AccessMessage) {
-	if message.Status != corecommlog.AccessAccepted {
-		return
-	}
-	outbound := detourOutbound(message.Detour)
-	if outbound == "" {
-		return
-	}
-	target := serial.ToString(message.To)
-	network, host, port, ok := parseConnectionTarget(target)
-	if !ok {
-		return
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	domain := r.takeRoutedLocked(network, port, target)
-	if domain != "" && net.ParseIP(host) != nil {
-		host = domain
-	}
-	r.nextSeq++
-	r.entries = append(r.entries, connectionEntry{
-		Seq:      r.nextSeq,
+	l.seq++
+	l.entries = append(l.entries, ConnectionLogEntry{
+		Seq:      l.seq,
 		Time:     time.Now().UnixMilli(),
 		Host:     host,
 		Port:     port,
 		Network:  network,
 		Outbound: outbound,
 	})
-	if len(r.entries) > connectionLogCapacity {
-		r.entries = append(r.entries[:0], r.entries[len(r.entries)-connectionLogCapacity:]...)
+	if over := len(l.entries) - connectionLogCapacity; over > 0 {
+		l.entries = append([]ConnectionLogEntry(nil), l.entries[over:]...)
 	}
 }
 
-// takeRoutedLocked finds the name routed for this access record. Route-only sniffing keeps the IP in
-// the routing message, so it matches exactly; otherwise that message carries the domain instead.
-func (r *connectionRecorder) takeRoutedLocked(network string, port int, target string) string {
-	key := network + ":" + strconv.Itoa(port)
-	candidates := r.routed[key]
-	for index, candidate := range candidates {
-		_, host, _, ok := parseConnectionTarget(candidate.destination)
-		if candidate.destination == target || (ok && net.ParseIP(host) == nil) {
-			r.routed[key] = append(candidates[:index:index], candidates[index+1:]...)
-			if len(r.routed[key]) == 0 {
-				delete(r.routed, key)
-			}
-			r.pending--
-			return candidate.domain
+// splitDestination reads Xray's "network:host:port", where an IPv6 host is bracketed.
+func splitDestination(destination string) (network, host string, port int) {
+	network = "tcp"
+	if i := strings.Index(destination, ":"); i > 0 {
+		network, destination = destination[:i], destination[i+1:]
+	}
+	if i := strings.LastIndex(destination, ":"); i >= 0 {
+		if p, err := strconv.Atoi(destination[i+1:]); err == nil {
+			port = p
+			destination = destination[:i]
 		}
 	}
-	return ""
+	return network, strings.Trim(destination, "[]"), port
 }
 
-// detourOutbound reads the outbound tag from "inbound >> outbound", "->" and "==>" forms, or a bare tag.
-func detourOutbound(detour string) string {
-	for _, separator := range []string{" >> ", " -> ", " ==> "} {
-		if _, outbound, found := strings.Cut(detour, separator); found {
-			return strings.TrimSpace(outbound)
+// snapshot returns the entries newer than afterSeq and the cursor for the next read.
+func (l *connectionLog) snapshot(afterSeq int64) string {
+	l.mu.Lock()
+	out := connectionLogSnapshot{Seq: l.seq, Entries: []ConnectionLogEntry{}}
+	for _, e := range l.entries {
+		if e.Seq > afterSeq {
+			out.Entries = append(out.Entries, e)
 		}
 	}
-	return strings.TrimSpace(detour)
-}
-
-// parseConnectionTarget reads the forms Xray inbounds put into an access record: tcp:host:port and
-// udp:host:port from SOCKS, //host:port from an HTTP CONNECT, and a full URL from a plain HTTP request.
-func parseConnectionTarget(target string) (network string, host string, port int, ok bool) {
-	if strings.HasPrefix(target, "//") || strings.Contains(target, "://") {
-		parsed, err := url.Parse(target)
-		if err != nil || parsed.Hostname() == "" {
-			return "", "", 0, false
-		}
-		port, err = strconv.Atoi(parsed.Port())
-		if err != nil {
-			switch parsed.Scheme {
-			case "http":
-				port = 80
-			case "https":
-				port = 443
-			default:
-				return "", "", 0, false
-			}
-		}
-		return "tcp", parsed.Hostname(), port, true
-	}
-	network, address, found := strings.Cut(target, ":")
-	if !found || (network != "tcp" && network != "udp") {
-		return "", "", 0, false
-	}
-	host, rawPort, err := net.SplitHostPort(address)
-	if err != nil {
-		return "", "", 0, false
-	}
-	port, err = strconv.Atoi(rawPort)
-	if err != nil {
-		return "", "", 0, false
-	}
-	return network, host, port, true
-}
-
-// read returns the entries newer than [after] and the cursor to pass next time.
-func (r *connectionRecorder) read(after int64) string {
-	r.mu.Lock()
-	snapshot := connectionLogSnapshot{Seq: r.nextSeq, Entries: []connectionEntry{}}
-	for _, entry := range r.entries {
-		if entry.Seq > after {
-			snapshot.Entries = append(snapshot.Entries, entry)
-		}
-	}
-	r.mu.Unlock()
-	encoded, err := json.Marshal(snapshot)
+	l.mu.Unlock()
+	encoded, err := json.Marshal(out)
 	if err != nil {
 		return `{"seq":0,"entries":[]}`
 	}
 	return string(encoded)
 }
 
-// SetConnectionLogEnabled switches the in-memory connection log. It applies at once, running or not.
-func (c *CoreController) SetConnectionLogEnabled(enabled bool) {
-	c.connections.enabled.Store(enabled)
+// connectionLogHandler sits in front of Xray's own log instance: it hands every line on,
+// and reads Info lines for the connection log, which the configured level would drop.
+type connectionLogHandler struct {
+	inner corecommlog.Handler
+	log   *connectionLog
 }
 
-// ReadConnectionLog returns the connections newer than [afterSeq] as JSON: {"seq":n,"entries":[...]}.
-func (c *CoreController) ReadConnectionLog(afterSeq int64) string {
-	return c.connections.read(afterSeq)
+func (h *connectionLogHandler) Handle(msg corecommlog.Message) {
+	if g, ok := msg.(*corecommlog.GeneralMessage); ok && g.Severity == corecommlog.Severity_Info {
+		h.log.record(msg.String())
+	}
+	if h.inner != nil {
+		h.inner.Handle(msg)
+	}
+}
+
+// Severity lets Info lines reach the handler while the log is on; the inner instance still
+// applies the configured level to what it writes.
+func (h *connectionLogHandler) Severity() corecommlog.Severity {
+	severity := corecommlog.Severity_Warning
+	if s, ok := h.inner.(corecommlog.SeverityLogger); ok {
+		severity = s.Severity()
+	}
+	if h.log.enabled.Load() && severity < corecommlog.Severity_Info {
+		return corecommlog.Severity_Info
+	}
+	return severity
+}
+
+// activeConnectionLog is the running session's handler. Every core.New replaces Xray's
+// process-global handler, so a probe must put it back with restoreConnectionLog.
+var activeConnectionLog atomic.Pointer[connectionLogHandler]
+
+// installConnectionLog puts the handler in front of the log instance of server.
+func installConnectionLog(server *core.Instance, l *connectionLog) {
+	h := &connectionLogHandler{log: l}
+	if feature := server.GetFeature((*coreapplog.Instance)(nil)); feature != nil {
+		if inner, ok := feature.(corecommlog.Handler); ok {
+			h.inner = inner
+		}
+	}
+	activeConnectionLog.Store(h)
+	corecommlog.RegisterHandler(h)
+}
+
+// restoreConnectionLog takes the global handler back after a probe replaced it.
+func restoreConnectionLog() {
+	if h := activeConnectionLog.Load(); h != nil {
+		corecommlog.RegisterHandler(h)
+	}
+}
+
+// clearConnectionLog forgets the session's handler once it has stopped.
+func clearConnectionLog(l *connectionLog) {
+	if h := activeConnectionLog.Load(); h != nil && h.log == l {
+		activeConnectionLog.Store(nil)
+	}
 }

@@ -136,7 +136,8 @@ type CoreController struct {
 	trafficStatsTotals map[string]int64
 	callback           CoreCallbackHandler
 	isRunning          bool
-	connections        *connectionRecorder
+	connLog            *connectionLog
+	connLogEnabled     bool
 }
 
 // trafficStatsBytes is deliberately kept private: the mobile binding only
@@ -167,8 +168,7 @@ func NewCoreController(handler CoreCallbackHandler) *CoreController {
 	})
 
 	return &CoreController{
-		callback:    handler,
-		connections: newConnectionRecorder(),
+		callback: handler,
 	}
 }
 
@@ -214,8 +214,9 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 		clearTunFdEnv()
 		return fmt.Errorf("failed to create xray instance: %w", err)
 	}
-	c.connections.reset()
-	installSessionLogHandler(server, c.connections)
+	// Every session counts connections from zero.
+	connLog := newConnectionLog(c.connLogEnabled)
+	installConnectionLog(server, connLog)
 
 	if mgr := server.GetFeature(corestats.ManagerType()); mgr != nil {
 		if sm, ok := mgr.(corestats.Manager); ok {
@@ -227,7 +228,7 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 		// Xray does not roll back features that started before the failing one, so
 		// inbounds already listening would keep their ports until the process exits.
 		_ = server.Close()
-		clearSessionLogHandler()
+		clearConnectionLog(connLog)
 		clearTunFdEnv()
 		c.statsManager = nil
 		c.trafficStatsTotals = nil
@@ -235,6 +236,7 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	}
 
 	c.instance = server
+	c.connLog = connLog
 	c.isRunning = true
 
 	if c.callback != nil {
@@ -261,7 +263,8 @@ func (c *CoreController) StopLoop() error {
 	}
 
 	err := c.instance.Close()
-	clearSessionLogHandler()
+	clearConnectionLog(c.connLog)
+	c.connLog = nil
 	c.instance = nil
 	c.statsManager = nil
 	c.trafficStatsTotals = nil
@@ -277,6 +280,28 @@ func (c *CoreController) StopLoop() error {
 	}
 
 	return err
+}
+
+// SetConnectionLogEnabled switches the connection log of this and later sessions.
+func (c *CoreController) SetConnectionLogEnabled(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.connLogEnabled = enabled
+	if c.connLog != nil {
+		c.connLog.enabled.Store(enabled)
+	}
+}
+
+// ReadConnectionLog returns the routed connections newer than afterSeq as JSON. It takes
+// no controller lock, so a slow probe cannot hold a poll back.
+func (c *CoreController) ReadConnectionLog(afterSeq int64) string {
+	c.mu.Lock()
+	l := c.connLog
+	c.mu.Unlock()
+	if l == nil {
+		return `{"seq":0,"entries":[]}`
+	}
+	return l.snapshot(afterSeq)
 }
 
 // IsRunning returns whether the core instance is currently running.
@@ -593,10 +618,10 @@ func startOutboundTestInstance(configJSON string) (*core.Instance, error) {
 	config.App = essentialApps
 
 	server, err := core.New(config)
-	restoreSessionLogHandler()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create test instance: %w", err)
 	}
+	restoreConnectionLog()
 
 	if err := server.Start(); err != nil {
 		_ = server.Close()
@@ -1020,10 +1045,10 @@ func FastSelectBestOutbound(configJSON string, candidateTags string, probeURL st
 	config.Inbound = nil
 
 	server, err := core.New(config)
-	restoreSessionLogHandler()
 	if err != nil {
 		return candidates[0]
 	}
+	restoreConnectionLog()
 
 	if err := server.Start(); err != nil {
 		_ = server.Close()

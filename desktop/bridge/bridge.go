@@ -236,7 +236,7 @@ func (r *Runtime) QueryTrafficStats(handle Handle) (string, error) {
 	return controller.QueryTrafficStats(), nil
 }
 
-// SetConnectionLogEnabled switches a controller's in-memory connection log.
+// SetConnectionLogEnabled switches the connection log of a controller.
 func (r *Runtime) SetConnectionLogEnabled(handle Handle, enabled bool) error {
 	controller, err := r.controller(handle)
 	if err != nil {
@@ -246,7 +246,7 @@ func (r *Runtime) SetConnectionLogEnabled(handle Handle, enabled bool) error {
 	return nil
 }
 
-// ReadConnectionLog returns the connections newer than afterSeq as JSON.
+// ReadConnectionLog returns the routed connections newer than afterSeq as JSON.
 func (r *Runtime) ReadConnectionLog(handle Handle, afterSeq int64) (string, error) {
 	controller, err := r.controller(handle)
 	if err != nil {
