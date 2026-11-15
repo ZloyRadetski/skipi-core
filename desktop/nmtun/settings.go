@@ -9,6 +9,7 @@
 package nmtun
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +22,15 @@ import (
 const (
 	minMTU = 1280
 	maxMTU = 65535
+
+	// dnsPriority is NetworkManager's VPN default made negative: a negative priority excludes the DNS
+	// of every connection with a higher value, so the tunnel's resolver is the only one in use.
+	dnsPriority = int32(-50)
 )
+
+// dnsAllDomains is the routing domain that matches every name, so systemd-resolved sends all
+// queries to the tunnel's link instead of the physical one.
+var dnsAllDomains = []string{"~."}
 
 var (
 	interfaceNamePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,14}$`)
@@ -34,6 +43,9 @@ type Plan struct {
 	MTU       int      `json:"mtu"`
 	Addresses []string `json:"addresses"`
 	Routes    []string `json:"routes"`
+	// DNS lists the resolvers the system uses while the interface is up. Their queries enter the
+	// tunnel, where Core answers them; without them the system keeps resolving outside the tunnel.
+	DNS []string `json:"dns,omitempty"`
 }
 
 // ParsePlan decodes the host's JSON.
@@ -110,6 +122,27 @@ func (p Plan) Settings(uid int, user string) (map[string]map[string]dbus.Variant
 		return nil, errors.New("IPv6 routes require an IPv6 address")
 	}
 
+	// NetworkManager's ipv4.dns is "au": each address is the uint32 whose in-memory bytes are the
+	// address in network order. ipv6.dns is "aay": the raw 16 bytes.
+	var v4DNS []uint32
+	var v6DNS [][]byte
+	for _, text := range p.DNS {
+		addr, err := netip.ParseAddr(text)
+		if err != nil || addr.Zone() != "" {
+			return nil, fmt.Errorf("invalid DNS server %q", text)
+		}
+		if addr.Is4() {
+			bytes := addr.As4()
+			v4DNS = append(v4DNS, binary.NativeEndian.Uint32(bytes[:]))
+		} else {
+			bytes := addr.As16()
+			v6DNS = append(v6DNS, bytes[:])
+		}
+	}
+	if len(v6DNS) > 0 && len(v6Address) == 0 {
+		return nil, errors.New("an IPv6 DNS server requires an IPv6 address")
+	}
+
 	ipv4 := map[string]dbus.Variant{
 		"method":        dbus.MakeVariant("manual"),
 		"address-data":  dbus.MakeVariant(v4Address),
@@ -117,6 +150,15 @@ func (p Plan) Settings(uid int, user string) (map[string]map[string]dbus.Variant
 	}
 	if len(v4Routes) > 0 {
 		ipv4["route-data"] = dbus.MakeVariant(v4Routes)
+	}
+	if len(p.DNS) > 0 {
+		// The routing domain and the priority belong to the connection as a whole, so IPv4 carries
+		// them even when every server is IPv6.
+		ipv4["dns-search"] = dbus.MakeVariant(dnsAllDomains)
+		ipv4["dns-priority"] = dbus.MakeVariant(dnsPriority)
+	}
+	if len(v4DNS) > 0 {
+		ipv4["dns"] = dbus.MakeVariant(v4DNS)
 	}
 	ipv6 := map[string]dbus.Variant{"method": dbus.MakeVariant("ignore")}
 	if len(v6Address) > 0 {
@@ -127,6 +169,13 @@ func (p Plan) Settings(uid int, user string) (map[string]map[string]dbus.Variant
 		}
 		if len(v6Routes) > 0 {
 			ipv6["route-data"] = dbus.MakeVariant(v6Routes)
+		}
+		if len(p.DNS) > 0 {
+			ipv6["dns-search"] = dbus.MakeVariant(dnsAllDomains)
+			ipv6["dns-priority"] = dbus.MakeVariant(dnsPriority)
+		}
+		if len(v6DNS) > 0 {
+			ipv6["dns"] = dbus.MakeVariant(v6DNS)
 		}
 	}
 

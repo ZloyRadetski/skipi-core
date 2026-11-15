@@ -4,6 +4,7 @@
 package nmtun
 
 import (
+	"encoding/binary"
 	"reflect"
 	"strings"
 	"testing"
@@ -130,6 +131,10 @@ func TestSettingsRejectInvalidPlans(t *testing.T) {
 		"bad route":          func(p *Plan) { p.Routes = []string{"nope/1"} },
 		"two v4 addresses":   func(p *Plan) { p.Addresses = []string{"172.19.0.1/30", "10.0.0.1/24"} },
 		"v6 route no v6 ip":  func(p *Plan) { p.Routes = append(p.Routes, "::/1") },
+		"bad dns":            func(p *Plan) { p.DNS = []string{"dns.google"} },
+		"dns with prefix":    func(p *Plan) { p.DNS = []string{"8.8.8.8/32"} },
+		"dns with zone":      func(p *Plan) { p.DNS = []string{"fe80::1%eth0"} },
+		"v6 dns no v6 ip":    func(p *Plan) { p.DNS = []string{"2001:4860:4860::8888"} },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -139,6 +144,73 @@ func TestSettingsRejectInvalidPlans(t *testing.T) {
 				t.Fatal("expected an error")
 			}
 		})
+	}
+}
+
+func TestSettingsSendAllQueriesToTheTunnelResolver(t *testing.T) {
+	plan := validPlan()
+	plan.DNS = []string{"1.2.3.4"}
+
+	settings, err := plan.Settings(1000, "vqsego")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	servers, ok := value(t, settings, "ipv4", "dns").([]uint32)
+	if !ok || len(servers) != 1 {
+		t.Fatalf("ipv4 dns = %v", value(t, settings, "ipv4", "dns"))
+	}
+	// NetworkManager reads each uint32 as an in_addr: its bytes in memory are the address in order.
+	var bytes [4]byte
+	binary.NativeEndian.PutUint32(bytes[:], servers[0])
+	if bytes != [4]byte{1, 2, 3, 4} {
+		t.Errorf("ipv4 dns bytes = %v", bytes)
+	}
+	if got := value(t, settings, "ipv4", "dns-search"); !reflect.DeepEqual(got, []string{"~."}) {
+		t.Errorf("ipv4 dns-search = %v", got)
+	}
+	if got := value(t, settings, "ipv4", "dns-priority"); got != int32(-50) {
+		t.Errorf("ipv4 dns-priority = %v", got)
+	}
+	if _, ok := settings["ipv6"]["dns-search"]; ok {
+		t.Error("ipv6 DNS settings present while IPv6 is ignored")
+	}
+}
+
+func TestSettingsCarryIpv6DnsWithAnIpv6Address(t *testing.T) {
+	plan := validPlan()
+	plan.Addresses = append(plan.Addresses, "fdfe:dcba:9876::1/126")
+	plan.DNS = []string{"8.8.8.8", "2001:4860:4860::8888"}
+
+	settings, err := plan.Settings(1000, "vqsego")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := [][]byte{{0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88}}
+	if got := value(t, settings, "ipv6", "dns"); !reflect.DeepEqual(got, want) {
+		t.Errorf("ipv6 dns = %v", got)
+	}
+	if got := value(t, settings, "ipv6", "dns-search"); !reflect.DeepEqual(got, []string{"~."}) {
+		t.Errorf("ipv6 dns-search = %v", got)
+	}
+	if got := value(t, settings, "ipv6", "dns-priority"); got != int32(-50) {
+		t.Errorf("ipv6 dns-priority = %v", got)
+	}
+	if got := value(t, settings, "ipv4", "dns"); len(got.([]uint32)) != 1 {
+		t.Errorf("ipv4 dns = %v", got)
+	}
+}
+
+func TestSettingsLeaveTheSystemResolverAloneWithoutDns(t *testing.T) {
+	settings, err := validPlan().Settings(1000, "vqsego")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"dns", "dns-search", "dns-priority"} {
+		if _, ok := settings["ipv4"][key]; ok {
+			t.Errorf("ipv4 %s present without DNS servers", key)
+		}
 	}
 }
 
@@ -152,11 +224,14 @@ func TestSettingsRejectUnsafeUserNames(t *testing.T) {
 }
 
 func TestParsePlanReadsTheHostJson(t *testing.T) {
-	plan, err := ParsePlan(`{"name":"skipi0","mtu":1400,"addresses":["172.19.0.1/30"],"routes":["0.0.0.0/1"]}`)
+	plan, err := ParsePlan(`{"name":"skipi0","mtu":1400,"addresses":["172.19.0.1/30"],"routes":["0.0.0.0/1"],"dns":["8.8.8.8"]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Plan{Name: "skipi0", MTU: 1400, Addresses: []string{"172.19.0.1/30"}, Routes: []string{"0.0.0.0/1"}}
+	want := Plan{
+		Name: "skipi0", MTU: 1400, Addresses: []string{"172.19.0.1/30"}, Routes: []string{"0.0.0.0/1"},
+		DNS: []string{"8.8.8.8"},
+	}
 	if !reflect.DeepEqual(plan, want) {
 		t.Fatalf("plan = %+v", plan)
 	}

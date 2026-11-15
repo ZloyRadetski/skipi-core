@@ -115,8 +115,8 @@ func SkipiCoreDesktopStop(handle C.uint64_t) *C.char {
 }
 
 // SkipiCoreDesktopTunOpen brings up the TUN interface described by a JSON plan
-// ({"name","mtu","addresses","routes"}) and returns the attached tun file
-// descriptor, or -1 with SkipiCoreDesktopLastError set. The descriptor stays owned
+// ({"name","mtu","addresses","routes","dns"}; "dns" is optional and makes the
+// system resolve through the tunnel) and returns the attached tun file descriptor, or -1 with SkipiCoreDesktopLastError set. The descriptor stays owned
 // by SKIPI Core until SkipiCoreDesktopTunClose.
 //
 //export SkipiCoreDesktopTunOpen
