@@ -113,32 +113,39 @@ func (r *Runtime) CreateController() Handle {
 	return handle
 }
 
-// DestroyController stops an active controller before releasing its handle.
+// DestroyController stops an active controller before releasing its handle. The handle leaves
+// the table at once, so nothing can start it again; the stop itself runs without the runtime
+// locks, which keep answering state reads while the instance closes.
 func (r *Runtime) DestroyController(handle Handle) error {
 	coreProcessState.Lock()
-	defer coreProcessState.Unlock()
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	controller, err := r.controllerLocked(handle)
 	if err != nil {
+		r.mu.Unlock()
+		coreProcessState.Unlock()
 		return err
 	}
-	if controller.IsRunning() {
-		if err := controller.StopLoop(); err != nil {
-			delete(r.controllers, handle)
-			if r.active == handle {
-				r.active = 0
-			}
-			clearProcessActiveLocked(r, handle)
-			return fmt.Errorf("stop SKIPI Core desktop controller %d during destroy: %w", handle, err)
-		}
-	}
 	delete(r.controllers, handle)
-	if r.active == handle {
-		r.active = 0
+	running := controller.IsRunning()
+	if !running {
+		if r.active == handle {
+			r.active = 0
+		}
+		clearProcessActiveLocked(r, handle)
 	}
-	clearProcessActiveLocked(r, handle)
+	r.mu.Unlock()
+	coreProcessState.Unlock()
+	if !running {
+		return nil
+	}
+
+	// The session lease (r.active and the process-wide active handle) stays held until the
+	// instance is closed, so no other controller starts while this one is still shutting down.
+	stopErr := controller.StopLoop()
+	r.releaseActive(handle)
+	if stopErr != nil {
+		return fmt.Errorf("stop SKIPI Core desktop controller %d during destroy: %w", handle, stopErr)
+	}
 	return nil
 }
 
@@ -184,26 +191,32 @@ func (r *Runtime) Start(handle Handle, configJSON string, tunFD int64) error {
 }
 
 // Stop stops a controller and releases the active-session lease even when Xray
-// reports a close error, because its instance is no longer usable afterward.
+// reports a close error, because its instance is no longer usable afterward. Closing can take
+// seconds, so it runs without the runtime locks: state reads stay responsive, while the lease
+// keeps any other controller from starting until the instance is gone.
 func (r *Runtime) Stop(handle Handle) error {
-	coreProcessState.Lock()
-	defer coreProcessState.Unlock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	controller, err := r.controllerLocked(handle)
+	controller, err := r.controller(handle)
 	if err != nil {
 		return err
 	}
 	err = controller.StopLoop()
-	if r.active == handle {
-		r.active = 0
-	}
-	clearProcessActiveLocked(r, handle)
+	r.releaseActive(handle)
 	if err != nil {
 		return fmt.Errorf("stop SKIPI Core desktop controller %d: %w", handle, err)
 	}
 	return nil
+}
+
+// releaseActive gives up the session lease held by handle.
+func (r *Runtime) releaseActive(handle Handle) {
+	coreProcessState.Lock()
+	defer coreProcessState.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.active == handle {
+		r.active = 0
+	}
+	clearProcessActiveLocked(r, handle)
 }
 
 // IsRunning reports whether an allocated controller owns a running core instance.

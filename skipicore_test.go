@@ -670,6 +670,7 @@ func TestAmneziaWgRunnerLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAmneziaWgRunner failed: %v", err)
 	}
+	runner.socksPort = 0 // ephemeral: the default 10809 may be held by a running SKIPI
 
 	if err := runner.Start(); err != nil {
 		t.Fatalf("runner.Start failed: %v", err)

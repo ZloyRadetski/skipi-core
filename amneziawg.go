@@ -707,7 +707,12 @@ type AmneziaWgRunner struct {
 	running    bool
 	cancel     context.CancelFunc
 	protector  SocketProtector
+
+	dnsMu    sync.Mutex
+	dnsCache map[string]tunnelDNSEntry
 }
+
+var errNoTunnelAddress = errors.New("lookup through AmneziaWG returned no usable address")
 
 // SocketProtector matches the gomobile interface for Android VpnService.protect(int).
 type SocketProtector interface {
@@ -1059,7 +1064,9 @@ func (r *AmneziaWgRunner) serveSocks(ctx context.Context, ln net.Listener) {
 func (r *AmneziaWgRunner) handleSocksConn(ctx context.Context, c net.Conn) {
 	defer c.Close()
 
-	// 1. Negotiation
+	// 1. Negotiation. A client that goes quiet here would otherwise hold this goroutine until
+	// the runner stops.
+	_ = c.SetDeadline(time.Now().Add(socksHandshakeTimeout))
 	var header [2]byte
 	if _, err := io.ReadFull(c, header[:]); err != nil || header[0] != 0x05 {
 		return
@@ -1088,6 +1095,8 @@ func (r *AmneziaWgRunner) handleSocksConn(ctx context.Context, c net.Conn) {
 		_ = sendSocksReply(c, 0x08) // Address type not supported
 		return
 	}
+	// The request is complete: the dial has its own timeout and the stream may idle.
+	_ = c.SetDeadline(time.Time{})
 	if reqHeader[1] == 0x03 { // UDP ASSOCIATE
 		r.handleSocksUDPAssociate(ctx, c)
 		return
@@ -1105,14 +1114,9 @@ func (r *AmneziaWgRunner) handleSocksConn(ctx context.Context, c net.Conn) {
 	if ip := net.ParseIP(destAddr); ip != nil {
 		tcpAddr = &net.TCPAddr{IP: ip, Port: int(destPort)}
 	} else {
-		addrs, err := r.tnet.LookupHost(destAddr)
-		if err != nil || len(addrs) == 0 {
+		ip, err := r.lookupTunnelHost(dialCtx, destAddr)
+		if err != nil {
 			_ = sendSocksReply(c, 0x04) // Host unreachable
-			return
-		}
-		ip := net.ParseIP(addrs[0])
-		if ip == nil {
-			_ = sendSocksReply(c, 0x04)
 			return
 		}
 		tcpAddr = &net.TCPAddr{IP: ip, Port: int(destPort)}
@@ -1130,21 +1134,8 @@ func (r *AmneziaWgRunner) handleSocksConn(ctx context.Context, c net.Conn) {
 		return
 	}
 
-	// 5. Bidirectional stream copy
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(remoteConn, c)
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(c, remoteConn)
-		done <- struct{}{}
-	}()
-
-	select {
-	case <-done:
-	case <-ctx.Done():
-	}
+	// 5. Bidirectional stream copy with half-close
+	relay(ctx, c, remoteConn)
 }
 
 // readSocksAddress reads an RFC 1928 address from a TCP SOCKS request.
@@ -1258,13 +1249,20 @@ func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control n
 		finish()
 	}()
 	go func() {
-		<-ctx.Done()
-		finish()
+		// ctx lives as long as the runner; without the finished case this goroutine would
+		// outlive every association it belongs to.
+		select {
+		case <-ctx.Done():
+			finish()
+		case <-finished:
+		}
 	}()
 
 	startTunnelResponseLoop := func(tunnelUDP net.PacketConn) {
 		go func() {
-			buffer := make([]byte, 64*1024)
+			bufferRef := socksUDPBuffers.Get().(*[]byte)
+			defer socksUDPBuffers.Put(bufferRef)
+			buffer := *bufferRef
 			for {
 				n, source, err := tunnelUDP.ReadFrom(buffer)
 				if err != nil {
@@ -1312,7 +1310,9 @@ func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control n
 	}
 
 	go func() {
-		buffer := make([]byte, 64*1024)
+		bufferRef := socksUDPBuffers.Get().(*[]byte)
+		defer socksUDPBuffers.Put(bufferRef)
+		buffer := *bufferRef
 		for {
 			n, source, err := clientUDP.ReadFromUDP(buffer)
 			if err != nil {
@@ -1322,7 +1322,7 @@ func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control n
 			if controlIP != nil && !source.IP.Equal(controlIP) {
 				continue
 			}
-			payload, destination, err := r.parseSocksUDPDatagram(buffer[:n])
+			payload, destination, err := r.parseSocksUDPDatagram(ctx, buffer[:n])
 			if err != nil {
 				continue
 			}
@@ -1379,7 +1379,7 @@ func amneziaWgUDPBindAddress(destination *net.UDPAddr, localAddrs []netip.Addr) 
 	return nil, "", fmt.Errorf("no local AmneziaWG %s address configured for UDP", family)
 }
 
-func (r *AmneziaWgRunner) parseSocksUDPDatagram(packet []byte) ([]byte, *net.UDPAddr, error) {
+func (r *AmneziaWgRunner) parseSocksUDPDatagram(ctx context.Context, packet []byte) ([]byte, *net.UDPAddr, error) {
 	// RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR | DST.PORT | DATA
 	if len(packet) < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
 		return nil, nil, errors.New("invalid or fragmented SOCKS UDP datagram")
@@ -1393,27 +1393,20 @@ func (r *AmneziaWgRunner) parseSocksUDPDatagram(packet []byte) ([]byte, *net.UDP
 	if consumed <= 0 || 3+consumed > len(packet) {
 		return nil, nil, errors.New("invalid SOCKS UDP destination")
 	}
-	destination, err := r.resolveTunnelUDPAddress(host, port)
+	destination, err := r.resolveTunnelUDPAddress(ctx, host, port)
 	if err != nil {
 		return nil, nil, err
 	}
 	return packet[3+consumed:], destination, nil
 }
 
-func (r *AmneziaWgRunner) resolveTunnelUDPAddress(host string, port uint16) (*net.UDPAddr, error) {
+func (r *AmneziaWgRunner) resolveTunnelUDPAddress(ctx context.Context, host string, port uint16) (*net.UDPAddr, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		return &net.UDPAddr{IP: ip, Port: int(port)}, nil
 	}
-	addrs, err := r.tnet.LookupHost(host)
+	ip, err := r.lookupTunnelHost(ctx, host)
 	if err != nil {
 		return nil, fmt.Errorf("resolve %q through AmneziaWG: %w", host, err)
-	}
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("resolve %q through AmneziaWG returned no addresses", host)
-	}
-	ip := net.ParseIP(addrs[0])
-	if ip == nil {
-		return nil, fmt.Errorf("resolve %q through AmneziaWG returned invalid address", host)
 	}
 	return &net.UDPAddr{IP: ip, Port: int(port)}, nil
 }

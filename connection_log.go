@@ -6,6 +6,7 @@ package skipicore
 import (
 	"encoding/json"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,6 +67,12 @@ func (l *connectionLog) record(line string) {
 	if !l.enabled.Load() {
 		return
 	}
+	// The dispatcher logs far more Info lines than these three; skip the regexps for the rest.
+	if !strings.Contains(line, "sniffed domain: ") &&
+		!strings.Contains(line, "taking detour") &&
+		!strings.Contains(line, "default route for") {
+		return
+	}
 	if m := sniffedDomainPattern.FindStringSubmatch(line); m != nil {
 		l.mu.Lock()
 		if len(l.pending) >= connectionLogPendingLimit {
@@ -104,8 +111,12 @@ func (l *connectionLog) add(id, destination, outbound string) {
 		Network:  network,
 		Outbound: outbound,
 	})
-	if over := len(l.entries) - connectionLogCapacity; over > 0 {
-		l.entries = append([]ConnectionLogEntry(nil), l.entries[over:]...)
+	// Trim in place once the slice holds twice the capacity: one copy per capacity-many
+	// connections instead of one allocation per connection.
+	if len(l.entries) >= 2*connectionLogCapacity {
+		n := copy(l.entries, l.entries[len(l.entries)-connectionLogCapacity:])
+		clear(l.entries[n:])
+		l.entries = l.entries[:n]
 	}
 }
 
@@ -127,12 +138,14 @@ func splitDestination(destination string) (network, host string, port int) {
 // snapshot returns the entries newer than afterSeq and the cursor for the next read.
 func (l *connectionLog) snapshot(afterSeq int64) string {
 	l.mu.Lock()
-	out := connectionLogSnapshot{Seq: l.seq, Entries: []ConnectionLogEntry{}}
-	for _, e := range l.entries {
-		if e.Seq > afterSeq {
-			out.Entries = append(out.Entries, e)
-		}
+	visible := l.entries
+	if over := len(visible) - connectionLogCapacity; over > 0 {
+		visible = visible[over:]
 	}
+	// Seq grows by one per entry, so the newer ones start at a binary-searchable index.
+	first := sort.Search(len(visible), func(i int) bool { return visible[i].Seq > afterSeq })
+	out := connectionLogSnapshot{Seq: l.seq, Entries: make([]ConnectionLogEntry, len(visible)-first)}
+	copy(out.Entries, visible[first:])
 	l.mu.Unlock()
 	encoded, err := json.Marshal(out)
 	if err != nil {

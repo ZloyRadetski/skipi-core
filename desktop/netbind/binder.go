@@ -33,7 +33,9 @@ type Binder struct {
 	ok        bool
 	refreshed time.Time
 	announced bool
-	reported  map[string]bool
+	// refreshing is set while one background lookup runs; everyone else keeps the previous answer.
+	refreshing bool
+	reported   map[string]bool
 }
 
 func (b *Binder) Enable() {
@@ -48,22 +50,58 @@ func (b *Binder) Disable() {
 	b.mu.Unlock()
 }
 
+// current returns the interface to bind to. The first answer after Enable is looked up in line,
+// so no socket of the session goes unbound. Later expiries refresh in the background while the
+// previous answer keeps serving: the lookup asks the OS for every adapter and route, and a dial
+// must not wait for it once a second.
 func (b *Binder) current() (string, bool) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if !b.enabled {
+		b.mu.Unlock()
 		return "", false
 	}
 	now := b.Now()
-	if b.refreshed.IsZero() || now.Sub(b.refreshed) >= b.TTL {
+	switch {
+	case b.refreshed.IsZero():
+		// Concurrent first dials queue behind this one instead of each asking the OS.
 		iface, ok := b.Lookup()
-		changed := !b.announced || iface != b.iface || ok != b.ok
-		b.iface, b.ok, b.refreshed, b.announced = iface, ok, now, true
-		if changed && b.OnChoose != nil {
-			b.OnChoose(iface, ok)
+		changed := b.store(iface, ok, now)
+		onChoose := b.OnChoose
+		b.mu.Unlock()
+		if changed && onChoose != nil {
+			onChoose(iface, ok)
 		}
+		return iface, ok
+	case now.Sub(b.refreshed) >= b.TTL && !b.refreshing:
+		b.refreshing = true
+		go b.refresh()
 	}
-	return b.iface, b.ok
+	iface, ok := b.iface, b.ok
+	b.mu.Unlock()
+	return iface, ok
+}
+
+func (b *Binder) refresh() {
+	iface, ok := b.Lookup()
+	b.mu.Lock()
+	b.refreshing = false
+	if !b.enabled {
+		b.mu.Unlock()
+		return
+	}
+	changed := b.store(iface, ok, b.Now())
+	onChoose := b.OnChoose
+	b.mu.Unlock()
+	if changed && onChoose != nil {
+		onChoose(iface, ok)
+	}
+}
+
+// store records an answer and reports whether it differs from the announced one. b.mu is held.
+func (b *Binder) store(iface string, ok bool, now time.Time) bool {
+	changed := !b.announced || iface != b.iface || ok != b.ok
+	b.iface, b.ok, b.refreshed, b.announced = iface, ok, now, true
+	return changed
 }
 
 func (b *Binder) reportBindError(iface string, err error) {

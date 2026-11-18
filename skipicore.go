@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	quic "github.com/apernet/quic-go"
@@ -135,9 +136,9 @@ type CoreController struct {
 	statsManager       corestats.Manager
 	trafficStatsTotals map[string]int64
 	callback           CoreCallbackHandler
-	isRunning          bool
-	connLog            *connectionLog
-	connLogEnabled     bool
+	isRunning          atomic.Bool // readable without c.mu, which a slow start or stop holds
+	connLog            atomic.Pointer[connectionLog] // read without c.mu: a slow start or stop must not hold a poll back
+	connLogEnabled     atomic.Bool
 }
 
 // trafficStatsBytes is deliberately kept private: the mobile binding only
@@ -177,7 +178,7 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.isRunning {
+	if c.isRunning.Load() {
 		return errors.New("core instance is already running")
 	}
 	c.statsManager = nil
@@ -215,7 +216,7 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 		return fmt.Errorf("failed to create xray instance: %w", err)
 	}
 	// Every session counts connections from zero.
-	connLog := newConnectionLog(c.connLogEnabled)
+	connLog := newConnectionLog(c.connLogEnabled.Load())
 	installConnectionLog(server, connLog)
 
 	if mgr := server.GetFeature(corestats.ManagerType()); mgr != nil {
@@ -236,8 +237,10 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	}
 
 	c.instance = server
-	c.connLog = connLog
-	c.isRunning = true
+	c.connLog.Store(connLog)
+	// A toggle that raced the start saw no log yet; apply the latest value now it is visible.
+	connLog.enabled.Store(c.connLogEnabled.Load())
+	c.isRunning.Store(true)
 
 	if c.callback != nil {
 		c.callback.Startup()
@@ -258,17 +261,17 @@ func (c *CoreController) StopLoop() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if !c.isRunning || c.instance == nil {
+	if !c.isRunning.Load() || c.instance == nil {
 		return nil
 	}
 
 	err := c.instance.Close()
-	clearConnectionLog(c.connLog)
-	c.connLog = nil
+	clearConnectionLog(c.connLog.Load())
+	c.connLog.Store(nil)
 	c.instance = nil
 	c.statsManager = nil
 	c.trafficStatsTotals = nil
-	c.isRunning = false
+	c.isRunning.Store(false)
 
 	// Drop the TUN descriptor env vars so later instances (latency probes,
 	// URL-test racers) never observe an already-closed file descriptor.
@@ -282,22 +285,19 @@ func (c *CoreController) StopLoop() error {
 	return err
 }
 
-// SetConnectionLogEnabled switches the connection log of this and later sessions.
+// SetConnectionLogEnabled switches the connection log of this and later sessions. It takes no
+// controller lock either.
 func (c *CoreController) SetConnectionLogEnabled(enabled bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.connLogEnabled = enabled
-	if c.connLog != nil {
-		c.connLog.enabled.Store(enabled)
+	c.connLogEnabled.Store(enabled)
+	if l := c.connLog.Load(); l != nil {
+		l.enabled.Store(enabled)
 	}
 }
 
-// ReadConnectionLog returns the routed connections newer than afterSeq as JSON. It takes
-// no controller lock, so a slow probe cannot hold a poll back.
+// ReadConnectionLog returns the routed connections newer than afterSeq as JSON. It takes no
+// controller lock, so neither a slow probe nor a slow start or stop can hold a poll back.
 func (c *CoreController) ReadConnectionLog(afterSeq int64) string {
-	c.mu.Lock()
-	l := c.connLog
-	c.mu.Unlock()
+	l := c.connLog.Load()
 	if l == nil {
 		return `{"seq":0,"entries":[]}`
 	}
@@ -306,9 +306,7 @@ func (c *CoreController) ReadConnectionLog(afterSeq int64) string {
 
 // IsRunning returns whether the core instance is currently running.
 func (c *CoreController) IsRunning() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.isRunning
+	return c.isRunning.Load()
 }
 
 // MeasureDelay measures network latency to a target URL through the currently running core instance.
@@ -953,22 +951,24 @@ func readMemoryStatsFromMetrics() *MemoryStats {
 		{Name: "/memory/classes/total:bytes"},         // total runtime memory   -> SysBytes
 		{Name: "/memory/classes/heap/free:bytes"},     // idle, not yet returned -> HeapIdle part
 		{Name: "/memory/classes/heap/released:bytes"}, // returned to the OS     -> HeapReleased
-		{Name: "/gc/cycles:gc-cycles"},
+		{Name: "/gc/cycles/total:gc-cycles"},
 		{Name: "/sched/goroutines:goroutines"},
 	}
 	metrics.Read(samples)
+	// Every metric above is a uint64 counter or gauge; anything else (including KindBad for a
+	// name this runtime does not know) sends the caller to the MemStats fallback.
 	for _, sample := range samples {
-		if sample.Value.Kind() == metrics.KindBad {
+		if sample.Value.Kind() != metrics.KindUint64 {
 			return nil
 		}
 	}
 
 	const mb = 1024 * 1024
-	heapObjects := int64(samples[0].Value.Float64())
-	totalAlloc := int64(samples[1].Value.Float64())
-	sysBytes := int64(samples[2].Value.Float64())
-	heapFree := int64(samples[3].Value.Float64())
-	heapReleased := int64(samples[4].Value.Float64())
+	heapObjects := int64(samples[0].Value.Uint64())
+	totalAlloc := int64(samples[1].Value.Uint64())
+	sysBytes := int64(samples[2].Value.Uint64())
+	heapFree := int64(samples[3].Value.Uint64())
+	heapReleased := int64(samples[4].Value.Uint64())
 
 	return &MemoryStats{
 		AllocBytes:    heapObjects,
@@ -980,7 +980,7 @@ func readMemoryStatsFromMetrics() *MemoryStats {
 		HeapIdle:      heapFree + heapReleased,
 		HeapReleased:  heapReleased,
 		NumGoroutines: int(samples[6].Value.Uint64()),
-		NumGC:         uint32(samples[5].Value.Float64()),
+		NumGC:         uint32(samples[5].Value.Uint64()),
 	}
 }
 
@@ -1037,21 +1037,10 @@ func FastSelectBestOutbound(configJSON string, candidateTags string, probeURL st
 		timeoutMs = 1200
 	}
 
-	config, err := coreserial.LoadJSONConfig(strings.NewReader(configJSON))
+	// Same stripped-down instance as the other probes: no inbounds, routing, geo data or
+	// observatory, only what a forced-outbound dial needs.
+	server, err := startOutboundTestInstance(configJSON)
 	if err != nil {
-		return candidates[0]
-	}
-
-	config.Inbound = nil
-
-	server, err := core.New(config)
-	if err != nil {
-		return candidates[0]
-	}
-	restoreConnectionLog()
-
-	if err := server.Start(); err != nil {
-		_ = server.Close()
 		return candidates[0]
 	}
 	defer server.Close()

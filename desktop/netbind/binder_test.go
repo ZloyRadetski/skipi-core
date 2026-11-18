@@ -5,6 +5,8 @@ package netbind
 
 import (
 	"errors"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -81,10 +83,11 @@ func TestBinderDoesNothingWhileDisabledOrWithoutAnInterface(t *testing.T) {
 
 func TestBinderCachesTheLookupUntilTheTTLExpires(t *testing.T) {
 	var bound []string
+	var mu sync.Mutex
 	lookups := 0
 	now := time.Unix(0, 0)
 	b := &Binder{
-		Lookup: func() (string, bool) { lookups++; return "enp12s0", true },
+		Lookup: func() (string, bool) { mu.Lock(); lookups++; mu.Unlock(); return "enp12s0", true },
 		Bind:   func(uintptr, string) error { bound = append(bound, "x"); return nil },
 		TTL:    time.Second,
 		Now:    func() time.Time { return now },
@@ -96,8 +99,62 @@ func TestBinderCachesTheLookupUntilTheTTLExpires(t *testing.T) {
 	now = now.Add(2 * time.Second)
 	_ = b.Control("tcp", "203.0.113.9:443", fakeConn{5})
 
-	if lookups != 2 {
-		t.Fatalf("lookups = %d, want 2", lookups)
+	// The expired entry keeps answering while a background lookup replaces it.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := lookups
+		mu.Unlock()
+		if n == 2 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("lookups = %d, want 2", lookups)
+}
+
+func TestBinderExpiredLookupDoesNotBlockDials(t *testing.T) {
+	release := make(chan struct{})
+	var calls int32
+	now := time.Unix(0, 0)
+	var nowMu sync.Mutex
+	b := &Binder{
+		Lookup: func() (string, bool) {
+			if atomic.AddInt32(&calls, 1) > 1 {
+				<-release
+			}
+			return "enp12s0", true
+		},
+		Bind: func(uintptr, string) error { return nil },
+		TTL:  time.Second,
+		Now:  func() time.Time { nowMu.Lock(); defer nowMu.Unlock(); return now },
+	}
+	b.Enable()
+	_ = b.Control("tcp", "203.0.113.7:443", fakeConn{3})
+	nowMu.Lock()
+	now = now.Add(2 * time.Second)
+	nowMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 50; i++ {
+			_ = b.Control("tcp", "203.0.113.8:443", fakeConn{4})
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dials waited for the refresh")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&calls) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(release)
+	time.Sleep(50 * time.Millisecond) // a second refresh, if one were wrongly started, would show now
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("lookups = %d, want a single refresh", got)
 	}
 }
 
