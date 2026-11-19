@@ -1,3 +1,11 @@
+const SessionIdle = 0
+
+const SessionRunning = 2
+
+const SessionStarting = 1
+
+const SessionStopping = 3
+
 func (c *CoreController) ForceStop() error
 
 func (c *CoreController) IsRunning() bool
@@ -14,7 +22,13 @@ func (c *CoreController) RegisterProcessFinder(finder ProcessFinder)
 
 func (c *CoreController) SetConnectionLogEnabled(enabled bool)
 
+func (c *CoreController) SetStateListener(l StateListener)
+
 func (c *CoreController) StartLoop(configJSON string, tunFd int64) error
+
+func (c *CoreController) StartSession(planJSON string, tunFd int64) error
+
+func (c *CoreController) State() int
 
 func (c *CoreController) StopLoop() error
 
@@ -165,6 +179,10 @@ type ProcessFinder interface {
 
 type SocketProtector interface {
 	Protect(fd int) bool
+}
+
+type StateListener interface {
+	OnStateChanged(state int, detail string)
 }
 
 var ErrStopTimedOut = errors.New("SKIPI Core stop timed out")

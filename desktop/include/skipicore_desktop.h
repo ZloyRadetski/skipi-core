@@ -30,6 +30,8 @@ SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopInitializeAssets(const char *direct
 SKIPI_CORE_DESKTOP_API uint64_t SkipiCoreDesktopCreateController(void);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopDestroyController(uint64_t handle);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopStart(uint64_t handle, const char *config_json, int64_t tun_fd);
+SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopStartSession(uint64_t handle, const char *plan_json, int64_t tun_fd);
+SKIPI_CORE_DESKTOP_API int32_t SkipiCoreDesktopSessionState(uint64_t handle);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopStop(uint64_t handle);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopStopWithTimeout(uint64_t handle, int64_t timeout_millis);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopForceStop(uint64_t handle);

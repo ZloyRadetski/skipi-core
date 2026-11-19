@@ -446,3 +446,56 @@ func normalizeAssetDirectory(directory string) (string, error) {
 	}
 	return filepath.Clean(absolute), nil
 }
+
+// StartSession starts a controller from a session plan JSON (see skipicore.CoreController.StartSession):
+// Xray and, when the plan has it, AmneziaWG with its SOCKS readiness wait. It takes the same
+// session lease as Start. A desktop process has no VpnService, so no socket protector is used.
+func (r *Runtime) StartSession(handle Handle, planJSON string, tunFD int64) error {
+	if strings.TrimSpace(planJSON) == "" {
+		return errors.New("SKIPI Core desktop session plan must not be blank")
+	}
+	if tunFD < 0 {
+		return fmt.Errorf("SKIPI Core desktop TUN descriptor must not be negative: %d", tunFD)
+	}
+
+	coreProcessState.Lock()
+	defer coreProcessState.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if coreProcessState.assetRuntime != r || coreProcessState.assetDirectory == "" {
+		return fmt.Errorf("%w: initialize this runtime before start", ErrAssetsNotInitialized)
+	}
+	controller, err := r.controllerLocked(handle)
+	if err != nil {
+		return err
+	}
+	if coreProcessState.activeRuntime != nil &&
+		(coreProcessState.activeRuntime != r || coreProcessState.activeHandle != handle) {
+		return fmt.Errorf("%w: controller %d", ErrAnotherControllerActive, coreProcessState.activeHandle)
+	}
+	if r.active != 0 && r.active != handle {
+		return fmt.Errorf("%w: controller %d", ErrAnotherControllerActive, r.active)
+	}
+	if controller.IsRunning() {
+		return fmt.Errorf("SKIPI Core desktop controller %d is already running", handle)
+	}
+
+	skipicore.SetAmneziaWgSocketProtector(nil)
+	if err := controller.StartSession(planJSON, tunFD); err != nil {
+		return fmt.Errorf("start SKIPI Core desktop session %d: %w", handle, err)
+	}
+	r.active = handle
+	coreProcessState.activeRuntime = r
+	coreProcessState.activeHandle = handle
+	return nil
+}
+
+// SessionState returns the controller's session state (skipicore.SessionIdle and friends). It
+// never waits on a slow start or stop.
+func (r *Runtime) SessionState(handle Handle) (int, error) {
+	controller, err := r.controller(handle)
+	if err != nil {
+		return 0, err
+	}
+	return controller.State(), nil
+}

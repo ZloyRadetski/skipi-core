@@ -12,6 +12,7 @@ SKIPI Core is a thin facade over Xray-core and AmneziaWG. The same Go module is 
 skipicore.go          package doc and the wrapper version
 controller.go         CoreController: lifecycle state machine (StartLoop, StopLoop, ForceStop, ...)
 controller_stats.go   CoreController traffic-stat methods
+session.go            session API: StartSession plan, State, StateListener, AmneziaWG readiness wait
 callbacks.go          interfaces the host implements: CoreCallbackHandler, ProcessFinder, SocketProtector
 env.go                InitCoreEnv, CoreVersion, CheckVersionX, ReconcileBrowserDialer, env helpers
 probes.go             MeasureOutboundDelay/Download, CancelOutboundDownload, FastSelectBestOutbound
@@ -73,9 +74,31 @@ root package (all build tags) and compares it with `testdata/public_api.golden`.
    `setAmneziaWgSocketProtector`, and the `CoreController`, `CoreCallbackHandler` and
    `SocketProtector` types must keep their names and signatures.
 
+## Tunnel session
+
+`StartSession(planJSON, tunFd)` makes the controller the whole tunnel session, so hosts only call
+start and stop. The plan is `{"xrayConfig": "<json>", "amneziaWg": {"config": "<json>", "socksPort": N}
+(optional), "connectionLog": bool}`; unknown fields are ignored.
+
+1. With `amneziaWg`: start it, then poll a TCP dial to `127.0.0.1:socksPort` until it accepts
+   (`awgReadyTimeout`, 8 s). `AmneziaWgRunner.Start` binds the listener before it returns, so the
+   first dial normally succeeds; the poll keeps the contract independent of that. Not ready in time:
+   AmneziaWG is stopped (bounded) and the error names the port and the timeout.
+2. Apply `connectionLog`, then the ordinary `StartLoop` path. An Xray failure stops AmneziaWG.
+3. The session owns the runner: `StopLoop`, `StopLoopWithTimeout` and `ForceStop` stop it too (a
+   timed-out stop counts as abandoned). A plain `StartLoop` never makes `StopLoop` touch AmneziaWG.
+4. `ForceStop` during the AmneziaWG phase bumps the same generation counter as for `StartLoop`, so
+   the readiness wait ends within one poll and the start returns an error.
+
+`State()` returns `SessionIdle/Starting/Running/Stopping` and only takes the short lifecycle lock.
+`SetStateListener` registers a `StateListener` that is called synchronously on every transition
+(failure message or stop error as `detail`), after `c.mu` is released; a panic in it is recovered.
+Desktop exposes `SkipiCoreDesktopStartSession` and `SkipiCoreDesktopSessionState` (-1: unknown handle).
+
 ## Test seams
 
-`createCoreInstance`, `startCoreInstance`, `awgStop`, `defaultStopTimeout` and `forceStopTimeout`
+`createCoreInstance`, `startCoreInstance`, `awgStop`, `startAmneziaWgFn`, `awgReadyTimeout`,
+`defaultStopTimeout` and `forceStopTimeout`
 (controller.go, amneziawg.go) are package-level variables so `stop_timeout_test.go` can simulate a
 hanging Xray or AmneziaWG close. Tests that touch unexported root state live in the root package;
 tests of an implementation live next to it in `internal/`.

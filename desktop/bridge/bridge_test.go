@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	skipicore "github.com/ZloyRadetski/skipi-core"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
@@ -537,5 +538,85 @@ func TestRuntimeForceStopIdleControllerAndUnknownHandle(t *testing.T) {
 func TestRuntimeAbandonedInstancesStartsAtZero(t *testing.T) {
 	if got := NewRuntime().AbandonedInstances(); got != 0 {
 		t.Fatalf("abandoned instances = %d, want 0", got)
+	}
+}
+
+func TestRuntimeStartSessionRunsXrayAndReportsState(t *testing.T) {
+	runtime := initializedRuntime(t)
+	handle := runtime.CreateController()
+	t.Cleanup(func() { _ = runtime.DestroyController(handle) })
+
+	if state, err := runtime.SessionState(handle); err != nil || state != skipicore.SessionIdle {
+		t.Fatalf("initial state = %d, %v", state, err)
+	}
+	plan, _ := json.Marshal(map[string]any{"xrayConfig": testXrayConfig(t)})
+	if err := runtime.StartSession(handle, string(plan), 0); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if state, _ := runtime.SessionState(handle); state != skipicore.SessionRunning {
+		t.Fatalf("state = %d, want Running", state)
+	}
+	if runtime.ActiveHandle() != handle {
+		t.Fatalf("active handle = %d, want %d", runtime.ActiveHandle(), handle)
+	}
+	if err := runtime.Stop(handle); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if state, _ := runtime.SessionState(handle); state != skipicore.SessionIdle {
+		t.Fatalf("state after stop = %d, want Idle", state)
+	}
+}
+
+func TestRuntimeStartSessionWithAwgIsStoppedByStop(t *testing.T) {
+	runtime := initializedRuntime(t)
+	handle := runtime.CreateController()
+	t.Cleanup(func() {
+		_ = runtime.DestroyController(handle)
+		_ = runtime.StopAmneziaWg()
+	})
+	port := freeLoopbackPort(t)
+	plan, _ := json.Marshal(map[string]any{
+		"xrayConfig": testXrayConfig(t),
+		"amneziaWg":  map[string]any{"config": testAmneziaWgConfig, "socksPort": port},
+	})
+	if err := runtime.StartSession(handle, string(plan), 0); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if !runtime.IsAmneziaWgRunning() {
+		t.Fatal("the session must have started AmneziaWG")
+	}
+	if err := runtime.Stop(handle); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if runtime.IsAmneziaWgRunning() {
+		t.Fatal("Stop must also stop the session's AmneziaWG")
+	}
+}
+
+func TestRuntimeStartSessionRejectsBadInputAndLeavesLeaseFree(t *testing.T) {
+	runtime := initializedRuntime(t)
+	handle := runtime.CreateController()
+	t.Cleanup(func() { _ = runtime.DestroyController(handle) })
+
+	if err := runtime.StartSession(handle, " ", 0); err == nil {
+		t.Fatal("blank plan must be rejected")
+	}
+	if err := runtime.StartSession(handle, `{"amneziaWg":null}`, 0); err == nil {
+		t.Fatal("plan without xrayConfig must be rejected")
+	}
+	if err := runtime.StartSession(handle, `{"xrayConfig":"{}"}`, -1); err == nil {
+		t.Fatal("negative TUN descriptor must be rejected")
+	}
+	if err := runtime.StartSession(9999, `{"xrayConfig":"{}"}`, 0); !errors.Is(err, ErrControllerNotFound) {
+		t.Fatalf("unknown handle: %v", err)
+	}
+	if runtime.ActiveHandle() != 0 {
+		t.Fatalf("a failed start must not take the lease, active = %d", runtime.ActiveHandle())
+	}
+}
+
+func TestRuntimeSessionStateRejectsUnknownHandle(t *testing.T) {
+	if _, err := NewRuntime().SessionState(9999); !errors.Is(err, ErrControllerNotFound) {
+		t.Fatalf("expected controller-not-found, got %v", err)
 	}
 }

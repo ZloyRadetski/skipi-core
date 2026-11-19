@@ -104,6 +104,36 @@ func SkipiCoreDesktopStart(handle C.uint64_t, configJSON *C.char, tunFD C.int64_
 	})
 }
 
+// SkipiCoreDesktopStartSession starts a whole tunnel session from a plan JSON:
+// {"xrayConfig": "...", "amneziaWg": {"config": "...", "socksPort": 10808}, "connectionLog": true}.
+// amneziaWg is optional; Core starts it, waits for its SOCKS listener and then starts Xray, and
+// Stop / ForceStop stop both. It returns NULL on success, otherwise an owned error string.
+//
+//export SkipiCoreDesktopStartSession
+func SkipiCoreDesktopStartSession(handle C.uint64_t, planJSON *C.char, tunFD C.int64_t) *C.char {
+	return cError(func() error {
+		plan, err := requiredCString(planJSON, "session plan")
+		if err != nil {
+			return err
+		}
+		return desktopRuntime.StartSession(desktopbridge.Handle(handle), plan, int64(tunFD))
+	})
+}
+
+// SkipiCoreDesktopSessionState returns 0 idle, 1 starting, 2 running, 3 stopping, and -1 for an
+// unknown handle (see SkipiCoreDesktopLastError). It never waits on a slow start or stop.
+//
+//export SkipiCoreDesktopSessionState
+func SkipiCoreDesktopSessionState(handle C.uint64_t) C.int32_t {
+	return cInt32(func() (int32, error) {
+		state, err := desktopRuntime.SessionState(desktopbridge.Handle(handle))
+		if err != nil {
+			return -1, err
+		}
+		return int32(state), nil
+	})
+}
+
 // SkipiCoreDesktopStop stops a controller. It returns NULL on success,
 // otherwise an owned error string.
 //

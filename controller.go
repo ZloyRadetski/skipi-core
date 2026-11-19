@@ -39,6 +39,8 @@ type CoreController struct {
 	isRunning          atomic.Bool                 // readable without c.mu, which a slow start or stop holds
 	connLog            atomic.Pointer[connlog.Log] // read without c.mu: a slow start or stop must not hold a poll back
 	connLogEnabled     atomic.Bool
+	ownsAwg            bool                        // the running session started AmneziaWG; guarded by mu
+	stateListener      atomic.Pointer[listenerBox] // see SetStateListener
 }
 
 // NewCoreController creates a new CoreController with the provided callback handler.
@@ -114,27 +116,50 @@ var errStartAborted = errors.New("core start was aborted by ForceStop")
 // The controller lock is only held for short state swaps: loading the config, core.New and
 // Start run unlocked, so IsRunning, the stats readers and ForceStop never wait on a slow start.
 func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
+	myGen, err := c.beginStart()
+	if err != nil {
+		return err
+	}
+	// If ForceStop gave up on this start, its abandoned mark ends when we return.
+	defer c.reapAbandonedStart(myGen)
+	return c.runStart(myGen, configJSON, tunFd, false, nil)
+}
+
+// beginStart moves an idle controller to starting and returns the generation of this attempt.
+func (c *CoreController) beginStart() (uint64, error) {
 	c.mu.Lock()
 	switch c.state {
 	case stateRunning:
 		c.mu.Unlock()
-		return errors.New("core instance is already running")
+		return 0, errors.New("core instance is already running")
 	case stateStarting:
 		c.mu.Unlock()
-		return errors.New("core instance is already starting")
+		return 0, errors.New("core instance is already starting")
 	case stateStopping:
 		c.mu.Unlock()
-		return errors.New("core instance is still stopping")
+		return 0, errors.New("core instance is still stopping")
 	}
 	c.state = stateStarting
 	c.gen++
 	myGen := c.gen
 	c.statsManager = nil
 	c.trafficStatsTotals = make(map[string]int64)
+	c.ownsAwg = false
 	c.mu.Unlock()
+	c.notifyState(stateStarting, "")
+	return myGen, nil
+}
 
-	// If ForceStop gave up on this start, its abandoned mark ends when we return.
-	defer c.reapAbandonedStart(myGen)
+// runStart is the Xray part of a start attempt that beginStart opened. ownsAwg marks the session
+// as the owner of the AmneziaWG runner, so its stop stops it too. beforeFail, when set, runs on
+// every failure before the controller returns to idle.
+func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, ownsAwg bool, beforeFail func()) error {
+	fail := func(err error) bool {
+		if beforeFail != nil {
+			beforeFail()
+		}
+		return c.failStart(myGen, err.Error())
+	}
 
 	// Loading routing/geo data is a one-off allocation burst: keep the GC out of its way, then
 	// collect the leftovers once in the background.
@@ -146,8 +171,9 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 
 	config, err := coreserial.LoadJSONConfig(strings.NewReader(configJSON))
 	if err != nil {
-		c.failStart(myGen)
-		return fmt.Errorf("failed to load xray config: %w", err)
+		err = fmt.Errorf("failed to load xray config: %w", err)
+		fail(err)
+		return err
 	}
 
 	// Publish the TUN descriptor only after the config validated successfully so
@@ -171,10 +197,11 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 
 	server, err := createCoreInstance(config)
 	if err != nil {
-		if c.failStart(myGen) {
+		err = fmt.Errorf("failed to create xray instance: %w", err)
+		if fail(err) {
 			clearTunFdEnv()
 		}
-		return fmt.Errorf("failed to create xray instance: %w", err)
+		return err
 	}
 	if c.superseded(myGen) {
 		lifecycle.CloseInBackground(server)
@@ -199,10 +226,11 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 		// A Close that hangs is abandoned rather than allowed to hang this start.
 		_, _ = lifecycle.RunBounded(server.Close, defaultStopTimeout, nil)
 		connlog.Clear(connLog)
-		if c.failStart(myGen) {
+		err = fmt.Errorf("failed to start xray instance: %w", err)
+		if fail(err) {
 			clearTunFdEnv()
 		}
-		return fmt.Errorf("failed to start xray instance: %w", err)
+		return err
 	}
 
 	c.mu.Lock()
@@ -219,8 +247,10 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	// A toggle that raced the start saw no log yet; apply the latest value now it is visible.
 	connLog.SetEnabled(c.connLogEnabled.Load())
 	c.state = stateRunning
+	c.ownsAwg = ownsAwg
 	c.isRunning.Store(true)
 	c.mu.Unlock()
+	c.notifyState(stateRunning, "")
 
 	if c.callback != nil {
 		c.callback.Startup()
@@ -237,17 +267,20 @@ func (c *CoreController) superseded(gen uint64) bool {
 	return c.gen != gen
 }
 
-// failStart returns the controller to idle after start attempt gen failed. It reports whether
-// that attempt was still the current one, i.e. whether it owns the process-wide env vars.
-func (c *CoreController) failStart(gen uint64) bool {
+// failStart returns the controller to idle after start attempt gen failed and tells the state
+// listener why. It reports whether that attempt was still the current one, i.e. whether it owns
+// the process-wide env vars.
+func (c *CoreController) failStart(gen uint64, detail string) bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.gen != gen || c.state != stateStarting {
+		c.mu.Unlock()
 		return false
 	}
 	c.state = stateIdle
 	c.statsManager = nil
 	c.trafficStatsTotals = nil
+	c.mu.Unlock()
+	c.notifyState(stateIdle, detail)
 	return true
 }
 
@@ -293,11 +326,17 @@ func (c *CoreController) stopWithin(d time.Duration) error {
 	}
 	op := lifecycle.NewStopOp()
 	inst := c.instance
+	ownsAwg := c.ownsAwg
 	c.stop = op
 	c.state = stateStopping
 	c.mu.Unlock()
+	c.notifyState(stateStopping, "")
 
 	closeErr, timedOut := lifecycle.RunBounded(inst.Close, d, op.Force())
+	var awgErr error
+	if ownsAwg {
+		awgErr = StopAmneziaWgWithTimeout(d.Milliseconds())
+	}
 
 	c.mu.Lock()
 	connlog.Clear(c.connLog.Load())
@@ -307,6 +346,7 @@ func (c *CoreController) stopWithin(d time.Duration) error {
 	c.trafficStatsTotals = nil
 	c.isRunning.Store(false)
 	c.stop = nil
+	c.ownsAwg = false
 	c.state = stateIdle
 	c.mu.Unlock()
 
@@ -318,7 +358,13 @@ func (c *CoreController) stopWithin(d time.Duration) error {
 	if timedOut {
 		stopErr = fmt.Errorf("%w: xray instance did not close within %v", ErrStopTimedOut, d)
 	}
+	stopErr = errors.Join(stopErr, awgErr)
 	op.Finish(stopErr)
+	detail := ""
+	if stopErr != nil {
+		detail = stopErr.Error()
+	}
+	c.notifyState(stateIdle, detail)
 
 	if c.callback != nil {
 		c.callback.Shutdown()
@@ -346,9 +392,11 @@ func (c *CoreController) ForceStop() error {
 		c.state = stateIdle
 		c.statsManager = nil
 		c.trafficStatsTotals = nil
+		c.ownsAwg = false
 		clearTunFdEnv()
 		c.mu.Unlock()
 		xrayErr = fmt.Errorf("%w: the start in flight was abandoned", ErrStopTimedOut)
+		c.notifyState(stateIdle, xrayErr.Error())
 	case stateStopping:
 		op := c.stop
 		c.mu.Unlock()
