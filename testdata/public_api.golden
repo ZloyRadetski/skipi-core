@@ -16,6 +16,8 @@ func (c *CoreController) QueryAllOutboundTrafficStats() string
 
 func (c *CoreController) QueryTrafficStats() string
 
+func (c *CoreController) QueryTunnelStats() string
+
 func (c *CoreController) ReadConnectionLog(afterSeq int64) string
 
 func (c *CoreController) RegisterProcessFinder(finder ProcessFinder)

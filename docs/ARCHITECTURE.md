@@ -25,6 +25,7 @@ amneziawg_runner.go   AmneziaWgRunner (netstack tunnel + SOCKS listener)
 amneziawg_socks.go    the runner's SOCKS5 handlers
 process_finder_*.go   RegisterProcessFinder: Android implementation / no-op elsewhere (build tags)
 
+internal/hevtun       HEV TUN (hev-socks5-tunnel): cgo on Android (build/hev static libs), stub elsewhere
 internal/lifecycle    bounded stop (RunBounded), abandoned counter, shared stop operation
 internal/xraylog      console log writer registered with Xray
 internal/connlog      connection log implementation
@@ -38,6 +39,7 @@ internal/assets       Xray asset reader (filesystem on desktop, APK fallback on 
 
 desktop/              bridge (C exports), netbind, nmtun, notify, tunhost, include (C header)
 cmd/skipicore-desktop c-shared entry point
+third_party/          hev-socks5-tunnel submodule + patches; scripts/ builds it and the AAR
 testdata/             public_api.golden, the pinned exported API
 ```
 
@@ -78,13 +80,18 @@ root package (all build tags) and compares it with `testdata/public_api.golden`.
 
 `StartSession(planJSON, tunFd)` makes the controller the whole tunnel session, so hosts only call
 start and stop. The plan is `{"xrayConfig": "<json>", "amneziaWg": {"config": "<json>", "socksPort": N}
-(optional), "connectionLog": bool}`; unknown fields are ignored.
+(optional), "connectionLog": bool, "hev": {"configYaml": "<yaml>", "tunFd": N} (optional)}`; unknown fields are ignored.
 
 1. With `amneziaWg`: start it, then poll a TCP dial to `127.0.0.1:socksPort` until it accepts
    (`awgReadyTimeout`, 8 s). `AmneziaWgRunner.Start` binds the listener before it returns, so the
    first dial normally succeeds; the poll keeps the contract independent of that. Not ready in time:
    AmneziaWG is stopped (bounded) and the error names the port and the timeout.
 2. Apply `connectionLog`, then the ordinary `StartLoop` path. An Xray failure stops AmneziaWG.
+   With `hev` (Android only; elsewhere `internal/hevtun` is a stub returning "HEV TUN is not built into
+   this Core on <GOOS>"), HEV TUN starts after Xray and Core waits for its readiness callback
+   (`hevReadyTimeout`, 5 s). Not ready or failed: HEV TUN, Xray and AmneziaWG are stopped in reverse.
+   Stop order is HEV TUN, Xray, AmneziaWG, each bounded; a hung HEV TUN stop counts as abandoned.
+   `QueryTunnelStats` returns hev's packet and byte counters as JSON.
 3. The session owns the runner: `StopLoop`, `StopLoopWithTimeout` and `ForceStop` stop it too (a
    timed-out stop counts as abandoned). A plain `StartLoop` never makes `StopLoop` touch AmneziaWG.
 4. `ForceStop` during the AmneziaWG phase bumps the same generation counter as for `StartLoop`, so
@@ -97,7 +104,7 @@ Desktop exposes `SkipiCoreDesktopStartSession` and `SkipiCoreDesktopSessionState
 
 ## Test seams
 
-`createCoreInstance`, `startCoreInstance`, `awgStop`, `startAmneziaWgFn`, `awgReadyTimeout`,
+`createCoreInstance`, `startCoreInstance`, `awgStop`, `startAmneziaWgFn`, `awgReadyTimeout`, `hevTun`, `hevReadyTimeout`,
 `defaultStopTimeout` and `forceStopTimeout`
 (controller.go, amneziawg.go) are package-level variables so `stop_timeout_test.go` can simulate a
 hanging Xray or AmneziaWG close. Tests that touch unexported root state live in the root package;

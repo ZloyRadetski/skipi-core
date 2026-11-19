@@ -14,3 +14,4 @@ dist/
 /libskipicore.*
 *.aar.version
 *.test
+/build/

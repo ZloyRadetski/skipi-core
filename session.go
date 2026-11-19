@@ -71,6 +71,7 @@ type sessionPlan struct {
 	XrayConfig    string          `json:"xrayConfig"`
 	AmneziaWg     *sessionPlanAwg `json:"amneziaWg"`
 	ConnectionLog bool            `json:"connectionLog"`
+	Hev           *sessionPlanHev `json:"hev"`
 }
 
 type sessionPlanAwg struct {
@@ -94,6 +95,14 @@ func parseSessionPlan(planJSON string) (*sessionPlan, error) {
 			return nil, errors.New("session plan: amneziaWg.config must not be blank")
 		}
 	}
+	if p.Hev != nil {
+		if strings.TrimSpace(p.Hev.ConfigYAML) == "" {
+			return nil, errors.New("session plan: hev.configYaml must not be blank")
+		}
+		if p.Hev.TunFd <= 0 {
+			return nil, errors.New("session plan: hev.tunFd must be positive")
+		}
+	}
 	return &p, nil
 }
 
@@ -102,8 +111,10 @@ func parseSessionPlan(planJSON string) (*sessionPlan, error) {
 //	{"xrayConfig": "<xray json>", "amneziaWg": {"config": "<awg json>", "socksPort": 10808}, "connectionLog": true}
 //
 // amneziaWg is optional. With it, AmneziaWG starts first and Core waits until its local SOCKS
-// listener accepts connections, then Xray starts. Any failure stops what was started. A later
-// StopLoop, StopLoopWithTimeout or ForceStop stops AmneziaWG together with Xray.
+// listener accepts connections, then Xray starts. The optional "hev": {"configYaml": "<yaml>",
+// "tunFd": N} starts HEV TUN last and waits (hevReadyTimeout) until it reports ready. Any failure
+// stops what was started, in reverse. A later StopLoop, StopLoopWithTimeout or ForceStop stops
+// HEV TUN, then Xray, then AmneziaWG.
 func (c *CoreController) StartSession(planJSON string, tunFd int64) error {
 	plan, err := parseSessionPlan(planJSON)
 	if err != nil {
@@ -130,7 +141,11 @@ func (c *CoreController) StartSession(planJSON string, tunFd int64) error {
 	}
 
 	c.SetConnectionLogEnabled(plan.ConnectionLog)
-	if err := c.runStart(myGen, plan.XrayConfig, tunFd, plan.AmneziaWg != nil, stopOwnAwg); err != nil {
+	var afterXray func() error
+	if plan.Hev != nil {
+		afterXray = func() error { return c.startSessionHev(myGen, plan.Hev) }
+	}
+	if err := c.runStart(myGen, plan.XrayConfig, tunFd, plan.AmneziaWg != nil, stopOwnAwg, afterXray, plan.Hev != nil); err != nil {
 		stopOwnAwg() // also covers a start that ForceStop aborted
 		return err
 	}

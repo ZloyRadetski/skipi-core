@@ -40,6 +40,7 @@ type CoreController struct {
 	connLog            atomic.Pointer[connlog.Log] // read without c.mu: a slow start or stop must not hold a poll back
 	connLogEnabled     atomic.Bool
 	ownsAwg            bool                        // the running session started AmneziaWG; guarded by mu
+	ownsHev            bool                        // the running session started HEV TUN; guarded by mu
 	stateListener      atomic.Pointer[listenerBox] // see SetStateListener
 }
 
@@ -122,7 +123,7 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	}
 	// If ForceStop gave up on this start, its abandoned mark ends when we return.
 	defer c.reapAbandonedStart(myGen)
-	return c.runStart(myGen, configJSON, tunFd, false, nil)
+	return c.runStart(myGen, configJSON, tunFd, false, nil, nil, false)
 }
 
 // beginStart moves an idle controller to starting and returns the generation of this attempt.
@@ -145,6 +146,7 @@ func (c *CoreController) beginStart() (uint64, error) {
 	c.statsManager = nil
 	c.trafficStatsTotals = make(map[string]int64)
 	c.ownsAwg = false
+	c.ownsHev = false
 	c.mu.Unlock()
 	c.notifyState(stateStarting, "")
 	return myGen, nil
@@ -152,8 +154,10 @@ func (c *CoreController) beginStart() (uint64, error) {
 
 // runStart is the Xray part of a start attempt that beginStart opened. ownsAwg marks the session
 // as the owner of the AmneziaWG runner, so its stop stops it too. beforeFail, when set, runs on
-// every failure before the controller returns to idle.
-func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, ownsAwg bool, beforeFail func()) error {
+// every failure before the controller returns to idle. afterXray, when set, runs once Xray
+// started and before the session is reported running (it starts HEV TUN); when it fails, Xray is
+// closed again and the start fails with its error. ownsHev marks the session as the owner of HEV TUN.
+func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, ownsAwg bool, beforeFail func(), afterXray func() error, ownsHev bool) error {
 	fail := func(err error) bool {
 		if beforeFail != nil {
 			beforeFail()
@@ -233,12 +237,30 @@ func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, 
 		return err
 	}
 
+	if afterXray != nil {
+		if err := afterXray(); err != nil {
+			// The hook already stopped what it started; undo Xray the same bounded way.
+			_, _ = lifecycle.RunBounded(server.Close, defaultStopTimeout, nil)
+			connlog.Clear(connLog)
+			if errors.Is(err, errStartAborted) {
+				return err // ForceStop already reset the controller; the caller stops AmneziaWG
+			}
+			if fail(err) {
+				clearTunFdEnv()
+			}
+			return err
+		}
+	}
+
 	c.mu.Lock()
 	if c.gen != myGen {
 		// ForceStop aborted this start while Xray was still coming up: do not install it.
 		c.mu.Unlock()
 		connlog.Clear(connLog)
 		lifecycle.CloseInBackground(server)
+		if ownsHev {
+			_ = stopHevBounded(defaultStopTimeout, nil)
+		}
 		return errStartAborted
 	}
 	c.instance = server
@@ -248,6 +270,7 @@ func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, 
 	connLog.SetEnabled(c.connLogEnabled.Load())
 	c.state = stateRunning
 	c.ownsAwg = ownsAwg
+	c.ownsHev = ownsHev
 	c.isRunning.Store(true)
 	c.mu.Unlock()
 	c.notifyState(stateRunning, "")
@@ -327,11 +350,17 @@ func (c *CoreController) stopWithin(d time.Duration) error {
 	op := lifecycle.NewStopOp()
 	inst := c.instance
 	ownsAwg := c.ownsAwg
+	ownsHev := c.ownsHev
 	c.stop = op
 	c.state = stateStopping
 	c.mu.Unlock()
 	c.notifyState(stateStopping, "")
 
+	// Reverse of the start order: HEV TUN, then Xray, then AmneziaWG, each bounded by d.
+	var hevErr error
+	if ownsHev {
+		hevErr = stopHevBounded(d, op.Force())
+	}
 	closeErr, timedOut := lifecycle.RunBounded(inst.Close, d, op.Force())
 	var awgErr error
 	if ownsAwg {
@@ -347,6 +376,7 @@ func (c *CoreController) stopWithin(d time.Duration) error {
 	c.isRunning.Store(false)
 	c.stop = nil
 	c.ownsAwg = false
+	c.ownsHev = false
 	c.state = stateIdle
 	c.mu.Unlock()
 
@@ -358,7 +388,7 @@ func (c *CoreController) stopWithin(d time.Duration) error {
 	if timedOut {
 		stopErr = fmt.Errorf("%w: xray instance did not close within %v", ErrStopTimedOut, d)
 	}
-	stopErr = errors.Join(stopErr, awgErr)
+	stopErr = errors.Join(hevErr, stopErr, awgErr)
 	op.Finish(stopErr)
 	detail := ""
 	if stopErr != nil {
@@ -377,9 +407,10 @@ func (c *CoreController) stopWithin(d time.Duration) error {
 // ForceStop is the emergency stop. It never waits on a hung start or stop and works in every
 // state: a running instance gets a short deadline, a start in flight is aborted (its StartLoop
 // returns an error and closes whatever it built), and a stop that is already hung is detached.
-// AmneziaWG is stopped too. The error wraps ErrStopTimedOut when anything had to be abandoned.
+// HEV TUN and AmneziaWG are stopped too. The error wraps ErrStopTimedOut when anything had to be abandoned.
 func (c *CoreController) ForceStop() error {
-	var xrayErr error
+	var xrayErr, hevErr error
+	hevStopped := false
 	c.mu.Lock()
 	switch c.state {
 	case stateStarting:
@@ -393,6 +424,7 @@ func (c *CoreController) ForceStop() error {
 		c.statsManager = nil
 		c.trafficStatsTotals = nil
 		c.ownsAwg = false
+		c.ownsHev = false
 		clearTunFdEnv()
 		c.mu.Unlock()
 		xrayErr = fmt.Errorf("%w: the start in flight was abandoned", ErrStopTimedOut)
@@ -403,13 +435,20 @@ func (c *CoreController) ForceStop() error {
 		op.ForceNow()
 		<-op.Done()
 		xrayErr = op.Err()
+		hevStopped = true
 	case stateRunning:
 		c.mu.Unlock()
 		xrayErr = c.stopWithin(forceStopTimeout)
+		hevStopped = true
 	default:
 		c.mu.Unlock()
 	}
-	return errors.Join(xrayErr, StopAmneziaWgWithTimeout(forceStopTimeout.Milliseconds()))
+	// HEV TUN is a process singleton Core owns: unless the stop above already covered it, make sure
+	// it is stopped (a no-op when it is not running).
+	if !hevStopped {
+		hevErr = stopHevBounded(forceStopTimeout, nil)
+	}
+	return errors.Join(xrayErr, hevErr, StopAmneziaWgWithTimeout(forceStopTimeout.Milliseconds()))
 }
 
 // IsRunning returns whether the core instance is currently running.

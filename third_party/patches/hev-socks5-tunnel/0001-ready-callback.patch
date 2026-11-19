@@ -1,0 +1,79 @@
+--- a/src/core/src/hev-socks5-server.c
++++ b/src/core/src/hev-socks5-server.c
+@@ -173,16 +173,13 @@
+ 
+     user = hev_socks5_authenticator_get (self->auth, (char *)name, nlen);
+     if (!user) {
+-        name[nlen] = '\0';
+-        LOG_I ("%p socks5 server auth user: %s", self, name);
++        LOG_I ("%p socks5 server authentication failed", self);
+         return -1;
+     }
+ 
+     res = hev_socks5_user_check (user, (char *)pass, plen);
+     if (res < 0) {
+-        name[nlen] = '\0';
+-        pass[plen] = '\0';
+-        LOG_I ("%p socks5 server auth user: %s pass: %s", self, name, pass);
++        LOG_I ("%p socks5 server authentication failed", self);
+         return -1;
+     }
+ 
+--- a/src/hev-main.c
++++ b/src/hev-main.c
+@@ -26,6 +26,14 @@
+ 
+ #include "hev-main.h"
+ 
++static HevSocks5TunnelReadyCallback ready_callback;
++
++void
++hev_socks5_tunnel_set_ready_callback (HevSocks5TunnelReadyCallback callback)
++{
++    ready_callback = callback;
++}
++
+ static int
+ hev_socks5_tunnel_main_inner (int tun_fd)
+ {
+@@ -75,6 +83,9 @@
+     if (res < 0)
+         goto free_task_sys;
+ 
++    if (ready_callback)
++        ready_callback ();
++
+     hev_socks5_tunnel_run ();
+ 
+     hev_socks5_tunnel_fini ();
+--- a/src/hev-main.h
++++ b/src/hev-main.h
+@@ -16,6 +16,17 @@
+ extern "C" {
+ #endif
+ 
++typedef void (*HevSocks5TunnelReadyCallback) (void);
++
++/**
++ * hev_socks5_tunnel_set_ready_callback:
++ * @callback: callback invoked after tunnel initialization succeeds
++ *
++ * Set an optional callback to be invoked after the tunnel, gateway, worker
++ * tasks, and mapped DNS have initialized successfully.
++ */
++void hev_socks5_tunnel_set_ready_callback (HevSocks5TunnelReadyCallback callback);
++
+ /**
+  * hev_socks5_tunnel_main:
+  * @config_path: config file path
+--- a/src/hev-socks5-session.c
++++ b/src/hev-socks5-session.c
+@@ -39,7 +39,7 @@
+     if (srv->user && srv->pass) {
+         hev_socks5_client_set_auth (HEV_SOCKS5_CLIENT (self), srv->user,
+                                     srv->pass);
+-        LOG_D ("%p socks5 client auth %s:%s", self, srv->user, srv->pass);
++        LOG_D ("%p socks5 client auth", self);
+     }
+ 
+     res = hev_socks5_client_handshake (HEV_SOCKS5_CLIENT (self), srv->pipeline);

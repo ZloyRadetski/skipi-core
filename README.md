@@ -15,14 +15,26 @@ binding rule and how to add an exported function. The exported API is pinned by
 ---
 
 ## Build (AAR for Android)
+
 ```bash
 go install golang.org/x/mobile/cmd/gomobile@latest
 gomobile init
-# github.com/wlynxg/anet requires this linker flag with Go 1.23+.
-# Align native library to 16 KB page size for Android 15+ compatibility:
-export CGO_LDFLAGS="-Wl,-z,max-page-size=16384"
-gomobile bind -target=android -androidapi 24 -javapkg=app.skipi.core -ldflags=-checklinkname=0 -o skipicore.aar .
+git submodule update --init --recursive   # hev-socks5-tunnel (HEV TUN) and its nested submodules
+export ANDROID_NDK_HOME=/path/to/ndk       # NDK r26d or newer
+scripts/build-android.sh                   # -> skipicore.aar
 ```
+
+`scripts/build-android.sh` first runs `scripts/build-hev-android.sh`, which builds
+[hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel) (`third_party/hev-socks5-tunnel`,
+pinned to 2.19.3) as static libraries for arm64-v8a, armeabi-v7a, x86 and x86_64 into
+`build/hev/android/<abi>/`. The submodule is copied, patched with
+`third_party/patches/hev-socks5-tunnel/*.patch` (readiness callback, credential-free logs) and built
+with `ndk-build`, so it works in Git Bash on Windows as well as on Linux. It then runs
+`gomobile bind` with `-androidapi 24 -javapkg=app.skipi.core -ldflags=-checklinkname=0` and
+`CGO_LDFLAGS=-Wl,-z,max-page-size=16384` (16 KB page alignment for Android 15+;
+`-checklinkname=0` is required by github.com/wlynxg/anet with Go 1.23+), which links the hev
+libraries into `libgojni.so` through cgo. `internal/hevtun` is the Go side; on non-Android builds
+it is a stub that returns "HEV TUN is not built into this Core on <GOOS>".
 
 In PowerShell, quote `'-javapkg=app.skipi.core'` so the dotted Java package
 prefix is passed to `gomobile` as one argument.
