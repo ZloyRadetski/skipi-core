@@ -1,7 +1,7 @@
 // Copyright 2026, Radetski
 // SPDX-License-Identifier: GPL-3.0
 
-//go:build android
+//go:build (android || linux) && cgo
 
 package hevtun
 
@@ -11,10 +11,11 @@ package hevtun
 #cgo android,arm LDFLAGS: -L${SRCDIR}/../../build/hev/android/armeabi-v7a -lhev-socks5-tunnel -lyaml -llwip -lhev-task-system
 #cgo android,386 LDFLAGS: -L${SRCDIR}/../../build/hev/android/x86 -lhev-socks5-tunnel -lyaml -llwip -lhev-task-system
 #cgo android,amd64 LDFLAGS: -L${SRCDIR}/../../build/hev/android/x86_64 -lhev-socks5-tunnel -lyaml -llwip -lhev-task-system
+#cgo linux,!android,amd64 LDFLAGS: -L${SRCDIR}/../../build/hev/linux-amd64 -lhev-socks5-tunnel -lyaml -llwip -lhev-task-system -lpthread -lm
 
 #include <stdlib.h>
 #include "hev-main.h"
-#include "hevtun_android.h"
+#include "hevtun_cgo.h"
 */
 import "C"
 
@@ -54,10 +55,13 @@ func current() *instance {
 	return active
 }
 
+// NeedsTunFd reports that this target runs hev in process on a TUN descriptor the caller opened.
+func NeedsTunFd() bool { return true }
+
 // Start runs hev on a dedicated, locked OS thread with the given YAML config and TUN
-// descriptor. It does not wait for readiness (see WaitReady) but fails at once when the hev
+// descriptor. executable is only used by the Windows process mode and ignored here. It does not wait for readiness (see WaitReady) but fails at once when the hev
 // main returns right away. Only one instance can run per process.
-func Start(configYAML string, tunFd int) error {
+func Start(configYAML string, tunFd int, executable string) error {
 	if configYAML == "" {
 		return errors.New("HEV TUN config is empty")
 	}

@@ -1,8 +1,8 @@
 // Copyright 2026, Radetski
 // SPDX-License-Identifier: GPL-3.0
 
-#ifndef SKIPI_HEVTUN_ANDROID_H
-#define SKIPI_HEVTUN_ANDROID_H
+#ifndef SKIPI_HEVTUN_CGO_H
+#define SKIPI_HEVTUN_CGO_H
 
 void skipi_hev_reset (void);
 /* Blocks until the hev main returns; returns its result. */

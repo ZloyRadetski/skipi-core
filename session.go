@@ -99,7 +99,7 @@ func parseSessionPlan(planJSON string) (*sessionPlan, error) {
 		if strings.TrimSpace(p.Hev.ConfigYAML) == "" {
 			return nil, errors.New("session plan: hev.configYaml must not be blank")
 		}
-		if p.Hev.TunFd <= 0 {
+		if hevTun.NeedsTunFd() && p.Hev.TunFd <= 0 {
 			return nil, errors.New("session plan: hev.tunFd must be positive")
 		}
 	}
@@ -112,8 +112,10 @@ func parseSessionPlan(planJSON string) (*sessionPlan, error) {
 //
 // amneziaWg is optional. With it, AmneziaWG starts first and Core waits until its local SOCKS
 // listener accepts connections, then Xray starts. The optional "hev": {"configYaml": "<yaml>",
-// "tunFd": N} starts HEV TUN last and waits (hevReadyTimeout) until it reports ready. Any failure
-// stops what was started, in reverse. A later StopLoop, StopLoopWithTimeout or ForceStop stops
+// "tunFd": N, "executable": "<hev exe>"} starts HEV TUN last and waits (hevReadyTimeout) until it
+// reports ready. tunFd (positive) is required by in-process targets (Android, Linux); executable
+// is used only by the Windows process mode, where tunFd is ignored. Any failure stops what was
+// started, in reverse. A later StopLoop, StopLoopWithTimeout or ForceStop stops
 // HEV TUN, then Xray, then AmneziaWG.
 func (c *CoreController) StartSession(planJSON string, tunFd int64) error {
 	plan, err := parseSessionPlan(planJSON)

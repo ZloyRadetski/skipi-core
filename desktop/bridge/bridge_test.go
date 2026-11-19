@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -618,5 +620,49 @@ func TestRuntimeStartSessionRejectsBadInputAndLeavesLeaseFree(t *testing.T) {
 func TestRuntimeSessionStateRejectsUnknownHandle(t *testing.T) {
 	if _, err := NewRuntime().SessionState(9999); !errors.Is(err, ErrControllerNotFound) {
 		t.Fatalf("expected controller-not-found, got %v", err)
+	}
+}
+
+func TestRuntimeQueryTunnelStatsIsZeroWithoutATunnelAndRejectsUnknownHandle(t *testing.T) {
+	runtime := initializedRuntime(t)
+	handle := runtime.CreateController()
+	t.Cleanup(func() { _ = runtime.DestroyController(handle) })
+
+	got, err := runtime.QueryTunnelStats(handle)
+	if err != nil {
+		t.Fatalf("QueryTunnelStats: %v", err)
+	}
+	if want := `{"txPackets":0,"txBytes":0,"rxPackets":0,"rxBytes":0}`; got != want {
+		t.Fatalf("stats = %s, want %s", got, want)
+	}
+	if _, err := runtime.QueryTunnelStats(handle + 100); !errors.Is(err, ErrControllerNotFound) {
+		t.Fatalf("unknown handle: err = %v, want ErrControllerNotFound", err)
+	}
+}
+
+func TestRuntimeStartSessionAcceptsTheHevBlockAndReportsAFailedTunnelStart(t *testing.T) {
+	runtime := initializedRuntime(t)
+	handle := runtime.CreateController()
+	t.Cleanup(func() { _ = runtime.DestroyController(handle) })
+
+	// On Windows the executable is missing; elsewhere the build has no HEV TUN or the descriptor
+	// is invalid. Either way the plan is parsed, HEV TUN is attempted after Xray, its failure is
+	// reported by name, and the session lease is released again.
+	hev := map[string]any{
+		"configYaml": "tunnel:\n  mtu: 1500\n",
+		"tunFd":      -1,
+		"executable": filepath.Join(t.TempDir(), "missing-hev.exe"),
+	}
+	plan, _ := json.Marshal(map[string]any{"xrayConfig": testXrayConfig(t), "hev": hev})
+	err := runtime.StartSession(handle, string(plan), 0)
+	if err == nil {
+		_ = runtime.Stop(handle)
+		t.Fatal("start must fail: there is no usable HEV TUN")
+	}
+	if !strings.Contains(err.Error(), "HEV TUN") && !strings.Contains(err.Error(), "tunFd") {
+		t.Fatalf("error %q does not name HEV TUN", err)
+	}
+	if runtime.ActiveHandle() != 0 {
+		t.Fatalf("lease still held by %d", runtime.ActiveHandle())
 	}
 }

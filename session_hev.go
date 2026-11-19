@@ -14,9 +14,12 @@ import (
 )
 
 // hevTunnel is the HEV TUN the session drives. The production value forwards to internal/hevtun
-// (cgo on Android, a stub elsewhere); tests substitute a fake.
+// (cgo on Android and Linux, a supervised process on Windows, a stub elsewhere); tests substitute a fake.
 type hevTunnel interface {
-	Start(configYAML string, tunFd int) error
+	// NeedsTunFd reports whether this target runs hev in process on a descriptor the host opened
+	// (Android, Linux). A process-mode target (Windows) creates the interface itself.
+	NeedsTunFd() bool
+	Start(configYAML string, tunFd int, executable string) error
 	WaitReady(timeout time.Duration) error
 	Stop() error
 	Stats() (txPackets, txBytes, rxPackets, rxBytes uint64)
@@ -25,8 +28,9 @@ type hevTunnel interface {
 
 type realHevTunnel struct{}
 
-func (realHevTunnel) Start(configYAML string, tunFd int) error {
-	return hevtun.Start(configYAML, tunFd)
+func (realHevTunnel) NeedsTunFd() bool { return hevtun.NeedsTunFd() }
+func (realHevTunnel) Start(configYAML string, tunFd int, executable string) error {
+	return hevtun.Start(configYAML, tunFd, executable)
 }
 func (realHevTunnel) WaitReady(timeout time.Duration) error   { return hevtun.WaitReady(timeout) }
 func (realHevTunnel) Stop() error                             { return hevtun.Stop() }
@@ -46,6 +50,8 @@ const hevReadyPoll = 100 * time.Millisecond
 type sessionPlanHev struct {
 	ConfigYAML string `json:"configYaml"`
 	TunFd      int    `json:"tunFd"`
+	// Executable is the hev executable of the Windows process mode; ignored by in-process targets.
+	Executable string `json:"executable"`
 }
 
 // stopHevBounded stops HEV TUN within d; a stop that hangs is counted in AbandonedInstances
@@ -67,7 +73,7 @@ func (c *CoreController) startSessionHev(gen uint64, cfg *sessionPlanHev) error 
 	if c.superseded(gen) {
 		return errStartAborted
 	}
-	if err := hevTun.Start(cfg.ConfigYAML, cfg.TunFd); err != nil {
+	if err := hevTun.Start(cfg.ConfigYAML, cfg.TunFd, cfg.Executable); err != nil {
 		_ = stopHevBounded(defaultStopTimeout, nil)
 		return fmt.Errorf("HEV TUN failed to start: %w", err)
 	}

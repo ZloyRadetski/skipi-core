@@ -46,6 +46,7 @@ SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopStartAmneziaWg(const char *config_j
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopStopAmneziaWg(void);
 SKIPI_CORE_DESKTOP_API int32_t SkipiCoreDesktopIsAmneziaWgRunning(void);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopQueryTrafficStats(uint64_t handle);
+SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopQueryTunnelStats(uint64_t handle);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopSetConnectionLogEnabled(uint64_t handle, int32_t enabled);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopReadConnectionLog(uint64_t handle, int64_t after_seq);
 SKIPI_CORE_DESKTOP_API int64_t SkipiCoreDesktopMeasureDelay(uint64_t handle, const char *target_url);

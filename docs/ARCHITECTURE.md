@@ -25,7 +25,7 @@ amneziawg_runner.go   AmneziaWgRunner (netstack tunnel + SOCKS listener)
 amneziawg_socks.go    the runner's SOCKS5 handlers
 process_finder_*.go   RegisterProcessFinder: Android implementation / no-op elsewhere (build tags)
 
-internal/hevtun       HEV TUN (hev-socks5-tunnel): cgo on Android (build/hev static libs), stub elsewhere
+internal/hevtun       HEV TUN (hev-socks5-tunnel): cgo on Android and Linux (build/hev static libs), supervised process on Windows, stub elsewhere
 internal/lifecycle    bounded stop (RunBounded), abandoned counter, shared stop operation
 internal/xraylog      console log writer registered with Xray
 internal/connlog      connection log implementation
@@ -80,18 +80,38 @@ root package (all build tags) and compares it with `testdata/public_api.golden`.
 
 `StartSession(planJSON, tunFd)` makes the controller the whole tunnel session, so hosts only call
 start and stop. The plan is `{"xrayConfig": "<json>", "amneziaWg": {"config": "<json>", "socksPort": N}
-(optional), "connectionLog": bool, "hev": {"configYaml": "<yaml>", "tunFd": N} (optional)}`; unknown fields are ignored.
+(optional), "connectionLog": bool, "hev": {"configYaml": "<yaml>", "tunFd": N, "executable": "<path>"}
+(optional)}`; unknown fields are ignored. `tunFd` must be positive where hev runs in process
+(Android, Linux) and is ignored on Windows; `executable` is used only on Windows.
 
 1. With `amneziaWg`: start it, then poll a TCP dial to `127.0.0.1:socksPort` until it accepts
    (`awgReadyTimeout`, 8 s). `AmneziaWgRunner.Start` binds the listener before it returns, so the
    first dial normally succeeds; the poll keeps the contract independent of that. Not ready in time:
    AmneziaWG is stopped (bounded) and the error names the port and the timeout.
 2. Apply `connectionLog`, then the ordinary `StartLoop` path. An Xray failure stops AmneziaWG.
-   With `hev` (Android only; elsewhere `internal/hevtun` is a stub returning "HEV TUN is not built into
-   this Core on <GOOS>"), HEV TUN starts after Xray and Core waits for its readiness callback
-   (`hevReadyTimeout`, 5 s). Not ready or failed: HEV TUN, Xray and AmneziaWG are stopped in reverse.
+   With `hev`, HEV TUN starts after Xray and Core waits for its readiness (`hevReadyTimeout`, 5 s).
+   Not ready or failed: HEV TUN, Xray and AmneziaWG are stopped in reverse.
    Stop order is HEV TUN, Xray, AmneziaWG, each bounded; a hung HEV TUN stop counts as abandoned.
-   `QueryTunnelStats` returns hev's packet and byte counters as JSON.
+   `QueryTunnelStats` returns hev's packet and byte counters as JSON (desktop:
+   `SkipiCoreDesktopQueryTunnelStats`; zeros on Windows).
+
+### HEV TUN per platform
+
+HEV TUN is the TUN implementation everywhere; what differs is how Core runs it
+(`internal/hevtun`, selected by build tags, behind the `hevTun` seam):
+
+| Platform | How | TUN | Readiness | Stats |
+|---|---|---|---|---|
+| Android | static libs linked in process (cgo, `scripts/build-hev-android.sh`) | descriptor from the VpnService (`tunFd`) | ready callback (patch) | hev counters |
+| Linux amd64 | static libs linked in process (cgo, `scripts/build-hev-linux.sh`, `build/hev/linux-amd64`) | descriptor Core's desktop TUN opened (`tunFd`) | ready callback (patch) | hev counters |
+| Windows | supervised child process: `<executable> <temp config>`, run from the executable's directory (wintun.dll and the MSYS DLLs sit there); output goes to Core's log | hev creates the Wintun adapter itself, `tunFd` ignored | no callback across processes: Start waits a 150 ms grace and an earlier exit is a failure (first 4 KB of output in the error); WaitReady only reports whether the process is alive | zeros (counters live in another process) |
+| macOS | not in Core: the privileged supervisor stays in the app; `internal/hevtun` is a stub | n/a | n/a | zeros |
+
+Windows Stop terminates the process and waits up to 5 s; a process still alive stays known so a
+later Stop or ForceStop can end it. The temporary config (0600) is deleted when the process is gone.
+Builds without cgo (and other OSes) get the stub that returns "HEV TUN is not built into this Core
+on <GOOS>". `scripts/build-hev-linux.sh` builds a patched copy of the submodule with `make static`
+(`-fPIC`) and never touches `build/hev/android`; the Android script clears all of `build/hev`.
 3. The session owns the runner: `StopLoop`, `StopLoopWithTimeout` and `ForceStop` stop it too (a
    timed-out stop counts as abandoned). A plain `StartLoop` never makes `StopLoop` touch AmneziaWG.
 4. `ForceStop` during the AmneziaWG phase bumps the same generation counter as for `StartLoop`, so
@@ -100,7 +120,8 @@ start and stop. The plan is `{"xrayConfig": "<json>", "amneziaWg": {"config": "<
 `State()` returns `SessionIdle/Starting/Running/Stopping` and only takes the short lifecycle lock.
 `SetStateListener` registers a `StateListener` that is called synchronously on every transition
 (failure message or stop error as `detail`), after `c.mu` is released; a panic in it is recovered.
-Desktop exposes `SkipiCoreDesktopStartSession` and `SkipiCoreDesktopSessionState` (-1: unknown handle).
+Desktop exposes `SkipiCoreDesktopStartSession`, `SkipiCoreDesktopSessionState` (-1: unknown handle)
+and `SkipiCoreDesktopQueryTunnelStats`.
 
 ## Test seams
 

@@ -1,6 +1,8 @@
 // Copyright 2026, Radetski
 // SPDX-License-Identifier: GPL-3.0
 
+//go:build (android || linux) && cgo
+
 // Glue between Go and hev-socks5-tunnel: the ready callback (a patch to hev, see
 // third_party/patches/hev-socks5-tunnel) flips a flag under a mutex and wakes the Go waiter.
 
@@ -9,7 +11,7 @@
 #include <time.h>
 
 #include "hev-main.h"
-#include "hevtun_android.h"
+#include "hevtun_cgo.h"
 
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv;

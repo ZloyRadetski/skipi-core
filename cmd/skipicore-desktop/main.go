@@ -306,6 +306,17 @@ func SkipiCoreDesktopQueryTrafficStats(handle C.uint64_t) *C.char {
 	})
 }
 
+// SkipiCoreDesktopQueryTunnelStats returns an owned JSON snapshot of the HEV TUN counters
+// ({"txPackets","txBytes","rxPackets","rxBytes"}), or NULL on error. The counters are zero when
+// no HEV TUN runs, and always zero on Windows, where hev is a separate process.
+//
+//export SkipiCoreDesktopQueryTunnelStats
+func SkipiCoreDesktopQueryTunnelStats(handle C.uint64_t) *C.char {
+	return cString(func() (string, error) {
+		return desktopRuntime.QueryTunnelStats(desktopbridge.Handle(handle))
+	})
+}
+
 // SkipiCoreDesktopSetConnectionLogEnabled switches the connection log of a controller.
 // Returns NULL on success.
 //

@@ -1,7 +1,7 @@
 // Copyright 2026, Radetski
 // SPDX-License-Identifier: GPL-3.0
 
-//go:build !android
+//go:build !windows && !((android || linux) && cgo)
 
 package hevtun
 
@@ -13,7 +13,7 @@ import (
 )
 
 func TestStubStartReportsClearError(t *testing.T) {
-	err := Start("tunnel:\n  mtu: 1500\n", 7)
+	err := Start("tunnel:\n  mtu: 1500\n", 7, "")
 	if err == nil {
 		t.Fatal("Start must fail where HEV TUN is not built in")
 	}
@@ -45,5 +45,11 @@ func TestStubIsInertOtherwise(t *testing.T) {
 func TestSentinelErrorsAreDistinct(t *testing.T) {
 	if ErrReadyTimeout == nil || ErrExited == nil || ErrReadyTimeout == ErrExited {
 		t.Fatal("ErrReadyTimeout and ErrExited must be distinct non-nil errors")
+	}
+}
+
+func TestStubStillValidatesTheDescriptor(t *testing.T) {
+	if !NeedsTunFd() {
+		t.Fatal("NeedsTunFd() = false on a stub build")
 	}
 }

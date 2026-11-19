@@ -33,8 +33,10 @@ with `ndk-build`, so it works in Git Bash on Windows as well as on Linux. It the
 `gomobile bind` with `-androidapi 24 -javapkg=app.skipi.core -ldflags=-checklinkname=0` and
 `CGO_LDFLAGS=-Wl,-z,max-page-size=16384` (16 KB page alignment for Android 15+;
 `-checklinkname=0` is required by github.com/wlynxg/anet with Go 1.23+), which links the hev
-libraries into `libgojni.so` through cgo. `internal/hevtun` is the Go side; on non-Android builds
-it is a stub that returns "HEV TUN is not built into this Core on <GOOS>".
+libraries into `libgojni.so` through cgo. `internal/hevtun` is the Go side: Android and Linux
+(cgo) link hev in process, Windows runs the hev executable named in the session plan as a
+supervised process, and every other build gets a stub that returns "HEV TUN is not built into this
+Core on <GOOS>".
 
 In PowerShell, quote `'-javapkg=app.skipi.core'` so the dotted Java package
 prefix is passed to `gomobile` as one argument.
@@ -48,6 +50,18 @@ prefix is passed to `gomobile` as one argument.
 The build needs a GCC-compatible C compiler. On Windows, use MSYS2 UCRT64 with
 `mingw-w64-ucrt-x86_64-gcc`; Visual Studio's `cl.exe` alone is not compatible
 with the flags used by Go's CGo toolchain.
+
+On Linux, build HEV TUN first (needs `gcc`, `make`, `patch`; the submodules must be checked out
+with `git submodule update --init --recursive`). It links into `libskipicore.so`:
+
+```bash
+scripts/build-hev-linux.sh     # -> build/hev/linux-amd64/*.a (patched copy of the submodule, -fPIC)
+CGO_ENABLED=1 go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o libskipicore.so ./cmd/skipicore-desktop
+nm -D libskipicore.so | grep hev_socks5_tunnel_main_from_str   # HEV TUN is in the library
+```
+
+On Windows the library needs no hev build: the host ships the hev executable (with `wintun.dll`
+and its MSYS runtime DLLs next to it) and passes its path as `hev.executable` in the session plan.
 
 ```powershell
 $env:CGO_ENABLED = "1"

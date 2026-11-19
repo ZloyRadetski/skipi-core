@@ -1,7 +1,7 @@
 // Copyright 2026, Radetski
 // SPDX-License-Identifier: GPL-3.0
 
-//go:build !android
+//go:build !windows && !((android || linux) && cgo)
 
 package hevtun
 
@@ -15,8 +15,11 @@ func notBuilt() error {
 	return fmt.Errorf("HEV TUN is not built into this Core on %s", runtime.GOOS)
 }
 
+// NeedsTunFd is true: a descriptor is validated before the clear "not built" error from Start.
+func NeedsTunFd() bool { return true }
+
 // Start always fails: this Core was built without HEV TUN.
-func Start(configYAML string, tunFd int) error { return notBuilt() }
+func Start(configYAML string, tunFd int, executable string) error { return notBuilt() }
 
 // WaitReady always fails: this Core was built without HEV TUN.
 func WaitReady(timeout time.Duration) error { return notBuilt() }

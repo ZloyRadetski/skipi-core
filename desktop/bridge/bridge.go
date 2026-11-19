@@ -278,6 +278,17 @@ func (r *Runtime) QueryTrafficStats(handle Handle) (string, error) {
 	return controller.QueryTrafficStats(), nil
 }
 
+// QueryTunnelStats returns the HEV TUN interface counters as JSON
+// ({"txPackets","txBytes","rxPackets","rxBytes"}). Zeros when no HEV TUN runs, and always zeros
+// where hev runs as a separate process (Windows): its counters are not reachable from Core.
+func (r *Runtime) QueryTunnelStats(handle Handle) (string, error) {
+	controller, err := r.controller(handle)
+	if err != nil {
+		return "", err
+	}
+	return controller.QueryTunnelStats(), nil
+}
+
 // SetConnectionLogEnabled switches the connection log of a controller.
 func (r *Runtime) SetConnectionLogEnabled(handle Handle, enabled bool) error {
 	controller, err := r.controller(handle)
@@ -448,7 +459,8 @@ func normalizeAssetDirectory(directory string) (string, error) {
 }
 
 // StartSession starts a controller from a session plan JSON (see skipicore.CoreController.StartSession):
-// Xray and, when the plan has it, AmneziaWG with its SOCKS readiness wait. It takes the same
+// Xray and, when the plan has it, AmneziaWG with its SOCKS readiness wait and HEV TUN (in process
+// on Linux with the TUN descriptor tunFD, a supervised process on Windows). It takes the same
 // session lease as Start. A desktop process has no VpnService, so no socket protector is used.
 func (r *Runtime) StartSession(handle Handle, planJSON string, tunFD int64) error {
 	if strings.TrimSpace(planJSON) == "" {

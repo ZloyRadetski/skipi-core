@@ -44,7 +44,8 @@ case "$(uname -s)" in
 esac
 
 # 1. Fresh copy of the sources. -h dereferences symlinks (hev's include/ dirs are symlinks).
-rm -rf "$OUT"
+# Only this script's own directories are replaced, so the Linux libraries under build/hev survive.
+rm -rf "$SRC" "$OUT/android"
 mkdir -p "$SRC"
 (cd "$SUBMODULE" && tar --exclude=.git -chf - .) | (cd "$SRC" && tar -xf -)
 

@@ -58,10 +58,15 @@ type fakeHev struct {
 	stats       [4]uint64
 	gotCfg      atomic.Value
 	gotFd       atomic.Int64
+	gotExe      atomic.Value
+	noFd        bool // a process-mode target: no TUN descriptor is needed
 }
 
-func (f *fakeHev) Start(cfg string, fd int) error {
+func (f *fakeHev) NeedsTunFd() bool { return !f.noFd }
+
+func (f *fakeHev) Start(cfg string, fd int, exe string) error {
 	f.log.add("hev.start")
+	f.gotExe.Store(exe)
 	f.gotCfg.Store(cfg)
 	f.gotFd.Store(int64(fd))
 	if f.startErr != nil {
@@ -144,7 +149,71 @@ func hevPlan(t *testing.T, port int, withAwg bool) string {
 	return strings.TrimSuffix(base, "}") + fmt.Sprintf(`,"hev":{"configYaml":%s,"tunFd":42}}`, yaml)
 }
 
+const winExe = `C:\Program Files\Skipi\hev.exe`
+
+func useHevTarget(t *testing.T, h hevTunnel) {
+	t.Helper()
+	orig := hevTun
+	hevTun = h
+	t.Cleanup(func() { hevTun = orig })
+}
+
+func hevPlanWith(t *testing.T, hev string) string {
+	t.Helper()
+	return strings.TrimSuffix(buildPlan(t, 0, false), "}") + `,"hev":` + hev + `}`
+}
+
+func TestParseSessionPlanHevTunFdDependsOnTheTarget(t *testing.T) {
+	// In-process targets (Android, Linux) need the descriptor Core was given.
+	useHevTarget(t, &fakeHev{})
+	for _, fd := range []string{"0", "-1"} {
+		if _, err := parseSessionPlan(hevPlanWith(t, `{"configYaml":"a: b","tunFd":`+fd+`}`)); err == nil ||
+			!strings.Contains(err.Error(), "tunFd") {
+			t.Errorf("in-process tunFd %s: err = %v, want a tunFd error", fd, err)
+		}
+	}
+	// A process-mode target (Windows) creates the interface itself: 0, -1 and absent are fine.
+	useHevTarget(t, &fakeHev{noFd: true})
+	exe, _ := json.Marshal(winExe)
+	for _, hev := range []string{
+		`{"configYaml":"a: b","tunFd":-1,"executable":` + string(exe) + `}`,
+		`{"configYaml":"a: b","tunFd":0,"executable":` + string(exe) + `}`,
+		`{"configYaml":"a: b","executable":` + string(exe) + `}`,
+	} {
+		p, err := parseSessionPlan(hevPlanWith(t, hev))
+		if err != nil {
+			t.Errorf("process mode %s: %v", hev, err)
+			continue
+		}
+		if p.Hev.Executable != winExe {
+			t.Errorf("executable = %q", p.Hev.Executable)
+		}
+	}
+	// Blank YAML is rejected everywhere.
+	if _, err := parseSessionPlan(hevPlanWith(t, `{"configYaml":" ","tunFd":-1}`)); err == nil {
+		t.Error("blank yaml must be rejected")
+	}
+}
+
+func TestSessionPassesHevExecutableAndRunsProcessModeWithoutFd(t *testing.T) {
+	hev := &fakeHev{noFd: true}
+	installOrderedFakes(t, hev)
+	c := NewCoreController(nil)
+	yaml, _ := json.Marshal(hevTestYAML)
+	exe, _ := json.Marshal(winExe)
+	plan := strings.TrimSuffix(buildPlan(t, reserveLocalPort(t), true), "}") +
+		fmt.Sprintf(`,"hev":{"configYaml":%s,"executable":%s}}`, yaml, exe)
+	if err := c.StartSession(plan, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.StopLoop() })
+	if got := hev.gotExe.Load(); got != winExe {
+		t.Fatalf("hev got executable %v", got)
+	}
+}
+
 func TestParseSessionPlanHev(t *testing.T) {
+	useHevTarget(t, &fakeHev{})
 	p, err := parseSessionPlan(buildPlan(t, 0, false))
 	if err != nil || p.Hev != nil {
 		t.Fatalf("plan without hev: hev=%v err=%v", p.Hev, err)
