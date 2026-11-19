@@ -114,6 +114,38 @@ func SkipiCoreDesktopStop(handle C.uint64_t) *C.char {
 	})
 }
 
+// SkipiCoreDesktopStopWithTimeout stops a controller, waiting at most timeout_millis for Xray
+// to close (non-positive: 5000). On a timeout the controller is detached anyway and the
+// returned error contains "timed out"; SkipiCoreDesktopAbandonedInstances then counts the
+// instance until its Close returns. It returns NULL on success, otherwise an owned error string.
+//
+//export SkipiCoreDesktopStopWithTimeout
+func SkipiCoreDesktopStopWithTimeout(handle C.uint64_t, timeoutMillis C.int64_t) *C.char {
+	return cError(func() error {
+		return desktopRuntime.StopWithTimeout(desktopbridge.Handle(handle), int64(timeoutMillis))
+	})
+}
+
+// SkipiCoreDesktopForceStop is the emergency stop: it never waits on a hung start or stop,
+// aborts a start in flight, and also stops AmneziaWG. It returns NULL on success, otherwise an
+// owned error string ("timed out" when something had to be abandoned).
+//
+//export SkipiCoreDesktopForceStop
+func SkipiCoreDesktopForceStop(handle C.uint64_t) *C.char {
+	return cError(func() error {
+		return desktopRuntime.ForceStop(desktopbridge.Handle(handle))
+	})
+}
+
+// SkipiCoreDesktopAbandonedInstances returns how many Xray instances or AmneziaWG runners had
+// their stop given up on and have not finished closing. Non-zero means the process is dirty
+// and should be restarted.
+//
+//export SkipiCoreDesktopAbandonedInstances
+func SkipiCoreDesktopAbandonedInstances() C.int64_t {
+	return C.int64_t(desktopRuntime.AbandonedInstances())
+}
+
 // SkipiCoreDesktopTunOpen brings up the TUN interface described by a JSON plan
 // ({"name","mtu","addresses","routes","dns"}; "dns" is optional and makes the
 // system resolve through the tunnel) and returns the attached tun file descriptor, or -1 with SkipiCoreDesktopLastError set. The descriptor stays owned

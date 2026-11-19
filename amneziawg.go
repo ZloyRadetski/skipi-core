@@ -795,8 +795,9 @@ func StartAmneziaWg(configJSON string, socksPort int) error {
 	defer awgGlobalMu.Unlock()
 
 	if activeAwgRunner != nil && activeAwgRunner.running {
-		_ = activeAwgRunner.Stop()
+		old := activeAwgRunner
 		activeAwgRunner = nil
+		_, _ = runBounded(func() error { return awgStop(old) }, defaultStopTimeout, nil)
 	}
 
 	settings, err := ParseAmneziaWgSettings(configJSON)
@@ -817,16 +818,35 @@ func StartAmneziaWg(configJSON string, socksPort int) error {
 	return nil
 }
 
-// StopAmneziaWg stops the currently active AmneziaWG runner.
-func StopAmneziaWg() error {
-	awgGlobalMu.Lock()
-	defer awgGlobalMu.Unlock()
+// awgStop closes one runner. It is a variable so tests can simulate a Close that hangs.
+var awgStop = func(r *AmneziaWgRunner) error { return r.Stop() }
 
-	if activeAwgRunner == nil {
+// StopAmneziaWg stops the currently active AmneziaWG runner, giving up after the default timeout.
+func StopAmneziaWg() error {
+	return StopAmneziaWgWithTimeout(0)
+}
+
+// StopAmneziaWgWithTimeout stops the active runner and waits at most timeoutMillis for it
+// (non-positive: 5000 ms). A runner whose Stop hangs is detached anyway and counted in
+// AbandonedInstances until Stop returns; the error then wraps ErrStopTimedOut.
+func StopAmneziaWgWithTimeout(timeoutMillis int64) error {
+	d := defaultStopTimeout
+	if timeoutMillis > 0 {
+		d = time.Duration(timeoutMillis) * time.Millisecond
+	}
+
+	awgGlobalMu.Lock()
+	runner := activeAwgRunner
+	activeAwgRunner = nil
+	awgGlobalMu.Unlock()
+	if runner == nil {
 		return nil
 	}
-	err := activeAwgRunner.Stop()
-	activeAwgRunner = nil
+
+	err, timedOut := runBounded(func() error { return awgStop(runner) }, d, nil)
+	if timedOut {
+		return fmt.Errorf("%w: AmneziaWG runner did not stop within %v", ErrStopTimedOut, d)
+	}
 	return err
 }
 

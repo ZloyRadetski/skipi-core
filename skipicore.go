@@ -131,8 +131,14 @@ func unsetEnvVariable(key string) {
 
 // CoreController manages the lifecycle, stats, and real-time monitoring of an Xray-core instance.
 type CoreController struct {
+	// mu only guards the lifecycle fields below and is held for short swaps. Config loading,
+	// core.New, Start and Close all run without it, so reads and the stop methods never wait on them.
 	mu                 sync.Mutex
-	instance           *core.Instance
+	state              lifecycleState
+	gen                uint64 // bumped by every start and by ForceStop of a start in flight
+	abandonedStarts    map[uint64]struct{}
+	stop               *stopOp
+	instance           coreInstance
 	statsManager       corestats.Manager
 	trafficStatsTotals map[string]int64
 	callback           CoreCallbackHandler
@@ -173,16 +179,162 @@ func NewCoreController(handler CoreCallbackHandler) *CoreController {
 	}
 }
 
+// lifecycleState is where a controller is between StartLoop and StopLoop. It only changes under
+// CoreController.mu, which is never held across a slow Xray call.
+type lifecycleState int
+
+const (
+	stateIdle lifecycleState = iota
+	stateStarting
+	stateRunning
+	stateStopping
+)
+
+// coreInstance is what the controller needs from a running Xray instance. *core.Instance
+// satisfies it; tests substitute a fake whose Close or Start can hang.
+type coreInstance interface {
+	Close() error
+}
+
+// Seams for the slow Xray calls. Production behaviour is the real core.New and Start.
+var (
+	createCoreInstance = func(config *core.Config) (coreInstance, error) {
+		inst, err := core.New(config)
+		if err != nil {
+			return nil, err
+		}
+		return inst, nil
+	}
+	startCoreInstance = func(inst coreInstance) error {
+		real, ok := inst.(*core.Instance)
+		if !ok {
+			return errors.New("unsupported core instance")
+		}
+		return real.Start()
+	}
+)
+
+// ErrStopTimedOut marks a stop that gave up waiting for Xray (or AmneziaWG) to close. The
+// controller or runner is detached anyway and counted by AbandonedInstances until its Close
+// returns, so the host can decide that the process is dirty and must be restarted.
+var ErrStopTimedOut = errors.New("SKIPI Core stop timed out")
+
+var (
+	// defaultStopTimeout bounds StopLoop and applies to a non-positive timeout argument.
+	defaultStopTimeout = 5 * time.Second
+	// forceStopTimeout is how long ForceStop lets a running instance close before detaching it.
+	forceStopTimeout = time.Second
+
+	abandonedInstances atomic.Int64
+)
+
+// AbandonedInstances reports how many Xray instances or AmneziaWG runners had their stop given up
+// on and whose Close has not returned yet. A non-zero value means the process holds leaked
+// sockets or goroutines and should be restarted.
+func AbandonedInstances() int64 {
+	return abandonedInstances.Load()
+}
+
+// runBounded runs fn in its own goroutine and waits up to d (or until cancel closes). When it
+// gives up, the call is counted in AbandonedInstances until fn returns, and timedOut is true.
+func runBounded(fn func() error, d time.Duration, cancel <-chan struct{}) (error, bool) {
+	const (
+		running = iota
+		finished
+		abandoned
+	)
+	var (
+		state  atomic.Int32
+		result error
+	)
+	done := make(chan struct{})
+	go func() {
+		result = fn()
+		if !state.CompareAndSwap(running, finished) {
+			abandonedInstances.Add(-1) // the waiter gave up on us; we are no longer leaked
+		}
+		close(done)
+	}()
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return result, false
+	case <-timer.C:
+	case <-cancel:
+	}
+	// Count first, then claim: the goroutine can never decrement before this increment.
+	abandonedInstances.Add(1)
+	if !state.CompareAndSwap(running, abandoned) {
+		abandonedInstances.Add(-1) // it finished in the meantime
+		<-done
+		return result, false
+	}
+	return nil, true
+}
+
+// closeInBackground closes inst without waiting; the Close is counted as abandoned while it runs.
+func closeInBackground(inst coreInstance) {
+	abandonedInstances.Add(1)
+	go func() {
+		defer abandonedInstances.Add(-1)
+		_ = inst.Close()
+	}()
+}
+
+// stopOp is one in-flight stop. force makes its waiter give up at once.
+type stopOp struct {
+	finished  chan struct{}
+	force     chan struct{}
+	forceOnce sync.Once
+	err       error // valid once finished is closed
+}
+
+func (o *stopOp) forceNow() { o.forceOnce.Do(func() { close(o.force) }) }
+
+// wait lets a second caller share an in-flight stop; its own deadline detaches the instance too.
+func (o *stopOp) wait(d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-o.finished:
+	case <-timer.C:
+		o.forceNow()
+		<-o.finished
+	}
+	return o.err
+}
+
+// errStartAborted is returned by a StartLoop that ForceStop gave up on.
+var errStartAborted = errors.New("core start was aborted by ForceStop")
+
 // StartLoop initializes and starts the Xray core instance with given JSON config and optional TUN file descriptor.
+//
+// The controller lock is only held for short state swaps: loading the config, core.New and
+// Start run unlocked, so IsRunning, the stats readers and ForceStop never wait on a slow start.
 func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.isRunning.Load() {
+	switch c.state {
+	case stateRunning:
+		c.mu.Unlock()
 		return errors.New("core instance is already running")
+	case stateStarting:
+		c.mu.Unlock()
+		return errors.New("core instance is already starting")
+	case stateStopping:
+		c.mu.Unlock()
+		return errors.New("core instance is still stopping")
 	}
+	c.state = stateStarting
+	c.gen++
+	myGen := c.gen
 	c.statsManager = nil
 	c.trafficStatsTotals = make(map[string]int64)
+	c.mu.Unlock()
+
+	// If ForceStop gave up on this start, its abandoned mark ends when we return.
+	defer c.reapAbandonedStart(myGen)
 
 	// Loading routing/geo data is a one-off allocation burst: keep the GC out of its way, then
 	// collect the leftovers once in the background.
@@ -194,6 +346,7 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 
 	config, err := coreserial.LoadJSONConfig(strings.NewReader(configJSON))
 	if err != nil {
+		c.failStart(myGen)
 		return fmt.Errorf("failed to load xray config: %w", err)
 	}
 
@@ -201,6 +354,11 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	// a failed start can never leave a stale/global fd visible to other
 	// instances created later in this process (env vars are process-wide).
 	// Must happen before core.New: features read the fd during construction.
+	c.mu.Lock()
+	if c.gen != myGen {
+		c.mu.Unlock()
+		return errStartAborted
+	}
 	if tunFd > 0 {
 		fdStr := strconv.FormatInt(tunFd, 10)
 		setEnvVariable(tunFdKey, fdStr)
@@ -209,38 +367,60 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 		unsetEnvVariable(tunFdKey)
 		unsetEnvVariable(v2rayTunFdKey)
 	}
+	c.mu.Unlock()
 
-	server, err := core.New(config)
+	server, err := createCoreInstance(config)
 	if err != nil {
-		clearTunFdEnv()
+		if c.failStart(myGen) {
+			clearTunFdEnv()
+		}
 		return fmt.Errorf("failed to create xray instance: %w", err)
 	}
+	if c.superseded(myGen) {
+		closeInBackground(server)
+		return errStartAborted
+	}
+
 	// Every session counts connections from zero.
 	connLog := newConnectionLog(c.connLogEnabled.Load())
-	installConnectionLog(server, connLog)
-
-	if mgr := server.GetFeature(corestats.ManagerType()); mgr != nil {
-		if sm, ok := mgr.(corestats.Manager); ok {
-			c.statsManager = sm
+	var statsManager corestats.Manager
+	if real, ok := server.(*core.Instance); ok {
+		installConnectionLog(real, connLog)
+		if mgr := real.GetFeature(corestats.ManagerType()); mgr != nil {
+			if sm, ok := mgr.(corestats.Manager); ok {
+				statsManager = sm
+			}
 		}
 	}
 
-	if err := server.Start(); err != nil {
+	if err := startCoreInstance(server); err != nil {
 		// Xray does not roll back features that started before the failing one, so
 		// inbounds already listening would keep their ports until the process exits.
-		_ = server.Close()
+		// A Close that hangs is abandoned rather than allowed to hang this start.
+		_, _ = runBounded(server.Close, defaultStopTimeout, nil)
 		clearConnectionLog(connLog)
-		clearTunFdEnv()
-		c.statsManager = nil
-		c.trafficStatsTotals = nil
+		if c.failStart(myGen) {
+			clearTunFdEnv()
+		}
 		return fmt.Errorf("failed to start xray instance: %w", err)
 	}
 
+	c.mu.Lock()
+	if c.gen != myGen {
+		// ForceStop aborted this start while Xray was still coming up: do not install it.
+		c.mu.Unlock()
+		clearConnectionLog(connLog)
+		closeInBackground(server)
+		return errStartAborted
+	}
 	c.instance = server
+	c.statsManager = statsManager
 	c.connLog.Store(connLog)
 	// A toggle that raced the start saw no log yet; apply the latest value now it is visible.
 	connLog.enabled.Store(c.connLogEnabled.Load())
+	c.state = stateRunning
 	c.isRunning.Store(true)
+	c.mu.Unlock()
 
 	if c.callback != nil {
 		c.callback.Startup()
@@ -250,39 +430,145 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	return nil
 }
 
+// superseded reports whether a ForceStop (or a newer start) replaced start attempt gen.
+func (c *CoreController) superseded(gen uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gen != gen
+}
+
+// failStart returns the controller to idle after start attempt gen failed. It reports whether
+// that attempt was still the current one, i.e. whether it owns the process-wide env vars.
+func (c *CoreController) failStart(gen uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.gen != gen || c.state != stateStarting {
+		return false
+	}
+	c.state = stateIdle
+	c.statsManager = nil
+	c.trafficStatsTotals = nil
+	return true
+}
+
+// reapAbandonedStart ends the abandoned mark ForceStop put on start attempt gen.
+func (c *CoreController) reapAbandonedStart(gen uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.abandonedStarts[gen]; ok {
+		delete(c.abandonedStarts, gen)
+		abandonedInstances.Add(-1)
+	}
+}
+
 // clearTunFdEnv removes the process-wide TUN descriptor published for a core start.
 func clearTunFdEnv() {
 	unsetEnvVariable(tunFdKey)
 	unsetEnvVariable(v2rayTunFdKey)
 }
 
-// StopLoop gracefully shuts down the running Xray instance.
+// StopLoop gracefully shuts down the running Xray instance, giving up after the default timeout.
 func (c *CoreController) StopLoop() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	return c.StopLoopWithTimeout(0)
+}
 
-	if !c.isRunning.Load() || c.instance == nil {
-		return nil
+// StopLoopWithTimeout closes the running Xray instance and waits at most timeoutMillis for it
+// (non-positive: 5000 ms). If Close hangs, the controller is detached anyway, left not running,
+// counted in AbandonedInstances until Close returns, and the error wraps ErrStopTimedOut.
+func (c *CoreController) StopLoopWithTimeout(timeoutMillis int64) error {
+	d := defaultStopTimeout
+	if timeoutMillis > 0 {
+		d = time.Duration(timeoutMillis) * time.Millisecond
 	}
+	return c.stopWithin(d)
+}
 
-	err := c.instance.Close()
+func (c *CoreController) stopWithin(d time.Duration) error {
+	c.mu.Lock()
+	switch c.state {
+	case stateIdle:
+		c.mu.Unlock()
+		return nil
+	case stateStarting:
+		c.mu.Unlock()
+		return errors.New("core instance is still starting; use ForceStop to abort it")
+	case stateStopping:
+		op := c.stop
+		c.mu.Unlock()
+		return op.wait(d)
+	}
+	op := &stopOp{finished: make(chan struct{}), force: make(chan struct{})}
+	inst := c.instance
+	c.stop = op
+	c.state = stateStopping
+	c.mu.Unlock()
+
+	closeErr, timedOut := runBounded(inst.Close, d, op.force)
+
+	c.mu.Lock()
 	clearConnectionLog(c.connLog.Load())
 	c.connLog.Store(nil)
 	c.instance = nil
 	c.statsManager = nil
 	c.trafficStatsTotals = nil
 	c.isRunning.Store(false)
+	c.stop = nil
+	c.state = stateIdle
+	c.mu.Unlock()
 
 	// Drop the TUN descriptor env vars so later instances (latency probes,
 	// URL-test racers) never observe an already-closed file descriptor.
 	clearTunFdEnv()
+
+	if timedOut {
+		op.err = fmt.Errorf("%w: xray instance did not close within %v", ErrStopTimedOut, d)
+	} else {
+		op.err = closeErr
+	}
+	close(op.finished)
 
 	if c.callback != nil {
 		c.callback.Shutdown()
 		c.callback.OnEmitStatus(0, "Core stopped")
 	}
 
-	return err
+	return op.err
+}
+
+// ForceStop is the emergency stop. It never waits on a hung start or stop and works in every
+// state: a running instance gets a short deadline, a start in flight is aborted (its StartLoop
+// returns an error and closes whatever it built), and a stop that is already hung is detached.
+// AmneziaWG is stopped too. The error wraps ErrStopTimedOut when anything had to be abandoned.
+func (c *CoreController) ForceStop() error {
+	var xrayErr error
+	c.mu.Lock()
+	switch c.state {
+	case stateStarting:
+		if c.abandonedStarts == nil {
+			c.abandonedStarts = make(map[uint64]struct{})
+		}
+		c.abandonedStarts[c.gen] = struct{}{}
+		abandonedInstances.Add(1)
+		c.gen++
+		c.state = stateIdle
+		c.statsManager = nil
+		c.trafficStatsTotals = nil
+		clearTunFdEnv()
+		c.mu.Unlock()
+		xrayErr = fmt.Errorf("%w: the start in flight was abandoned", ErrStopTimedOut)
+	case stateStopping:
+		op := c.stop
+		c.mu.Unlock()
+		op.forceNow()
+		<-op.finished
+		xrayErr = op.err
+	case stateRunning:
+		c.mu.Unlock()
+		xrayErr = c.stopWithin(forceStopTimeout)
+	default:
+		c.mu.Unlock()
+	}
+	return errors.Join(xrayErr, StopAmneziaWgWithTimeout(forceStopTimeout.Milliseconds()))
 }
 
 // SetConnectionLogEnabled switches the connection log of this and later sessions. It takes no
@@ -312,7 +598,7 @@ func (c *CoreController) IsRunning() bool {
 // MeasureDelay measures network latency to a target URL through the currently running core instance.
 func (c *CoreController) MeasureDelay(targetURL string) (int64, error) {
 	c.mu.Lock()
-	inst := c.instance
+	inst, _ := c.instance.(*core.Instance)
 	c.mu.Unlock()
 
 	if inst == nil {

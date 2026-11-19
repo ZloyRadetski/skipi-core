@@ -141,7 +141,7 @@ func (r *Runtime) DestroyController(handle Handle) error {
 
 	// The session lease (r.active and the process-wide active handle) stays held until the
 	// instance is closed, so no other controller starts while this one is still shutting down.
-	stopErr := controller.StopLoop()
+	stopErr := controller.StopLoopWithTimeout(0)
 	r.releaseActive(handle)
 	if stopErr != nil {
 		return fmt.Errorf("stop SKIPI Core desktop controller %d during destroy: %w", handle, stopErr)
@@ -195,16 +195,45 @@ func (r *Runtime) Start(handle Handle, configJSON string, tunFD int64) error {
 // seconds, so it runs without the runtime locks: state reads stay responsive, while the lease
 // keeps any other controller from starting until the instance is gone.
 func (r *Runtime) Stop(handle Handle) error {
+	return r.StopWithTimeout(handle, 0)
+}
+
+// StopWithTimeout is Stop with an explicit close deadline in milliseconds (non-positive: the
+// default of 5 s). When Xray does not close in time the controller is detached anyway, the lease
+// is released, and the error wraps skipicore.ErrStopTimedOut; AbandonedInstances then counts it.
+func (r *Runtime) StopWithTimeout(handle Handle, timeoutMillis int64) error {
 	controller, err := r.controller(handle)
 	if err != nil {
 		return err
 	}
-	err = controller.StopLoop()
+	err = controller.StopLoopWithTimeout(timeoutMillis)
 	r.releaseActive(handle)
 	if err != nil {
 		return fmt.Errorf("stop SKIPI Core desktop controller %d: %w", handle, err)
 	}
 	return nil
+}
+
+// ForceStop is the emergency stop: it never waits on a hung start or stop, works in every state,
+// also stops AmneziaWG, and releases the lease. The error wraps skipicore.ErrStopTimedOut when
+// something had to be abandoned.
+func (r *Runtime) ForceStop(handle Handle) error {
+	controller, err := r.controller(handle)
+	if err != nil {
+		return err
+	}
+	err = controller.ForceStop()
+	r.releaseActive(handle)
+	if err != nil {
+		return fmt.Errorf("force stop SKIPI Core desktop controller %d: %w", handle, err)
+	}
+	return nil
+}
+
+// AbandonedInstances reports how many Xray instances or AmneziaWG runners had their stop given up
+// on and have not finished closing. A non-zero value means the process should be restarted.
+func (r *Runtime) AbandonedInstances() int64 {
+	return skipicore.AbandonedInstances()
 }
 
 // releaseActive gives up the session lease held by handle.

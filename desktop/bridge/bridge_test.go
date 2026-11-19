@@ -464,3 +464,78 @@ func TestConnectionLogIsReachableThroughAHandleOnly(t *testing.T) {
 		t.Fatalf("expected ErrControllerNotFound, got %v", err)
 	}
 }
+
+func TestRuntimeStopWithTimeoutStopsAndReleasesLease(t *testing.T) {
+	runtime := initializedRuntime(t)
+	handle := runtime.CreateController()
+	t.Cleanup(func() { _ = runtime.DestroyController(handle) })
+
+	if err := runtime.Start(handle, testXrayConfig(t), 0); err != nil {
+		t.Fatalf("start core: %v", err)
+	}
+	if err := runtime.StopWithTimeout(handle, 5000); err != nil {
+		t.Fatalf("stop with timeout: %v", err)
+	}
+	if running, _ := runtime.IsRunning(handle); running {
+		t.Fatal("expected stopped core to be inactive")
+	}
+	if runtime.ActiveHandle() != 0 {
+		t.Fatalf("active handle = %d after stop, want 0", runtime.ActiveHandle())
+	}
+	if got := runtime.AbandonedInstances(); got != 0 {
+		t.Fatalf("abandoned instances = %d, want 0", got)
+	}
+}
+
+func TestRuntimeStopWithTimeoutRejectsUnknownHandle(t *testing.T) {
+	runtime := initializedRuntime(t)
+	if err := runtime.StopWithTimeout(9999, 100); !errors.Is(err, ErrControllerNotFound) {
+		t.Fatalf("expected controller-not-found, got %v", err)
+	}
+}
+
+func TestRuntimeForceStopStopsRunningControllerAndFreesLease(t *testing.T) {
+	runtime := initializedRuntime(t)
+	first := runtime.CreateController()
+	second := runtime.CreateController()
+	t.Cleanup(func() {
+		_ = runtime.DestroyController(first)
+		_ = runtime.DestroyController(second)
+	})
+
+	if err := runtime.Start(first, testXrayConfig(t), 0); err != nil {
+		t.Fatalf("start core: %v", err)
+	}
+	if err := runtime.ForceStop(first); err != nil {
+		t.Fatalf("force stop: %v", err)
+	}
+	if running, _ := runtime.IsRunning(first); running {
+		t.Fatal("expected force-stopped core to be inactive")
+	}
+	if runtime.ActiveHandle() != 0 {
+		t.Fatalf("active handle = %d after force stop, want 0", runtime.ActiveHandle())
+	}
+	// The lease is free again: another controller can start.
+	if err := runtime.Start(second, testXrayConfig(t), 0); err != nil {
+		t.Fatalf("start after force stop: %v", err)
+	}
+}
+
+func TestRuntimeForceStopIdleControllerAndUnknownHandle(t *testing.T) {
+	runtime := initializedRuntime(t)
+	handle := runtime.CreateController()
+	t.Cleanup(func() { _ = runtime.DestroyController(handle) })
+
+	if err := runtime.ForceStop(handle); err != nil {
+		t.Fatalf("force stop of an idle controller: %v", err)
+	}
+	if err := runtime.ForceStop(9999); !errors.Is(err, ErrControllerNotFound) {
+		t.Fatalf("expected controller-not-found, got %v", err)
+	}
+}
+
+func TestRuntimeAbandonedInstancesStartsAtZero(t *testing.T) {
+	if got := NewRuntime().AbandonedInstances(); got != 0 {
+		t.Fatalf("abandoned instances = %d, want 0", got)
+	}
+}
