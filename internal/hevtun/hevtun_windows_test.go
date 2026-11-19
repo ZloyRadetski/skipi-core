@@ -94,7 +94,7 @@ func TestWindowsStartRunsStopsAndCleansUp(t *testing.T) {
 	tmp, logged := isolate(t)
 	exe := fakeHev(t)
 
-	if err := Start("mode: run\n", -1, exe); err != nil {
+	if err := Start("mode: run\n", Options{TunFd: -1, Executable: exe}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if !Running() {
@@ -107,7 +107,7 @@ func TestWindowsStartRunsStopsAndCleansUp(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatalf("config files while running = %v, want one", files)
 	}
-	if err := Start("mode: run\n", 0, exe); err == nil || !strings.Contains(err.Error(), "already running") {
+	if err := Start("mode: run\n", Options{TunFd: 0, Executable: exe}); err == nil || !strings.Contains(err.Error(), "already running") {
 		t.Fatalf("second Start = %v, want already running", err)
 	}
 	if a, b, c, d := Stats(); a|b|c|d != 0 {
@@ -144,7 +144,7 @@ func TestWindowsEarlyExitIsAFailureWithOutput(t *testing.T) {
 	tmp, _ := isolate(t)
 	exe := fakeHev(t)
 
-	err := Start("mode: exit\n", 0, exe)
+	err := Start("mode: exit\n", Options{TunFd: 0, Executable: exe})
 	if err == nil {
 		t.Fatal("Start must fail when the process exits during the grace window")
 	}
@@ -163,7 +163,7 @@ func TestWindowsEarlyExitIsAFailureWithOutput(t *testing.T) {
 
 func TestWindowsEarlyExitOutputIsCapped(t *testing.T) {
 	isolate(t)
-	err := Start("mode: flood\n", 0, fakeHev(t))
+	err := Start("mode: flood\n", Options{TunFd: 0, Executable: fakeHev(t)})
 	if err == nil {
 		t.Fatal("Start must fail")
 	}
@@ -174,7 +174,7 @@ func TestWindowsEarlyExitOutputIsCapped(t *testing.T) {
 
 func TestWindowsExitAfterStartIsReportedByWaitReadyAndStopIsClean(t *testing.T) {
 	tmp, _ := isolate(t)
-	if err := Start("mode: exitlater\n", 0, fakeHev(t)); err != nil {
+	if err := Start("mode: exitlater\n", Options{TunFd: 0, Executable: fakeHev(t)}); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
@@ -198,15 +198,15 @@ func TestWindowsExitAfterStartIsReportedByWaitReadyAndStopIsClean(t *testing.T) 
 func TestWindowsMissingExecutableIsAClearError(t *testing.T) {
 	tmp, _ := isolate(t)
 	missing := filepath.Join(tmp, "nope", "hev.exe")
-	err := Start("mode: run\n", 0, missing)
+	err := Start("mode: run\n", Options{TunFd: 0, Executable: missing})
 	if err == nil || !strings.Contains(err.Error(), missing) {
 		t.Fatalf("Start with missing exe = %v, want an error naming %s", err, missing)
 	}
-	err = Start("mode: run\n", 0, "")
+	err = Start("mode: run\n", Options{})
 	if err == nil || !strings.Contains(err.Error(), "executable") {
 		t.Fatalf("Start without exe = %v, want an error about the executable", err)
 	}
-	if err := Start("", 0, fakeHev(t)); err == nil {
+	if err := Start("", Options{TunFd: 0, Executable: fakeHev(t)}); err == nil {
 		t.Fatal("blank config must be rejected")
 	}
 	if left := configFiles(t, tmp); len(left) != 0 {

@@ -35,7 +35,8 @@ with `ndk-build`, so it works in Git Bash on Windows as well as on Linux. It the
 `-checklinkname=0` is required by github.com/wlynxg/anet with Go 1.23+), which links the hev
 libraries into `libgojni.so` through cgo. `internal/hevtun` is the Go side: Android and Linux
 (cgo) link hev in process, Windows runs the hev executable named in the session plan as a
-supervised process, and every other build gets a stub that returns "HEV TUN is not built into this
+supervised process, macOS runs the same executable under a root supervisor started through the
+system's administrator prompt (osascript), and every other build gets a stub that returns "HEV TUN is not built into this
 Core on <GOOS>".
 
 In PowerShell, quote `'-javapkg=app.skipi.core'` so the dotted Java package

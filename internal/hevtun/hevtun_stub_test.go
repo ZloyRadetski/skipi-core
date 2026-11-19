@@ -1,7 +1,7 @@
 // Copyright 2026, Radetski
 // SPDX-License-Identifier: GPL-3.0
 
-//go:build !windows && !((android || linux) && cgo)
+//go:build !windows && !darwin && !((android || linux) && cgo)
 
 package hevtun
 
@@ -13,7 +13,7 @@ import (
 )
 
 func TestStubStartReportsClearError(t *testing.T) {
-	err := Start("tunnel:\n  mtu: 1500\n", 7, "")
+	err := Start("tunnel:\n  mtu: 1500\n", Options{TunFd: 7})
 	if err == nil {
 		t.Fatal("Start must fail where HEV TUN is not built in")
 	}

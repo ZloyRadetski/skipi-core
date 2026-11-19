@@ -20,7 +20,12 @@ type hevTunnel interface {
 	// NeedsTunFd reports whether this target runs hev in process on a descriptor the host opened
 	// (Android, Linux). A process-mode target (Windows) creates the interface itself.
 	NeedsTunFd() bool
-	Start(configYAML string, tunFd int, executable string) error
+	// NeedsMacInterface reports whether this target (macOS) takes the interface plan, the run
+	// directory and the hev executable in the plan instead of a descriptor.
+	NeedsMacInterface() bool
+	// ReadyTimeout is the readiness wait this target needs when it is longer than hevReadyTimeout.
+	ReadyTimeout() time.Duration
+	Start(configYAML string, opts hevtun.Options) error
 	WaitReady(timeout time.Duration) error
 	Stop() error
 	Stats() (txPackets, txBytes, rxPackets, rxBytes uint64)
@@ -30,8 +35,10 @@ type hevTunnel interface {
 type realHevTunnel struct{}
 
 func (realHevTunnel) NeedsTunFd() bool { return hevtun.NeedsTunFd() }
-func (realHevTunnel) Start(configYAML string, tunFd int, executable string) error {
-	return hevtun.Start(configYAML, tunFd, executable)
+func (realHevTunnel) NeedsMacInterface() bool     { return hevtun.NeedsMacInterface() }
+func (realHevTunnel) ReadyTimeout() time.Duration { return hevtun.ReadyTimeout() }
+func (realHevTunnel) Start(configYAML string, opts hevtun.Options) error {
+	return hevtun.Start(configYAML, opts)
 }
 func (realHevTunnel) WaitReady(timeout time.Duration) error   { return hevtun.WaitReady(timeout) }
 func (realHevTunnel) Stop() error                             { return hevtun.Stop() }
@@ -78,8 +85,12 @@ const hevReadyPoll = 100 * time.Millisecond
 type sessionPlanHev struct {
 	ConfigYAML string `json:"configYaml"`
 	TunFd      int    `json:"tunFd"`
-	// Executable is the hev executable of the Windows process mode; ignored by in-process targets.
+	// Executable is the hev executable of the process modes (Windows, macOS); ignored by in-process targets.
 	Executable string `json:"executable"`
+	// RunDirectory is where the macOS supervisor keeps its marker files and the hev config.
+	RunDirectory string `json:"runDirectory"`
+	// MacInterface is the macOS utun plan (name, mtu, addresses, routes, dns).
+	MacInterface *hevtun.MacInterface `json:"macInterface"`
 }
 
 // stopHevBounded stops HEV TUN within d; a stop that hangs is counted in AbandonedInstances
@@ -101,11 +112,13 @@ func (c *CoreController) startSessionHev(gen uint64, cfg *sessionPlanHev) error 
 	if c.superseded(gen) {
 		return errStartAborted
 	}
-	if err := hevTun.Start(cfg.ConfigYAML, cfg.TunFd, cfg.Executable); err != nil {
+	opts := hevtun.Options{TunFd: cfg.TunFd, Executable: cfg.Executable, RunDirectory: cfg.RunDirectory, MacInterface: cfg.MacInterface}
+	if err := hevTun.Start(cfg.ConfigYAML, opts); err != nil {
 		_ = stopHevBounded(defaultStopTimeout, nil)
 		return fmt.Errorf("HEV TUN failed to start: %w", err)
 	}
-	deadline := time.Now().Add(hevReadyTimeout)
+	readyTimeout := max(hevReadyTimeout, hevTun.ReadyTimeout())
+	deadline := time.Now().Add(readyTimeout)
 	for {
 		if c.superseded(gen) {
 			_ = stopHevBounded(defaultStopTimeout, nil)
@@ -114,7 +127,7 @@ func (c *CoreController) startSessionHev(gen uint64, cfg *sessionPlanHev) error 
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			_ = stopHevBounded(defaultStopTimeout, nil)
-			return fmt.Errorf("HEV TUN was not ready: timed out after %v", hevReadyTimeout)
+			return fmt.Errorf("HEV TUN was not ready: timed out after %v", readyTimeout)
 		}
 		err := hevTun.WaitReady(min(remaining, hevReadyPoll))
 		if err == nil {

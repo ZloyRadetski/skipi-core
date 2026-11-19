@@ -61,7 +61,8 @@ func NeedsTunFd() bool { return true }
 // Start runs hev on a dedicated, locked OS thread with the given YAML config and TUN
 // descriptor. executable is only used by the Windows process mode and ignored here. It does not wait for readiness (see WaitReady) but fails at once when the hev
 // main returns right away. Only one instance can run per process.
-func Start(configYAML string, tunFd int, executable string) error {
+func Start(configYAML string, opts Options) error {
+	tunFd := opts.TunFd
 	if configYAML == "" {
 		return errors.New("HEV TUN config is empty")
 	}

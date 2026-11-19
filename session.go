@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ZloyRadetski/skipi-core/internal/hevtun"
 	"github.com/ZloyRadetski/skipi-core/internal/lifecycle"
 )
 
@@ -102,6 +103,11 @@ func parseSessionPlan(planJSON string) (*sessionPlan, error) {
 		if hevTun.NeedsTunFd() && p.Hev.TunFd <= 0 {
 			return nil, errors.New("session plan: hev.tunFd must be positive")
 		}
+		if hevTun.NeedsMacInterface() {
+			if err := hevtun.ValidateMacPlan(p.Hev.Executable, p.Hev.RunDirectory, p.Hev.MacInterface); err != nil {
+				return nil, fmt.Errorf("session plan: %w", err)
+			}
+		}
 	}
 	return &p, nil
 }
@@ -112,9 +118,13 @@ func parseSessionPlan(planJSON string) (*sessionPlan, error) {
 //
 // amneziaWg is optional. With it, AmneziaWG starts first and Core waits until its local SOCKS
 // listener accepts connections, then Xray starts. The optional "hev": {"configYaml": "<yaml>",
-// "tunFd": N, "executable": "<hev exe>"} starts HEV TUN last and waits (hevReadyTimeout) until it
-// reports ready. tunFd (positive) is required by in-process targets (Android, Linux); executable
-// is used only by the Windows process mode, where tunFd is ignored. Any failure stops what was
+// "tunFd": N, "executable": "<hev exe>", "runDirectory": "<dir>", "macInterface": {"name":
+// "utun9", "mtu": 1500, "addresses": [...], "routes": [...], "dns": [...]}} starts HEV TUN last and
+// waits (hevReadyTimeout, or the target's longer own budget) until it reports ready. tunFd
+// (positive) is required by in-process targets (Android, Linux); executable is used by the process
+// modes (Windows, macOS), where tunFd is ignored. On macOS executable, runDirectory and
+// macInterface are all required: Core runs hev under a root supervisor it starts through the
+// system's administrator prompt. Any failure stops what was
 // started, in reverse. A later StopLoop, StopLoopWithTimeout or ForceStop stops
 // HEV TUN, then Xray, then AmneziaWG.
 func (c *CoreController) StartSession(planJSON string, tunFd int64) error {

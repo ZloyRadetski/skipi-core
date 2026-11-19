@@ -25,7 +25,7 @@ amneziawg_runner.go   AmneziaWgRunner (netstack tunnel + SOCKS listener)
 amneziawg_socks.go    the runner's SOCKS5 handlers
 process_finder_*.go   RegisterProcessFinder: Android implementation / no-op elsewhere (build tags)
 
-internal/hevtun       HEV TUN (hev-socks5-tunnel): cgo on Android and Linux (build/hev static libs), supervised process on Windows, stub elsewhere
+internal/hevtun       HEV TUN (hev-socks5-tunnel): cgo on Android and Linux (build/hev static libs), supervised process on Windows, osascript-elevated supervisor on macOS, stub elsewhere
 internal/lifecycle    bounded stop (RunBounded), abandoned counter, shared stop operation
 internal/xraylog      console log writer registered with Xray
 internal/connlog      connection log implementation
@@ -80,16 +80,21 @@ root package (all build tags) and compares it with `testdata/public_api.golden`.
 
 `StartSession(planJSON, tunFd)` makes the controller the whole tunnel session, so hosts only call
 start and stop. The plan is `{"xrayConfig": "<json>", "amneziaWg": {"config": "<json>", "socksPort": N}
-(optional), "connectionLog": bool, "hev": {"configYaml": "<yaml>", "tunFd": N, "executable": "<path>"}
-(optional)}`; unknown fields are ignored. `tunFd` must be positive where hev runs in process
-(Android, Linux) and is ignored on Windows; `executable` is used only on Windows.
+(optional), "connectionLog": bool, "hev": {"configYaml": "<yaml>", "tunFd": N, "executable": "<path>", "runDirectory": "<dir>",
+"macInterface": {"name": "utun9", "mtu": 1500, "addresses": ["198.18.0.1/15", "fc00::1/64"],
+"routes": ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"], "dns": [...]}} (optional)}`; unknown
+fields are ignored. `tunFd` must be positive where hev runs in process (Android, Linux) and is
+ignored on Windows and macOS; `executable` is used on Windows and macOS. On macOS `executable`,
+`runDirectory` (marker files and the generated hev config, created 0700) and `macInterface` are
+required and validated before anything starts: a non-blank name, an IPv4 address, `mtu` > 0 and
+only valid IPv4/IPv6 CIDR routes (`dns` is accepted but not configured yet).
 
 1. With `amneziaWg`: start it, then poll a TCP dial to `127.0.0.1:socksPort` until it accepts
    (`awgReadyTimeout`, 8 s). `AmneziaWgRunner.Start` binds the listener before it returns, so the
    first dial normally succeeds; the poll keeps the contract independent of that. Not ready in time:
    AmneziaWG is stopped (bounded) and the error names the port and the timeout.
 2. Apply `connectionLog`, then the ordinary `StartLoop` path. An Xray failure stops AmneziaWG.
-   With `hev`, HEV TUN starts after Xray and Core waits for its readiness (`hevReadyTimeout`, 5 s).
+   With `hev`, HEV TUN starts after Xray and Core waits for its readiness (`hevReadyTimeout`, 5 s; on macOS the supervisor's own 30 s budget when longer).
    Not ready or failed: HEV TUN, Xray and AmneziaWG are stopped in reverse.
    Stop order is HEV TUN, Xray, AmneziaWG, each bounded; a hung HEV TUN stop counts as abandoned.
    `QueryTunnelStats` returns hev's packet and byte counters as JSON (desktop:
@@ -105,7 +110,7 @@ HEV TUN is the TUN implementation everywhere; what differs is how Core runs it
 | Android | static libs linked in process (cgo, `scripts/build-hev-android.sh`) | descriptor from the VpnService (`tunFd`) | ready callback (patch) | hev counters |
 | Linux amd64 | static libs linked in process (cgo, `scripts/build-hev-linux.sh`, `build/hev/linux-amd64`) | descriptor Core's desktop TUN opened (`tunFd`) | ready callback (patch) | hev counters |
 | Windows | supervised child process: `<executable> <temp config>`, run from the executable's directory (wintun.dll and the MSYS DLLs sit there); output goes to Core's log | hev creates the Wintun adapter itself, `tunFd` ignored | no callback across processes: Start waits a 150 ms grace and an earlier exit is a failure (first 4 KB of output in the error); WaitReady only reports whether the process is alive | zeros (counters live in another process) |
-| macOS | not in Core: the privileged supervisor stays in the app; `internal/hevtun` is a stub | n/a | n/a | zeros |
+| macOS | supervised privileged process (osascript administrator prompt), run by Core: a root `sh` supervisor starts the hev executable the app ships, installs the routes and removes them again on a stop request, hev exit or Core exit (`macsupervisor.go`, `macflow.go`, `hevtun_darwin.go`) | hev creates the utun interface itself, `tunFd` ignored; Core installs address, MTU and routes from `macInterface` | marker files in `runDirectory`: `tun-ready` (supervisor pid) or `tun-error` (reason), up to 30 s after the prompt is answered; `Running` is the ready file naming a live process and no pending `tun-stop` | zeros (counters live in the root process) |
 
 Windows Stop terminates the process and waits up to 5 s; a process still alive stays known so a
 later Stop or ForceStop can end it. The temporary config (0600) is deleted when the process is gone.

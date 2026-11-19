@@ -60,15 +60,23 @@ type fakeHev struct {
 	gotFd       atomic.Int64
 	gotExe      atomic.Value
 	noFd        bool // a process-mode target: no TUN descriptor is needed
+	mac         bool // the macOS target: takes the interface plan, no descriptor
+	readyBudget time.Duration
+	gotOpts     atomic.Value // hevtun.Options
 }
 
-func (f *fakeHev) NeedsTunFd() bool { return !f.noFd }
+func (f *fakeHev) NeedsTunFd() bool { return !f.noFd && !f.mac }
 
-func (f *fakeHev) Start(cfg string, fd int, exe string) error {
+func (f *fakeHev) NeedsMacInterface() bool { return f.mac }
+
+func (f *fakeHev) ReadyTimeout() time.Duration { return f.readyBudget }
+
+func (f *fakeHev) Start(cfg string, opts hevtun.Options) error {
 	f.log.add("hev.start")
-	f.gotExe.Store(exe)
+	f.gotExe.Store(opts.Executable)
 	f.gotCfg.Store(cfg)
-	f.gotFd.Store(int64(fd))
+	f.gotFd.Store(int64(opts.TunFd))
+	f.gotOpts.Store(opts)
 	if f.startErr != nil {
 		return f.startErr
 	}
@@ -493,5 +501,137 @@ func TestHevWatcherIgnoresANormalStop(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if log.count("xray.close") != 1 {
 		t.Fatalf("xray closed %d times, want 1 (log %s)", log.count("xray.close"), log)
+	}
+}
+
+const macRunDir = "/Users/u/SKIPI/run"
+const macExe = "/Applications/SKIPI.app/Contents/Resources/hev/hev-socks5-tunnel"
+
+func macHevBlock(t *testing.T, mut func(m map[string]any)) string {
+	t.Helper()
+	hev := map[string]any{
+		"configYaml":   hevTestYAML,
+		"executable":   macExe,
+		"runDirectory": macRunDir,
+		"macInterface": map[string]any{
+			"name": "utun9", "mtu": 1500,
+			"addresses": []string{"198.18.0.1/15", "fc00::1/64"},
+			"routes":    []string{"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"},
+			"dns":       []string{"1.1.1.1"},
+		},
+	}
+	if mut != nil {
+		mut(hev)
+	}
+	b, err := json.Marshal(hev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestParseSessionPlanMacOSHevBlock(t *testing.T) {
+	useHevTarget(t, &fakeHev{mac: true})
+	// No tunFd at all is fine on macOS.
+	p, err := parseSessionPlan(hevPlanWith(t, macHevBlock(t, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Hev.Executable != macExe || p.Hev.RunDirectory != macRunDir {
+		t.Fatalf("hev = %+v", p.Hev)
+	}
+	m := p.Hev.MacInterface
+	if m == nil || m.Name != "utun9" || m.MTU != 1500 || len(m.Addresses) != 2 || len(m.Routes) != 4 || len(m.DNS) != 1 {
+		t.Fatalf("macInterface = %+v", m)
+	}
+}
+
+func TestParseSessionPlanMacOSRejectsAnInvalidBlockBeforeAnythingStarts(t *testing.T) {
+	useHevTarget(t, &fakeHev{mac: true})
+	iface := func(m map[string]any) map[string]any { return m["macInterface"].(map[string]any) }
+	cases := map[string]func(m map[string]any){
+		"executable":   func(m map[string]any) { delete(m, "executable") },
+		"runDirectory": func(m map[string]any) { m["runDirectory"] = " " },
+		"macInterface": func(m map[string]any) { delete(m, "macInterface") },
+		"name":         func(m map[string]any) { iface(m)["name"] = "" },
+		"IPv4":         func(m map[string]any) { iface(m)["addresses"] = []string{"fc00::1/64"} },
+		"mtu":          func(m map[string]any) { iface(m)["mtu"] = 0 },
+		"route":        func(m map[string]any) { iface(m)["routes"] = []string{"0.0.0.0/1; reboot"} },
+		"no routes":    func(m map[string]any) { iface(m)["routes"] = []string{} },
+	}
+	for name, mut := range cases {
+		if _, err := parseSessionPlan(hevPlanWith(t, macHevBlock(t, mut))); err == nil {
+			t.Errorf("%s: invalid plan accepted", name)
+		}
+	}
+}
+
+func TestMacOSPlanFieldsReachTheTunnelAndNoDescriptorIsNeeded(t *testing.T) {
+	hev := &fakeHev{mac: true}
+	installOrderedFakes(t, hev)
+	c := NewCoreController(nil)
+	plan := hevPlanWith(t, macHevBlock(t, nil))
+	if err := c.StartSession(plan, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.StopLoop() })
+	opts, _ := hev.gotOpts.Load().(hevtun.Options)
+	if opts.Executable != macExe || opts.RunDirectory != macRunDir || opts.TunFd != 0 {
+		t.Fatalf("opts = %+v", opts)
+	}
+	if opts.MacInterface == nil || opts.MacInterface.Name != "utun9" || opts.MacInterface.MTU != 1500 ||
+		len(opts.MacInterface.Routes) != 4 {
+		t.Fatalf("macInterface = %+v", opts.MacInterface)
+	}
+}
+
+// The macOS supervisor may need longer than the session's default readiness wait (the prompt is
+// answered before Start returns, hev and the routes follow): the target's own budget extends it.
+func TestSessionWaitsForTheTargetsOwnReadyBudget(t *testing.T) {
+	hev := &fakeHev{mac: true, readyBudget: 2 * time.Second, readyErr: hevtun.ErrReadyTimeout}
+	installOrderedFakes(t, hev)
+	orig := hevReadyTimeout
+	hevReadyTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { hevReadyTimeout = orig })
+	c := NewCoreController(nil)
+	done := make(chan error, 1)
+	go func() { done <- c.StartSession(hevPlanWith(t, macHevBlock(t, nil)), 0) }()
+	time.Sleep(300 * time.Millisecond) // well past the session default, within the target budget
+	hev.readyErr = nil
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("StartSession = %v; the start must wait for the target's budget", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("StartSession did not return")
+	}
+	t.Cleanup(func() { _ = c.StopLoop() })
+}
+
+// On macOS Running() turns false when the supervisor's ready file is gone; the session stops itself.
+func TestMacOSSessionStopsItselfWhenTheSupervisorIsGone(t *testing.T) {
+	hev := &fakeHev{mac: true}
+	installOrderedFakes(t, hev)
+	origWatch := hevWatchInterval
+	hevWatchInterval = 10 * time.Millisecond
+	t.Cleanup(func() { hevWatchInterval = origWatch })
+	listener := &recordingListener{}
+	c := NewCoreController(nil)
+	c.SetStateListener(listener)
+	if err := c.StartSession(hevPlanWith(t, macHevBlock(t, nil)), 0); err != nil {
+		t.Fatal(err)
+	}
+	hev.running.Store(false)
+	deadline := time.Now().Add(2 * time.Second)
+	for c.State() != SessionIdle {
+		if time.Now().After(deadline) {
+			t.Fatalf("state = %d, want idle", c.State())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	events := listener.snapshot()
+	if last := events[len(events)-1]; !strings.Contains(last.detail, "HEV TUN exited") {
+		t.Fatalf("last event = %+v", last)
 	}
 }

@@ -123,7 +123,8 @@ func current() *process {
 // Start writes the YAML to a temporary file (0600) and runs "<executable> <config>" from the
 // executable's directory. A process that exits within the startup grace is a failed start; the
 // error carries its first 4 KB of output. tunFd is ignored.
-func Start(configYAML string, tunFd int, executable string) error {
+func Start(configYAML string, opts Options) error {
+	executable := opts.Executable
 	if configYAML == "" {
 		return errors.New("HEV TUN config is empty")
 	}

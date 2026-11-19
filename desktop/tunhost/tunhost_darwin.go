@@ -3,10 +3,10 @@
 
 //go:build darwin
 
-// Package tunhost is the TUN session of the desktop Core. On macOS the host application runs
-// hev-socks5-tunnel with administrator rights; hev creates the utun interface itself and the host
-// installs the routes. Core's part is the socket binding that keeps its own connections off that
-// interface.
+// Package tunhost is the TUN session of the desktop Core. On macOS Core's HEV TUN supervisor
+// (internal/hevtun) runs hev-socks5-tunnel with administrator rights obtained through osascript;
+// hev creates the utun interface itself and the supervisor installs the routes. This package's part
+// is the socket binding that keeps Core's own connections off that interface.
 package tunhost
 
 import "errors"
@@ -24,6 +24,6 @@ func Close() error {
 	return nil
 }
 
-// Probe returns nil: the administrator rights are obtained by the host when it starts the tunnel,
+// Probe returns nil: the administrator rights are obtained by Core's HEV TUN supervisor when it starts the tunnel,
 // and the socket binding itself needs none.
 func Probe() error { return nil }
