@@ -1,7 +1,7 @@
 // Copyright 2026, Radetski
 // SPDX-License-Identifier: GPL-3.0
 
-//go:build (android || linux) && cgo
+//go:build cgo && (android || (linux && skipi_hev))
 
 // Glue between Go and hev-socks5-tunnel: the ready callback (a patch to hev, see
 // third_party/patches/hev-socks5-tunnel) flips a flag under a mutex and wakes the Go waiter.

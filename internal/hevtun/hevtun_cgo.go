@@ -1,7 +1,7 @@
 // Copyright 2026, Radetski
 // SPDX-License-Identifier: GPL-3.0
 
-//go:build (android || linux) && cgo
+//go:build cgo && (android || (linux && skipi_hev))
 
 package hevtun
 

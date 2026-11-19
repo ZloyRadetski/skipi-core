@@ -77,16 +77,17 @@ jobs:
           check-latest: true
 
       - name: Build HEV TUN static libraries
-        run: scripts/build-hev-linux.sh
+        run: bash scripts/build-hev-linux.sh
 
       - name: Test and build shared library
         run: |
           export CGO_ENABLED=1
           export CC=gcc
           export CXX=g++
-          go test ./...
+          # skipi_hev links the HEV TUN static libraries built above; without it Linux builds use the stub.
+          go test -tags skipi_hev ./...
           mkdir -p dist
-          go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o dist/libskipicore.so ./cmd/skipicore-desktop
+          go build -tags skipi_hev -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o dist/libskipicore.so ./cmd/skipicore-desktop
           cp desktop/include/skipicore_desktop.h dist/
 
       - name: Verify HEV TUN is linked into the library
