@@ -5,3 +5,12 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Root build outputs (gomobile / c-shared)
+/skipicore-desktop
+/skipicore-desktop.exe
+/skipicore.dll
+/skipicore.h
+/libskipicore.*
+*.aar.version
+*.test

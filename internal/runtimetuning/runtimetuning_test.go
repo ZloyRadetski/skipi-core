@@ -1,4 +1,4 @@
-package skipicore
+package runtimetuning
 
 import (
 	"runtime/debug"
@@ -23,8 +23,8 @@ func TestResolveMaxProcs(t *testing.T) {
 		{8, "-2", 4},
 	}
 	for _, c := range cases {
-		if got := resolveMaxProcs(c.cpus, c.override); got != c.want {
-			t.Errorf("resolveMaxProcs(%d, %q) = %d, want %d", c.cpus, c.override, got, c.want)
+		if got := ResolveMaxProcs(c.cpus, c.override); got != c.want {
+			t.Errorf("ResolveMaxProcs(%d, %q) = %d, want %d", c.cpus, c.override, got, c.want)
 		}
 	}
 }
@@ -33,7 +33,7 @@ func TestPauseGCForStartupRestoresThePreviousPercent(t *testing.T) {
 	original := debug.SetGCPercent(50)
 	defer debug.SetGCPercent(original)
 
-	restore := pauseGCForStartup()
+	restore := PauseGCForStartup()
 	if got := debug.SetGCPercent(-1); got != -1 {
 		t.Fatalf("GC percent while paused = %d, want -1 (disabled)", got)
 	}
@@ -47,8 +47,8 @@ func TestPauseGCForStartupNestsAndRestoreIsIdempotent(t *testing.T) {
 	original := debug.SetGCPercent(50)
 	defer debug.SetGCPercent(original)
 
-	first := pauseGCForStartup()
-	second := pauseGCForStartup()
+	first := PauseGCForStartup()
+	second := PauseGCForStartup()
 	first()
 	first() // a repeated restore must not release the other holder
 	if got := debug.SetGCPercent(-1); got != -1 {

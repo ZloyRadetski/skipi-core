@@ -3,7 +3,7 @@
 
 //go:build !android && !ios
 
-package skipicore
+package assets
 
 import (
 	"io"
@@ -21,7 +21,7 @@ func TestInitCoreEnvUsesFilesystemReaderOnHost(t *testing.T) {
 		t.Fatalf("write test asset: %v", err)
 	}
 
-	InitCoreEnv(directory, "")
+	Configure()
 	reader, err := corefilesystem.NewFileReader(assetPath)
 	if err != nil {
 		t.Fatalf("open host asset: %v", err)

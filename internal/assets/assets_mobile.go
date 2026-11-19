@@ -3,7 +3,9 @@
 
 //go:build android || ios
 
-package skipicore
+// Package assets installs the Xray asset reader appropriate for the host: the filesystem on
+// desktop, with an APK-assets fallback on Android and iOS.
+package assets
 
 import (
 	"io"
@@ -14,10 +16,10 @@ import (
 	mobasset "golang.org/x/mobile/asset"
 )
 
-// configureCoreAssetReader keeps the mobile bundled-asset fallback. Geo files normally
+// Configure keeps the mobile bundled-asset fallback. Geo files normally
 // live in the app data directory, but gomobile can read a bundled asset by filename
 // before the host has materialized it there.
-func configureCoreAssetReader() {
+func Configure() {
 	corefilesystem.NewFileReader = func(path string) (io.ReadCloser, error) {
 		if file, err := os.Open(path); err == nil {
 			return file, nil

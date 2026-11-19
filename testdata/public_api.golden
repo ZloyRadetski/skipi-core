@@ -1,0 +1,170 @@
+func (c *CoreController) ForceStop() error
+
+func (c *CoreController) IsRunning() bool
+
+func (c *CoreController) MeasureDelay(targetURL string) (int64, error)
+
+func (c *CoreController) QueryAllOutboundTrafficStats() string
+
+func (c *CoreController) QueryTrafficStats() string
+
+func (c *CoreController) ReadConnectionLog(afterSeq int64) string
+
+func (c *CoreController) RegisterProcessFinder(finder ProcessFinder)
+
+func (c *CoreController) SetConnectionLogEnabled(enabled bool)
+
+func (c *CoreController) StartLoop(configJSON string, tunFd int64) error
+
+func (c *CoreController) StopLoop() error
+
+func (c *CoreController) StopLoopWithTimeout(timeoutMillis int64) error
+
+func (r *AmneziaWgRunner) Start() error
+
+func (r *AmneziaWgRunner) Stop() error
+
+func (s *AmneziaWgSettings) BuildIpcConfig() (string, error)
+
+func (s *AmneziaWgSettings) HasAmneziaParams() bool
+
+func AbandonedInstances() int64
+
+func CancelOutboundDownload(requestID string)
+
+func CheckVersionX() string
+
+func CoreVersion() string
+
+func FastSelectBestOutbound(configJSON string, candidateTags string, probeURL string, timeoutMs int64) string
+
+func FetchQuicCertSha256(requestJSON string) string
+
+func FetchTlsCertSha256(requestJSON string) string
+
+func ForceFreeMemory()
+
+func InitCoreEnv(dataDir string, assetKey string)
+
+func IsAmneziaWgRunning() bool
+
+func MeasureOutboundDelay(configJSON string, targetURL string) (int64, error)
+
+func MeasureOutboundDownload(
+	configJSON string,
+	targetURL string,
+	maxBytes int64,
+	timeoutMillis int64,
+	requestID string,
+) (string, error)
+
+func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgRunner, error)
+
+func NewCoreController(handler CoreCallbackHandler) *CoreController
+
+func ParseAmneziaWgSettings(rawJSON string) (*AmneziaWgSettings, error)
+
+func ReadMemoryStats() string
+
+func ReconcileBrowserDialer(dialerAddr string)
+
+func RewriteWireguardOutboundToSocks(rawJSON string, socksPort int) string
+
+func SetAmneziaWgSocketProtector(p SocketProtector)
+
+func StartAmneziaWg(configJSON string, socksPort int) error
+
+func StopAmneziaWg() error
+
+func StopAmneziaWgWithTimeout(timeoutMillis int64) error
+
+type AmneziaWgPeer struct {
+	PublicKey	string		`json:"publicKey"`
+	PreSharedKey	string		`json:"preSharedKey"`
+	Endpoint	string		`json:"endpoint"`
+	KeepAlive	any		`json:"keepAlive"`
+	AllowedIPs	[]string	`json:"allowedIPs"`
+}
+
+type AmneziaWgRunner struct {
+	// contains filtered or unexported fields
+}
+
+type AmneziaWgSettings struct {
+	SecretKey	string			`json:"secretKey"`
+	Address		any			`json:"address"`
+	Peers		[]*AmneziaWgPeer	`json:"peers"`
+	MTU		int			`json:"mtu"`
+
+	DNSServers	[]string	`json:"dnsServers"`
+
+	Jc	int	`json:"jc"`
+	Jmin	int	`json:"jmin"`
+	Jmax	int	`json:"jmax"`
+	S1	int	`json:"s1"`
+	S2	int	`json:"s2"`
+	S3	int	`json:"s3"`
+	S4	int	`json:"s4"`
+	H1	any	`json:"h1"`
+	H2	any	`json:"h2"`
+	H3	any	`json:"h3"`
+	H4	any	`json:"h4"`
+	I1	string	`json:"i1"`
+	I2	string	`json:"i2"`
+	I3	string	`json:"i3"`
+	I4	string	`json:"i4"`
+	I5	string	`json:"i5"`
+
+	HeaderProtectionKey	string	`json:"headerProtectionKey"`
+	ContentPaddingAddition	any	`json:"contentPaddingAddition"`
+	RekeyAfterTime		any	`json:"rekeyAfterTime"`
+	RekeyTimeout		any	`json:"rekeyTimeout"`
+	RejectAfterTime		any	`json:"rejectAfterTime"`
+	KeepaliveTimeout	any	`json:"keepaliveTimeout"`
+	MaxHandshakeAttempts	any	`json:"maxHandshakeAttempts"`
+
+	RandomTrailers	any	`json:"randomTrailers"`
+	DisableCookies	any	`json:"disableCookies"`
+}
+
+type ConnectionLogEntry struct {
+	Seq		int64	`json:"seq"`
+	Time		int64	`json:"time"`
+	Host		string	`json:"host"`
+	Port		int	`json:"port"`
+	Network		string	`json:"network"`
+	Outbound	string	`json:"outbound"`
+}
+
+type CoreCallbackHandler interface {
+	Startup() int64
+	Shutdown() int64
+	OnEmitStatus(code int64, message string) int64
+}
+
+type CoreController struct {
+	// contains filtered or unexported fields
+}
+
+type MemoryStats struct {
+	AllocBytes	int64	`json:"allocBytes"`
+	AllocMb		string	`json:"allocMb"`
+	TotalAlloc	int64	`json:"totalAlloc"`
+	SysBytes	int64	`json:"sysBytes"`
+	SysMb		string	`json:"sysMb"`
+	HeapInuse	int64	`json:"heapInuse"`
+	HeapIdle	int64	`json:"heapIdle"`
+	HeapReleased	int64	`json:"heapReleased"`
+	NumGoroutines	int	`json:"numGoroutines"`
+	NumGC		uint32	`json:"numGc"`
+}
+
+type ProcessFinder interface {
+	FindProcessByConnection(network, srcIP string, srcPort int, destIP string, destPort int) int
+}
+
+type SocketProtector interface {
+	Protect(fd int) bool
+}
+
+var ErrStopTimedOut = errors.New("SKIPI Core stop timed out")

@@ -4,6 +4,14 @@
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 
 **`skipicore`** is an ultra-fast, modern Go wrapper library around the official [Xray-core](https://github.com/XTLS/Xray-core) engine, specifically designed for seamless mobile integration ([SKIPI](https://github.com/ZloyRadetski/skipi-box) on Android).
+
+## Layout
+
+The root package is the gomobile-bound facade; implementation lives in `internal/` and the desktop
+host code in `desktop/`. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the map, the gomobile
+binding rule and how to add an exported function. The exported API is pinned by
+`testdata/public_api.golden` (`go test .` fails when it changes).
+
 ---
 
 ## Build (AAR for Android)

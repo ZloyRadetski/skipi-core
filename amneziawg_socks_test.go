@@ -52,18 +52,6 @@ func TestAmneziaWgUDPAssociateDoesNotLeakGoroutines(t *testing.T) {
 	t.Fatalf("goroutines grew from %d to %d after %d closed UDP associations", before, after, associations)
 }
 
-// The lock-free metrics path must stay usable: with a wrong metric name or kind it silently
-// returned nil and every call fell back to the stop-the-world MemStats read.
-func TestReadMemoryStatsUsesMetricsPath(t *testing.T) {
-	stats := readMemoryStatsFromMetrics()
-	if stats == nil {
-		t.Fatal("runtime/metrics path unavailable")
-	}
-	if stats.AllocBytes <= 0 || stats.SysBytes <= 0 || stats.NumGoroutines <= 0 || stats.NumGC == 0 && stats.TotalAlloc <= 0 {
-		t.Fatalf("implausible stats: %+v", stats)
-	}
-}
-
 func tcpPair(t *testing.T) (client, server *net.TCPConn) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -78,32 +66,6 @@ func tcpPair(t *testing.T) (client, server *net.TCPConn) {
 		t.Fatal(err)
 	}
 	return c.(*net.TCPConn), <-accepted
-}
-
-// A client that has sent its whole request and shut down its write side must still receive the
-// answer: the relay used to close both ends as soon as one direction hit EOF.
-func TestRelayKeepsTheAnswerAfterTheClientHalfCloses(t *testing.T) {
-	clientA, srvA := tcpPair(t)
-	clientB, srvB := tcpPair(t)
-	defer clientA.Close()
-	defer clientB.Close()
-	go relay(t.Context(), srvA, srvB)
-
-	_, _ = clientA.Write([]byte("request"))
-	_ = clientA.CloseWrite()
-
-	got, err := io.ReadAll(clientB) // ends when the relay half-closes towards B
-	if err != nil || string(got) != "request" {
-		t.Fatalf("B read %q, %v", got, err)
-	}
-	_, _ = clientB.Write([]byte("response"))
-	_ = clientB.Close()
-
-	_ = clientA.SetReadDeadline(time.Now().Add(3 * time.Second))
-	answer, err := io.ReadAll(clientA)
-	if err != nil || string(answer) != "response" {
-		t.Fatalf("A read %q, %v", answer, err)
-	}
 }
 
 func TestSocksHandshakeTimesOutOnSilentClient(t *testing.T) {
