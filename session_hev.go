@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/ZloyRadetski/skipi-core/internal/hevtun"
@@ -43,6 +44,33 @@ var (
 	// hevReadyTimeout is how long StartSession waits for HEV TUN to report readiness.
 	hevReadyTimeout = 5000 * time.Millisecond
 )
+
+// hevWatchInterval is how often a running session checks that HEV TUN is still alive.
+var hevWatchInterval = time.Second
+
+// hevExitedReason leads the Idle detail when the session stopped because HEV TUN exited.
+const hevExitedReason = "HEV TUN exited unexpectedly"
+
+// watchHev stops session gen when HEV TUN exits under it: without hev the TUN drops every packet
+// while Xray and the session still look healthy. It returns once that session is no longer running.
+func (c *CoreController) watchHev(gen uint64) {
+	ticker := time.NewTicker(hevWatchInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		c.mu.Lock()
+		current := c.gen == gen && c.state == stateRunning && c.ownsHev
+		c.mu.Unlock()
+		if !current {
+			return
+		}
+		if hevTun.Running() {
+			continue
+		}
+		log.Printf("SKIPI Core: %s; stopping the session", hevExitedReason)
+		_ = c.stopWithinReason(defaultStopTimeout, hevExitedReason)
+		return
+	}
+}
 
 // hevReadyPoll is the slice StartSession waits in, so a ForceStop ends the wait promptly.
 const hevReadyPoll = 100 * time.Millisecond

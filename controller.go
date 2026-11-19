@@ -274,6 +274,9 @@ func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, 
 	c.isRunning.Store(true)
 	c.mu.Unlock()
 	c.notifyState(stateRunning, "")
+	if ownsHev {
+		go c.watchHev(myGen)
+	}
 
 	if c.callback != nil {
 		c.callback.Startup()
@@ -334,6 +337,12 @@ func (c *CoreController) StopLoopWithTimeout(timeoutMillis int64) error {
 }
 
 func (c *CoreController) stopWithin(d time.Duration) error {
+	return c.stopWithinReason(d, "")
+}
+
+// stopWithinReason is stopWithin with a reason that leads the Idle detail the listener gets,
+// for a stop Core started by itself.
+func (c *CoreController) stopWithinReason(d time.Duration, reason string) error {
 	c.mu.Lock()
 	switch c.state {
 	case stateIdle:
@@ -390,9 +399,12 @@ func (c *CoreController) stopWithin(d time.Duration) error {
 	}
 	stopErr = errors.Join(hevErr, stopErr, awgErr)
 	op.Finish(stopErr)
-	detail := ""
+	detail := reason
 	if stopErr != nil {
-		detail = stopErr.Error()
+		if detail != "" {
+			detail += ": "
+		}
+		detail += stopErr.Error()
 	}
 	c.notifyState(stateIdle, detail)
 

@@ -439,3 +439,59 @@ func TestQueryTunnelStatsJSON(t *testing.T) {
 		t.Fatalf("QueryTunnelStats = %s, want %s", got, want)
 	}
 }
+
+// A HEV TUN that dies under a running session leaves a tunnel that drops every packet; the
+// session must notice, stop Xray and AmneziaWG, and report Idle with the reason.
+func TestSessionStopsItselfWhenHevExits(t *testing.T) {
+	hev := &fakeHev{}
+	log := installOrderedFakes(t, hev)
+	origWatch := hevWatchInterval
+	hevWatchInterval = 10 * time.Millisecond
+	t.Cleanup(func() { hevWatchInterval = origWatch })
+
+	listener := &recordingListener{}
+	c := NewCoreController(nil)
+	c.SetStateListener(listener)
+	if err := c.StartSession(hevPlan(t, reserveLocalPort(t), true), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	hev.running.Store(false) // hev main returned on its own
+
+	deadline := time.Now().Add(2 * time.Second)
+	for c.State() != SessionIdle {
+		if time.Now().After(deadline) {
+			t.Fatalf("state = %d, want idle after hev exited", c.State())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if log.count("xray.close") != 1 || log.count("awg.stop") != 1 {
+		t.Fatalf("Xray and AmneziaWG must be stopped once, log = %s", log)
+	}
+	events := listener.snapshot()
+	last := events[len(events)-1]
+	if last.state != SessionIdle || !strings.Contains(last.detail, "HEV TUN exited") {
+		t.Fatalf("last event = %+v, want idle with the HEV TUN exit reason", last)
+	}
+}
+
+// A normal stop must not race the watcher into a second stop.
+func TestHevWatcherIgnoresANormalStop(t *testing.T) {
+	hev := &fakeHev{}
+	log := installOrderedFakes(t, hev)
+	origWatch := hevWatchInterval
+	hevWatchInterval = 5 * time.Millisecond
+	t.Cleanup(func() { hevWatchInterval = origWatch })
+
+	c := NewCoreController(nil)
+	if err := c.StartSession(hevPlan(t, reserveLocalPort(t), true), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.StopLoop(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if log.count("xray.close") != 1 {
+		t.Fatalf("xray closed %d times, want 1 (log %s)", log.count("xray.close"), log)
+	}
+}
