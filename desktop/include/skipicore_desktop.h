@@ -55,6 +55,7 @@ SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopMeasureOutboundDelays(const char *c
 SKIPI_CORE_DESKTOP_API int64_t SkipiCoreDesktopMeasureTcpDelay(const char *host, int32_t port, int32_t timeout_millis);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopReadMemoryStats(void);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopForceFreeMemory(void);
+SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopTunAttach(const char *plan_json);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopSystemProxy(const char *operation, const char *arguments);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopLastError(void);
 SKIPI_CORE_DESKTOP_API void SkipiCoreDesktopFreeString(char *value);

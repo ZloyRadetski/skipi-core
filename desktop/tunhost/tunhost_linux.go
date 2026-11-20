@@ -63,3 +63,9 @@ func Close() error {
 
 // Probe returns nil when a TUN session can be opened on this machine, otherwise the reason it cannot.
 func Probe() error { return nmtun.Probe() }
+
+// platformPrepare has nothing to do here: only Windows leaves adapters behind.
+func platformPrepare(string) {}
+
+// Attach has nothing to finish here: the interface and its routes are set up elsewhere (see Open).
+func Attach(string) error { return nil }

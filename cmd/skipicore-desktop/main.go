@@ -219,6 +219,21 @@ func SkipiCoreDesktopTunPrepare(interfaceName *C.char) *C.char {
 	})
 }
 
+// SkipiCoreDesktopTunAttach finishes the TUN setup once the session runs on the interface: on Windows it
+// installs the routes into the adapter hev created, then the DNS servers and the multicast block. planJSON is
+// the host's device plan. It returns NULL on success; elsewhere it is a no-op.
+//
+//export SkipiCoreDesktopTunAttach
+func SkipiCoreDesktopTunAttach(planJSON *C.char) *C.char {
+	return cError(func() error {
+		plan, err := requiredCString(planJSON, "TUN plan")
+		if err != nil {
+			return err
+		}
+		return tunhost.Attach(plan)
+	})
+}
+
 // SkipiCoreDesktopNotify shows a desktop notification. It returns NULL
 // on success, otherwise why it could not be shown (for example, no notification service runs).
 //

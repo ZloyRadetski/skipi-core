@@ -32,9 +32,19 @@ func Prepare(name string) error {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	_, err := prepareLocked(name)
-	return err
+	fresh, err := prepareLocked(name)
+	if err != nil {
+		return err
+	}
+	if fresh {
+		preparedName = name
+		platformPrepare(name)
+	}
+	return nil
 }
+
+// preparedName is the interface the session was prepared for; Close cleans up behind it.
+var preparedName string
 
 // Prepared reports whether the socket binding is in place.
 func Prepared() bool { return binder.Load() != nil }

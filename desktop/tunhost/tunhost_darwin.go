@@ -27,3 +27,9 @@ func Close() error {
 // Probe returns nil: the administrator rights are obtained by Core's HEV TUN supervisor when it starts the tunnel,
 // and the socket binding itself needs none.
 func Probe() error { return nil }
+
+// platformPrepare has nothing to do here: only Windows leaves adapters behind.
+func platformPrepare(string) {}
+
+// Attach has nothing to finish here: the interface and its routes are set up elsewhere (see Open).
+func Attach(string) error { return nil }

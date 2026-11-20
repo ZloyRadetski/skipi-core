@@ -19,6 +19,8 @@ func Prepare(string) error { return errUnsupported }
 
 func Prepared() bool { return false }
 
+func Attach(string) error { return errUnsupported }
+
 // Protector has nothing to bind to here.
 type Protector struct{}
 
