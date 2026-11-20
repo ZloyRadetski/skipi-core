@@ -126,8 +126,11 @@ hev config policy (every target): `SanitizeConfig` lets through only the known k
 `post-up-script`, `pre-down-script` and `pid-file`. `misc.log-file` is kept where hev runs in
 process and dropped in the process modes (Windows, macOS), where hev has more rights than the app.
 
-Windows Stop terminates the process and waits up to 5 s; a process still alive stays known so a
-later Stop or ForceStop can end it. The temporary config (0600) is deleted when the process is gone.
+Windows runs only an executable given as an absolute path inside the Core library's own directory
+(links resolved), keeps it in a kill-on-close job object so it ends with Core even after a crash,
+and writes the config into a new temp file whose protected DACL admits only SYSTEM, Administrators
+and the owner. Stop terminates the process and waits up to 5 s; a process still alive stays known
+so a later Stop or ForceStop can end it. The config is deleted when the process is gone.
 Builds without cgo (and other OSes) get the stub that returns "HEV TUN is not built into this Core
 on <GOOS>". `scripts/build-hev-linux.sh` builds a patched copy of the submodule with `make static`
 (`-fPIC`) and never touches `build/hev/android`; the Android script clears all of `build/hev`.

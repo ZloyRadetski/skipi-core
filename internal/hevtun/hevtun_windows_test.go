@@ -27,6 +27,8 @@ var (
 func TestMain(m *testing.M) {
 	// Built before any test redirects the temp directory.
 	fakeOnce.Do(buildFake)
+	// The test binary is not the Core library; the fake hev's directory stands in for Core's.
+	trustedHevRoot = func() (string, error) { return fakeDir, nil }
 	code := m.Run()
 	if fakeDir != "" {
 		_ = os.RemoveAll(fakeDir)
