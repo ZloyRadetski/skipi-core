@@ -6,6 +6,7 @@ package skipicore
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -108,8 +109,61 @@ func (r *AmneziaWgRunner) serveSocks(ctx context.Context, ln net.Listener) {
 				continue
 			}
 		}
-		go r.handleSocksConn(ctx, clientConn)
+		// Every connection holds a goroutine and, once dialed, netstack buffers: past the limit a
+		// local client is turned away instead of growing the process without bound.
+		if int(r.socksConns.Add(1)) > maxSocksConns {
+			r.socksConns.Add(-1)
+			_ = clientConn.Close()
+			continue
+		}
+		go func() {
+			defer r.socksConns.Add(-1)
+			r.handleSocksConn(ctx, clientConn)
+		}()
 	}
+}
+
+// maxSocksConns bounds the SOCKS connections a runner serves at once. A variable so tests can lower it.
+var maxSocksConns = 1024
+
+// socksAuthenticate runs the method negotiation and, when the runner has credentials, the
+// username/password exchange of RFC 1929. It reports whether the client may go on.
+func (r *AmneziaWgRunner) socksAuthenticate(c net.Conn, methods []byte) bool {
+	if r.socksUser == "" && r.socksPass == "" {
+		_, err := c.Write([]byte{0x05, 0x00}) // no authentication required
+		return err == nil
+	}
+	if !bytes.Contains(methods, []byte{0x02}) {
+		_, _ = c.Write([]byte{0x05, 0xff}) // no acceptable method
+		return false
+	}
+	if _, err := c.Write([]byte{0x05, 0x02}); err != nil {
+		return false
+	}
+	var head [2]byte
+	if _, err := io.ReadFull(c, head[:]); err != nil || head[0] != 0x01 {
+		return false
+	}
+	user := make([]byte, head[1])
+	if _, err := io.ReadFull(c, user); err != nil {
+		return false
+	}
+	var plen [1]byte
+	if _, err := io.ReadFull(c, plen[:]); err != nil {
+		return false
+	}
+	pass := make([]byte, plen[0])
+	if _, err := io.ReadFull(c, pass); err != nil {
+		return false
+	}
+	userOK := subtle.ConstantTimeCompare(user, []byte(r.socksUser))
+	passOK := subtle.ConstantTimeCompare(pass, []byte(r.socksPass))
+	if userOK&passOK != 1 {
+		_, _ = c.Write([]byte{0x01, 0x01})
+		return false
+	}
+	_, err := c.Write([]byte{0x01, 0x00})
+	return err == nil
 }
 
 // handleSocksConn handles a single SOCKS5 TCP client connection.
@@ -128,8 +182,7 @@ func (r *AmneziaWgRunner) handleSocksConn(ctx context.Context, c net.Conn) {
 	if _, err := io.ReadFull(c, methods); err != nil {
 		return
 	}
-	// Reply: No authentication required
-	if _, err := c.Write([]byte{0x05, 0x00}); err != nil {
+	if !r.socksAuthenticate(c, methods) {
 		return
 	}
 
@@ -150,7 +203,11 @@ func (r *AmneziaWgRunner) handleSocksConn(ctx context.Context, c net.Conn) {
 	// The request is complete: the dial has its own timeout and the stream may idle.
 	_ = c.SetDeadline(time.Time{})
 	if reqHeader[1] == 0x03 { // UDP ASSOCIATE
-		r.handleSocksUDPAssociate(ctx, c)
+		var requested *net.UDPAddr
+		if ip := net.ParseIP(destAddr); ip != nil && destPort != 0 {
+			requested = &net.UDPAddr{IP: ip, Port: int(destPort)}
+		}
+		r.handleSocksUDPAssociate(ctx, c, requested)
 		return
 	}
 	if reqHeader[1] != 0x01 { // CONNECT
@@ -193,7 +250,10 @@ func (r *AmneziaWgRunner) handleSocksConn(ctx context.Context, c net.Conn) {
 // handleSocksUDPAssociate implements SOCKS5 UDP ASSOCIATE. Xray uses this
 // path for UDP traffic (including ordinary DNS), so accepting CONNECT alone
 // would make an AmneziaWG bridge only partially functional.
-func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control net.Conn) {
+//
+// requested is the source the client named in its request (RFC 1928), when it named one: then
+// only datagrams from exactly that address and port are relayed.
+func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control net.Conn, requested *net.UDPAddr) {
 	clientUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		_ = amneziawg.SendReply(control, 0x01)
@@ -307,7 +367,7 @@ func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control n
 				finish()
 				return
 			}
-			if controlIP != nil && !source.IP.Equal(controlIP) {
+			if !r.udpSourceAllowed(source, controlIP, requested) {
 				continue
 			}
 			payload, destination, err := r.parseSocksUDPDatagram(ctx, buffer[:n])
@@ -336,6 +396,20 @@ func (r *AmneziaWgRunner) handleSocksUDPAssociate(ctx context.Context, control n
 	}()
 
 	<-finished
+}
+
+// udpSourceAllowed reports whether a datagram from source belongs to the association: from the
+// exact address the client named, or, when it named none (an unspecified address or port 0),
+// from the IP of its control connection.
+func (r *AmneziaWgRunner) udpSourceAllowed(source *net.UDPAddr, controlIP net.IP, requested *net.UDPAddr) bool {
+	if requested != nil {
+		ip := requested.IP
+		if ip.IsUnspecified() {
+			ip = controlIP
+		}
+		return source.Port == requested.Port && (ip == nil || source.IP.Equal(ip))
+	}
+	return controlIP == nil || source.IP.Equal(controlIP)
 }
 
 func (r *AmneziaWgRunner) parseSocksUDPDatagram(ctx context.Context, packet []byte) ([]byte, *net.UDPAddr, error) {

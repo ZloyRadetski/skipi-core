@@ -139,6 +139,12 @@ func (c *CoreController) StartSession(planJSON string, tunFd int64) error {
 	if err != nil {
 		return err
 	}
+	if plan.AmneziaWg != nil {
+		plan.XrayConfig, plan.AmneziaWg.Config, err = secureAwgBridge(plan.XrayConfig, plan.AmneziaWg.Config, plan.AmneziaWg.SocksPort)
+		if err != nil {
+			return err
+		}
+	}
 	myGen, err := c.beginStart()
 	if err != nil {
 		return err

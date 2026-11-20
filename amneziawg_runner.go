@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
@@ -33,6 +34,10 @@ type AmneziaWgRunner struct {
 	protector  SocketProtector
 	// sessionOwned marks the runner of a session; the public start and stop leave it alone.
 	sessionOwned bool
+	// socksUser and socksPass, when set, are required from every SOCKS client.
+	socksUser, socksPass string
+	// socksConns counts the SOCKS connections being served (see maxSocksConns).
+	socksConns atomic.Int32
 
 	dnsMu    sync.Mutex
 	dnsCache map[string]tunnelDNSEntry
@@ -116,6 +121,8 @@ func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgR
 		localAddrs: append([]netip.Addr(nil), localAddrs...),
 		socksPort:  socksPort,
 		protector:  currentAmneziaWgSocketProtector(),
+		socksUser:  settings.SocksUser,
+		socksPass:  settings.SocksPass,
 	}, nil
 }
 

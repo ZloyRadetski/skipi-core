@@ -114,6 +114,9 @@ type AmneziaWgSettings struct {
 
 	DNSServers	[]string	`json:"dnsServers"`
 
+	SocksUser	string	`json:"socksUser"`
+	SocksPass	string	`json:"socksPass"`
+
 	Jc	int	`json:"jc"`
 	Jmin	int	`json:"jmin"`
 	Jmax	int	`json:"jmax"`

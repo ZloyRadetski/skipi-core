@@ -32,6 +32,10 @@ type AmneziaWgSettings struct {
 	// DNSServers is a runtime-only list of raw IP resolvers for the internal
 	// netstack. It deliberately is not an Xray WireGuard setting.
 	DNSServers []string `json:"dnsServers"`
+	// SocksUser and SocksPass are runtime-only too: when set, the local SOCKS listener asks every
+	// client for them (RFC 1929), so no other program on the device can use the tunnel's exit.
+	SocksUser string `json:"socksUser"`
+	SocksPass string `json:"socksPass"`
 
 	// AmneziaWG specific fields:
 	Jc   int    `json:"jc"`
