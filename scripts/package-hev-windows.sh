@@ -56,7 +56,9 @@ import sys, zipfile, os
 archive, stage = sys.argv[1], sys.argv[2]
 wanted = ["hev-socks5-tunnel.exe", "wintun.dll"]
 with zipfile.ZipFile(archive) as z:
-    names = {os.path.basename(n): n for n in z.namelist() if not n.endswith("/")}
+    # The archive was made on Windows: entry names may use backslashes, which only Windows' own
+    # path functions treat as separators.
+    names = {n.replace("\\", "/").rsplit("/", 1)[-1]: n for n in z.namelist() if not n.endswith(("/", "\\"))}
     for w in wanted:
         if w not in names:
             sys.exit("::error::the hev archive does not contain " + w)
