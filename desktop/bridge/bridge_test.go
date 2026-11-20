@@ -730,3 +730,25 @@ func TestAHangingStartBlocksNeitherForceStopNorStateReads(t *testing.T) {
 		}
 	}
 }
+
+type recordingProtector struct{}
+
+func (recordingProtector) Protect(int) bool { return true }
+
+// C6: AmneziaWG's peer sockets on the desktop are pinned to the physical interface like Xray's,
+// so a session with AmneziaWG and TUN does not loop its own packets back into the tunnel.
+func TestSessionAndAwgStartsInstallTheDesktopSocketProtector(t *testing.T) {
+	var installed []skipicore.SocketProtector
+	origSet, origSession := setAwgProtector, startSession
+	setAwgProtector = func(p skipicore.SocketProtector) { installed = append(installed, p) }
+	startSession = func(*skipicore.CoreController, string, int64) error { return errors.New("not today") }
+	t.Cleanup(func() { setAwgProtector, startSession = origSet, origSession })
+	SetSocketProtector(recordingProtector{})
+	t.Cleanup(func() { SetSocketProtector(nil) })
+
+	runtime := initializedRuntime(t)
+	_ = runtime.StartSession(runtime.CreateController(), `{"xrayConfig":"{}"}`, 0)
+	if len(installed) != 1 || installed[0] != (recordingProtector{}) {
+		t.Fatalf("installed = %v", installed)
+	}
+}

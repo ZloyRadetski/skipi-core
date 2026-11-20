@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"syscall"
 	"strconv"
 	"strings"
 	"time"
@@ -53,10 +54,13 @@ func LookupHostWithFallback(
 	return nil, fmt.Errorf("system DNS: %w; configured DNS: %w", systemErr, configuredErr)
 }
 
+// LookupHostWithConfiguredDNS asks the raw DNS servers in turn. control, when set, runs on each
+// query socket before it connects (it protects or binds it, so the query stays off the tunnel).
 func LookupHostWithConfiguredDNS(
 	ctx context.Context,
 	host string,
 	dnsServers []netip.Addr,
+	control func(network, address string, c syscall.RawConn) error,
 ) ([]netip.Addr, error) {
 	var lookupErrors []error
 	for _, server := range dnsServers {
@@ -69,7 +73,7 @@ func LookupHostWithConfiguredDNS(
 			PreferGo:     true,
 			StrictErrors: true,
 			Dial: func(dialCtx context.Context, network, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(dialCtx, network, resolverAddress)
+				return (&net.Dialer{Control: control}).DialContext(dialCtx, network, resolverAddress)
 			},
 		}
 		lookupCtx, cancelLookup := context.WithTimeout(ctx, configuredDNSLookupTimeout)

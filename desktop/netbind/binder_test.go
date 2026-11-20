@@ -209,3 +209,21 @@ func TestBinderReportsTheInterfaceItBindsTo(t *testing.T) {
 		t.Fatalf("chosen = %v", chosen)
 	}
 }
+
+// C6: AmneziaWG opens its UDP sockets itself, outside Xray's dialer; BindFD pins one of them the
+// same way, so the tunnel's own peer traffic never loops back into the TUN.
+func TestBindFDPinsAnExistingSocketToThePhysicalInterface(t *testing.T) {
+	var bound []string
+	b := newBinder("en0", true, &bound)
+	if err := b.BindFD(7); err != nil || len(bound) != 0 {
+		t.Fatalf("a disabled binder must leave the socket alone: %v %v", err, bound)
+	}
+	b.Enable()
+	if err := b.BindFD(7); err != nil || len(bound) != 1 || bound[0] != "en0" {
+		t.Fatalf("err = %v, bound = %v", err, bound)
+	}
+	b.Bind = func(uintptr, string) error { return errors.New("refused") }
+	if err := b.BindFD(7); err == nil {
+		t.Fatal("a failed bind must be reported to the caller, which then refuses the socket")
+	}
+}

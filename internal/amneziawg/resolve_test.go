@@ -2,8 +2,10 @@ package amneziawg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
+	"syscall"
 	"testing"
 )
 
@@ -54,5 +56,18 @@ func TestAmneziaWgEndpointLookupFallsBackToConfiguredDNS(t *testing.T) {
 	}
 	if len(addresses) != 1 || addresses[0].String() != "198.51.100.25" {
 		t.Fatalf("unexpected fallback addresses %v", addresses)
+	}
+}
+
+// C6: the lookup of the peer's name goes out through a socket the caller can protect or bind.
+func TestConfiguredDNSLookupDialsThroughTheGivenControl(t *testing.T) {
+	called := 0
+	control := func(network, address string, c syscall.RawConn) error {
+		called++
+		return errors.New("refused by the protector")
+	}
+	_, err := LookupHostWithConfiguredDNS(context.Background(), "relay.example", []netip.Addr{netip.MustParseAddr("127.0.0.1")}, control)
+	if err == nil || called == 0 {
+		t.Fatalf("err = %v, control called %d times", err, called)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/ZloyRadetski/skipi-core/internal/amneziawg"
 )
@@ -191,22 +192,51 @@ func (s *AmneziaWgSettings) validateNativeRunnerCompatibility() error {
 	return nil
 }
 
-func (s *AmneziaWgSettings) resolvePeerEndpoints(dnsServers []netip.Addr) error {
+// Seams for the peer name lookup.
+var (
+	systemHostLookup = func(ctx context.Context, host string) ([]netip.Addr, error) {
+		return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	}
+	configuredHostLookup = amneziawg.LookupHostWithConfiguredDNS
+)
+
+// protectControl is a dialer control that hands each socket to the protector.
+func protectControl(p SocketProtector) func(network, address string, c syscall.RawConn) error {
+	return func(network, address string, c syscall.RawConn) error {
+		var protectErr error
+		if err := c.Control(func(fd uintptr) {
+			if !p.Protect(int(fd)) {
+				protectErr = fmt.Errorf("the protector refused the DNS socket for %s", address)
+			}
+		}); err != nil {
+			return err
+		}
+		return protectErr
+	}
+}
+
+// resolvePeerEndpoints turns peer host names into addresses. With a protector (Core inside a VPN,
+// or a desktop TUN) the configured DNS servers are asked first over protected sockets, because a
+// system lookup can enter the tunnel this runner is about to carry; the system resolver is then
+// only the fallback. Without one the system resolver goes first, as before.
+func (s *AmneziaWgSettings) resolvePeerEndpoints(dnsServers []netip.Addr, protector SocketProtector) error {
+	configured := func(ctx context.Context, host string) ([]netip.Addr, error) {
+		var control func(string, string, syscall.RawConn) error
+		if protector != nil {
+			control = protectControl(protector)
+		}
+		return configuredHostLookup(ctx, host, dnsServers, control)
+	}
+	first, second := amneziawg.HostLookup(systemHostLookup), amneziawg.HostLookup(configured)
+	if protector != nil {
+		first, second = configured, systemHostLookup
+	}
 	for index, peer := range s.Peers {
 		if peer == nil {
 			return fmt.Errorf("AmneziaWG peer %d is missing", index)
 		}
 		endpoint, err := amneziawg.ResolveEndpoint(peer.Endpoint, func(ctx context.Context, host string) ([]netip.Addr, error) {
-			return amneziawg.LookupHostWithFallback(
-				ctx,
-				host,
-				func(systemCtx context.Context, lookupHost string) ([]netip.Addr, error) {
-					return net.DefaultResolver.LookupNetIP(systemCtx, "ip", lookupHost)
-				},
-				func(configuredDnsCtx context.Context, lookupHost string) ([]netip.Addr, error) {
-					return amneziawg.LookupHostWithConfiguredDNS(configuredDnsCtx, lookupHost, dnsServers)
-				},
-			)
+			return amneziawg.LookupHostWithFallback(ctx, host, first, second)
 		})
 		if err != nil {
 			return fmt.Errorf("resolve AmneziaWG peer %d endpoint: %w", index, err)

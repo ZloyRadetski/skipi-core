@@ -33,6 +33,9 @@ var (
 
 func main() {}
 
+// AmneziaWG's peer sockets follow Xray's: pinned to the physical interface while a TUN is up.
+func init() { desktopbridge.SetSocketProtector(tunhost.Protector{}) }
+
 // SkipiCoreDesktopApiVersion returns the C ABI version. The caller owns the
 // returned string and must release it with SkipiCoreDesktopFreeString.
 //

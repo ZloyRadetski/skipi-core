@@ -138,6 +138,21 @@ func (b *Binder) Control(network, address string, c syscall.RawConn) error {
 	})
 }
 
+// BindFD pins a socket that was opened outside Xray's dialer (AmneziaWG's peer sockets) to the
+// interface Control would choose. It does nothing while the binder is disabled or has no
+// interface; a failed bind is returned, so the caller can refuse the socket.
+func (b *Binder) BindFD(fd uintptr) error {
+	iface, ok := b.current()
+	if !ok {
+		return nil
+	}
+	if err := b.Bind(fd, iface); err != nil {
+		b.reportBindError(iface, err)
+		return err
+	}
+	return nil
+}
+
 func isLoopback(address string) bool {
 	if strings.HasPrefix(strings.ToLower(address), "localhost:") {
 		return true

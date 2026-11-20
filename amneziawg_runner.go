@@ -43,6 +43,10 @@ type AmneziaWgRunner struct {
 	dnsCache map[string]tunnelDNSEntry
 }
 
+// requireAwgProtector is true where Core always runs inside a VPN (Android): a runner without a
+// protector does not start there. A variable so tests can set it.
+var requireAwgProtector = runtime.GOOS == "android"
+
 // NewAmneziaWgRunner builds an AmneziaWgRunner instance from parsed settings.
 func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgRunner, error) {
 	if socksPort <= 0 {
@@ -55,9 +59,14 @@ func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgR
 	if err != nil {
 		return nil, err
 	}
+	protector := currentAmneziaWgSocketProtector()
+	if protector == nil && requireAwgProtector {
+		// Inside a VPN the peer's packets would enter the tunnel they carry and never arrive.
+		return nil, errors.New("AmneziaWG needs a socket protector here; none is registered")
+	}
 	// The UAPI endpoint parser accepts address literals only. Resolve a domain
 	// before IpcSet rather than passing an opaque hostname through to it.
-	if err := settings.resolvePeerEndpoints(dnsAddrs); err != nil {
+	if err := settings.resolvePeerEndpoints(dnsAddrs, protector); err != nil {
 		return nil, err
 	}
 
@@ -120,7 +129,7 @@ func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgR
 		tnet:       tnet,
 		localAddrs: append([]netip.Addr(nil), localAddrs...),
 		socksPort:  socksPort,
-		protector:  currentAmneziaWgSocketProtector(),
+		protector:  protector,
 		socksUser:  settings.SocksUser,
 		socksPass:  settings.SocksPass,
 	}, nil

@@ -68,3 +68,16 @@ func releaseLocked() {
 		binder.Store(nil)
 	}
 }
+
+// Protector pins sockets Core opens outside Xray's dialer (AmneziaWG's peer sockets) to the
+// physical interface, like Xray's own. Without a TUN it leaves them alone.
+type Protector struct{}
+
+// Protect binds fd while the binding is in place; it reports false when that bind failed.
+func (Protector) Protect(fd int) bool {
+	current := binder.Load()
+	if current == nil {
+		return true
+	}
+	return current.BindFD(uintptr(fd)) == nil
+}

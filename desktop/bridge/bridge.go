@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	skipicore "github.com/ZloyRadetski/skipi-core"
@@ -48,9 +49,31 @@ var coreProcessState struct {
 
 // Seams for the slow starts, so tests can hold one in flight.
 var (
-	startLoop    = (*skipicore.CoreController).StartLoop
-	startSession = (*skipicore.CoreController).StartSession
+	startLoop       = (*skipicore.CoreController).StartLoop
+	startSession    = (*skipicore.CoreController).StartSession
+	setAwgProtector = skipicore.SetAmneziaWgSocketProtector
 )
+
+// awgProtector pins AmneziaWG's peer sockets to the physical interface (see SetSocketProtector).
+var awgProtector atomic.Pointer[skipicore.SocketProtector]
+
+// SetSocketProtector sets what AmneziaWG's peer sockets go through on the desktop: the TUN host's
+// interface binding, so they never enter the tunnel. nil leaves them unprotected.
+func SetSocketProtector(p skipicore.SocketProtector) {
+	if p == nil {
+		awgProtector.Store(nil)
+		return
+	}
+	awgProtector.Store(&p)
+}
+
+func installAwgProtector() {
+	var p skipicore.SocketProtector
+	if stored := awgProtector.Load(); stored != nil {
+		p = *stored
+	}
+	setAwgProtector(p)
+}
 
 // Runtime serializes access to SKIPI Core's process-global state. A desktop
 // application may retain multiple handles for UI ownership, but exactly one may
@@ -437,13 +460,13 @@ func (r *Runtime) CoreVersion() string {
 
 // StartAmneziaWg starts the process-wide AmneziaWG runner and its private loopback
 // SOCKS listener on socksPort. The host points a SOCKS outbound at that port and
-// starts Core afterwards. A desktop process has no VpnService, so no socket
-// protector is installed.
+// starts Core afterwards. The peer sockets go through the desktop protector (see
+// SetSocketProtector), which pins them to the physical interface while a TUN is up.
 func (r *Runtime) StartAmneziaWg(configJSON string, socksPort int) error {
 	if socksPort <= 0 {
 		return errors.New("AmneziaWG SOCKS port must be positive")
 	}
-	skipicore.SetAmneziaWgSocketProtector(nil)
+	installAwgProtector()
 	return skipicore.StartAmneziaWg(configJSON, socksPort)
 }
 
@@ -509,7 +532,8 @@ func normalizeAssetDirectory(directory string) (string, error) {
 // StartSession starts a controller from a session plan JSON (see skipicore.CoreController.StartSession):
 // Xray and, when the plan has it, AmneziaWG with its SOCKS readiness wait and HEV TUN (in process
 // on Linux with the TUN descriptor tunFD, a supervised process on Windows). It takes the same
-// session lease as Start. A desktop process has no VpnService, so no socket protector is used.
+// session lease as Start. AmneziaWG's peer sockets go through the desktop protector (see
+// SetSocketProtector).
 func (r *Runtime) StartSession(handle Handle, planJSON string, tunFD int64) error {
 	if strings.TrimSpace(planJSON) == "" {
 		return errors.New("SKIPI Core desktop session plan must not be blank")
@@ -519,7 +543,7 @@ func (r *Runtime) StartSession(handle Handle, planJSON string, tunFD int64) erro
 	}
 
 	return r.startWithLease(handle, func(c *skipicore.CoreController) error {
-		skipicore.SetAmneziaWgSocketProtector(nil)
+		installAwgProtector()
 		if err := startSession(c, planJSON, tunFD); err != nil {
 			return fmt.Errorf("start SKIPI Core desktop session %d: %w", handle, err)
 		}

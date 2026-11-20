@@ -18,3 +18,9 @@ func Probe() error { return errUnsupported }
 func Prepare(string) error { return errUnsupported }
 
 func Prepared() bool { return false }
+
+// Protector has nothing to bind to here.
+type Protector struct{}
+
+// Protect always succeeds: there is no TUN to keep sockets out of.
+func (Protector) Protect(int) bool { return true }
