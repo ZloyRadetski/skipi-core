@@ -100,6 +100,13 @@ func parseSessionPlan(planJSON string) (*sessionPlan, error) {
 		if strings.TrimSpace(p.Hev.ConfigYAML) == "" {
 			return nil, errors.New("session plan: hev.configYaml must not be blank")
 		}
+		// Only keys hev needs get through: no scripts, no pid file, and a log file only where hev
+		// runs inside the app with its rights.
+		clean, err := hevtun.SanitizeConfig(p.Hev.ConfigYAML, hevTun.NeedsTunFd())
+		if err != nil {
+			return nil, fmt.Errorf("session plan: hev.configYaml: %w", err)
+		}
+		p.Hev.ConfigYAML = clean
 		if hevTun.NeedsTunFd() && p.Hev.TunFd <= 0 {
 			return nil, errors.New("session plan: hev.tunFd must be positive")
 		}

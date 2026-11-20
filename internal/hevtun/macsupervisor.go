@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,6 +20,11 @@ import (
 // removes them again when Core asks for a stop through a file, when hev ends, or when Core itself
 // is gone, so a crash never leaves the machine routed into a dead tunnel.
 //
+// Root never writes where the user can: every file it creates is in its own state directory under
+// /var/run, which it rebuilds for each session. The user's run directory is only looked at for the
+// stop request. hev runs from a copy root made, checked against the hash Core took, and the config
+// travels inside the script, so nothing the user can swap is ever run or read by root.
+//
 // Core's own sockets stay off the tunnel by IP_BOUND_IF (see netbind), so the supervisor needs no
 // host routes for the proxy servers.
 //
@@ -30,6 +36,8 @@ var (
 	macIPv4CIDR    = regexp.MustCompile(`^((?:[0-9]{1,3}\.){3}[0-9]{1,3})/([0-9]{1,2})$`)
 	macIPv6CIDR    = regexp.MustCompile(`^([0-9A-Fa-f:]{2,39})/([0-9]{1,3})$`)
 	macIPv4Address = regexp.MustCompile(`^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$`)
+	macHexHash     = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	macToken       = regexp.MustCompile(`^[0-9a-f]{16,64}$`)
 )
 
 // MacInterface is the utun interface plan of the session ("macInterface" in the hev block).
@@ -49,17 +57,31 @@ type MacTunSupervisorSpec struct {
 	MTU           int
 	IPv4Address   string
 	Routes        []string
+	// HevExecutable is the shipped hev; root copies it into StateDir and runs the copy only when
+	// it has HevSHA256, the hash Core took of it.
 	HevExecutable string
-	HevConfig     string
-	StopFile      string
-	ReadyFile     string
-	ErrorFile     string
-	AppPid        int64
-	UserUid       int
+	HevSHA256     string
+	// HevConfigYAML travels inside the script and is written 0600 into StateDir.
+	HevConfigYAML string
+	// StateDir is the root-owned directory the supervisor rebuilds and writes all its files into.
+	StateDir string
+	// StopFile is Core's stop request in the user's run directory; root only tests that it exists.
+	StopFile string
+	// Token marks this session's markers, so leftovers of another session are never taken for them.
+	Token  string
+	AppPid int64
 }
+
+// MacStateDirectory is the root-owned directory of the supervisor of user uid.
+func MacStateDirectory(uid int) string { return "/var/run/skipi-hev." + strconv.Itoa(uid) }
 
 // shellQuote is the text as one POSIX shell word: single-quoted, each inner quote becomes quote, backslash, quote, quote.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+// cleanAbsolute reports whether p is an absolute POSIX path in its shortest form, other than "/".
+func cleanAbsolute(p string) bool {
+	return strings.HasPrefix(p, "/") && p != "/" && path.Clean(p) == p && !strings.ContainsAny(p, "\x00\n")
+}
 
 func validOctets(address string) bool {
 	for _, part := range strings.Split(address, ".") {
@@ -92,77 +114,127 @@ func routeCommand(verb, route string) string {
 	return "route -n " + verb + " " + family + "-net " + shellQuote(route) + ` -interface "$IFACE"`
 }
 
-// MacTunSupervisorScript is the supervisor that runs as root. It is POSIX sh and is handed to the
-// shell as base64 text (MacPrivilegedShellCommand), so nothing in it is subject to a second round
-// of quoting. An invalid spec is an error: the values are interpolated into a root script.
-func MacTunSupervisorScript(spec MacTunSupervisorSpec) (string, error) {
+func validateSupervisorSpec(spec MacTunSupervisorSpec) error {
 	if !macUtunName.MatchString(spec.InterfaceName) {
-		return "", errors.New("the macOS tunnel interface must be named utunN")
+		return errors.New("the macOS tunnel interface must be named utunN")
 	}
 	if len(spec.Routes) == 0 {
-		return "", errors.New("invalid tunnel route")
+		return errors.New("invalid tunnel route")
 	}
 	for _, r := range spec.Routes {
 		if !ValidateMacRoute(r) {
-			return "", errors.New("invalid tunnel route")
+			return errors.New("invalid tunnel route")
 		}
 	}
 	if !macIPv4Address.MatchString(spec.IPv4Address) || !validOctets(spec.IPv4Address) {
-		return "", errors.New("invalid tunnel address")
+		return errors.New("invalid tunnel address")
 	}
 	if spec.MTU < 576 || spec.MTU > 65535 {
-		return "", errors.New("invalid tunnel MTU")
+		return errors.New("invalid tunnel MTU")
 	}
-	if spec.AppPid <= 0 || spec.UserUid < 0 {
-		return "", errors.New("invalid owner")
+	if spec.AppPid <= 0 {
+		return errors.New("invalid owner")
+	}
+	if !cleanAbsolute(spec.HevExecutable) {
+		return errors.New("the tunnel executable must be an absolute path")
+	}
+	if !macHexHash.MatchString(spec.HevSHA256) {
+		return errors.New("invalid tunnel executable hash")
+	}
+	if spec.HevConfigYAML == "" {
+		return errors.New("the tunnel config is empty")
+	}
+	if !cleanAbsolute(spec.StateDir) || !cleanAbsolute(spec.StopFile) {
+		return errors.New("the tunnel state and stop paths must be absolute")
+	}
+	if !macToken.MatchString(spec.Token) {
+		return errors.New("invalid tunnel session token")
+	}
+	return nil
+}
+
+// MacTunSupervisorScript is the supervisor that runs as root. It is POSIX sh and is handed to the
+// shell as base64 text (MacPrivilegedShellCommand), so nothing in it is subject to a second round
+// of quoting. An invalid spec is an error: the values are interpolated into a root script.
+//
+// Its markers in StateDir, readable by Core: tun-ready holds "<supervisor pid> <token>", tun-error
+// "<token>" and the reason on the next line, tun-exit "<token>" once it cleaned up and is leaving.
+func MacTunSupervisorScript(spec MacTunSupervisorSpec) (string, error) {
+	if err := validateSupervisorSpec(spec); err != nil {
+		return "", err
 	}
 
 	var b strings.Builder
 	line := func(s string) { b.WriteString(s + "\n") }
-	hev := shellQuote(spec.HevExecutable)
+	// Never write through an existing name, and never take a tool from anywhere but the system.
+	line("set -C")
+	line("umask 022")
+	line("PATH=/usr/bin:/bin:/usr/sbin:/sbin")
+	line("export PATH")
 	line("IFACE=" + shellQuote(spec.InterfaceName))
+	line("STATE=" + shellQuote(spec.StateDir))
 	line("STOP=" + shellQuote(spec.StopFile))
-	line("READY=" + shellQuote(spec.ReadyFile))
-	line("ERR=" + shellQuote(spec.ErrorFile))
+	line("TOKEN=" + shellQuote(spec.Token))
+	line("HEV_SRC=" + shellQuote(spec.HevExecutable))
+	line("HEV_SHA=" + shellQuote(spec.HevSHA256))
+	line(`READY="$STATE/tun-ready"`)
+	line(`ERR="$STATE/tun-error"`)
+	line(`EXIT="$STATE/tun-exit"`)
+	line(`CFG="$STATE/hev.yaml"`)
+	line(`HEV="$STATE/hev-socks5-tunnel"`)
+	line(`LOG="$STATE/hev.log"`)
 	line("APP_PID=" + strconv.FormatInt(spec.AppPid, 10))
 	line("HEV_PID=")
+	line("ROUTED=")
 	line("cleanup() {")
 	line(`  [ -n "$HEV_PID" ] && kill "$HEV_PID" 2>/dev/null`)
+	line(`  if [ -n "$ROUTED" ]; then`)
 	for _, r := range spec.Routes {
-		line("  " + routeCommand("delete", r) + " >/dev/null 2>&1")
+		line("    " + routeCommand("delete", r) + " >/dev/null 2>&1")
 	}
-	line(`  rm -f "$READY"`)
+	line("  fi")
+	line(`  rm -f "$READY" "$CFG" "$HEV" "$EXIT"`)
+	line(`  printf '%s\n' "$TOKEN" > "$EXIT"`)
 	line("}")
 	line("fail() {")
-	line(`  printf '%s' "$1" > "$ERR"`)
-	line("  chown " + strconv.Itoa(spec.UserUid) + ` "$ERR"`)
+	line(`  rm -f "$ERR"`)
+	line(`  printf '%s\n%s\n' "$TOKEN" "$1" > "$ERR"`)
 	line("  cleanup")
 	line("  exit 1")
 	line("}")
-	line(`trap 'cleanup; rm -f "$STOP"; exit 0' TERM INT HUP`)
-	// A packaged helper can lose its executable bit; root restores it instead of failing.
-	line("[ -x " + hev + " ] || chmod 755 " + hev + ` || fail "Could not make the tunnel executable"`)
+	line(`stopped() { [ -e "$STOP" ] || ! kill -0 "$APP_PID" 2>/dev/null; }`)
+	line(`trap 'cleanup; exit 0' TERM INT HUP`)
+	// /var/run is root's alone, so nothing on the way to the state directory can be a user's link,
+	// and rebuilding it leaves no leftover of anyone inside.
+	line(`rm -rf "$STATE" && mkdir -m 755 "$STATE" || exit 1`)
+	// A stop request already here means the start was cancelled while the password prompt was up.
+	line(`if stopped; then cleanup; exit 0; fi`)
+	line(`cp "$HEV_SRC" "$HEV" || fail "Could not copy the tunnel executable"`)
+	line(`[ "$(shasum -a 256 "$HEV" | cut -d ' ' -f 1)" = "$HEV_SHA" ] || fail "The tunnel executable changed after it was checked"`)
+	line(`chmod 755 "$HEV" || fail "Could not make the tunnel executable"`)
+	line(`(umask 077; echo ` + base64.StdEncoding.EncodeToString([]byte(spec.HevConfigYAML)) + ` | base64 -D > "$CFG") || fail "Could not write the tunnel config"`)
 	// hev's own raise asks for an unlimited soft value, which macOS refuses; the default of 256 holds ~100 sessions.
 	line("ulimit -n 10240 2>/dev/null || true")
-	line(hev + " " + shellQuote(spec.HevConfig) + " </dev/null >/dev/null 2>&1 &")
+	line(`"$HEV" "$CFG" </dev/null > "$LOG" 2>&1 &`)
 	line("HEV_PID=$!")
 	line("i=0")
 	line(`until ifconfig "$IFACE" >/dev/null 2>&1; do`)
 	line("  i=$((i + 1))")
 	line(`  [ "$i" -gt 100 ] && fail "The tunnel interface did not appear"`)
 	line(`  kill -0 "$HEV_PID" 2>/dev/null || fail "The tunnel process stopped before the interface appeared"`)
+	line(`  if stopped; then cleanup; exit 0; fi`)
 	line("  sleep 0.1")
 	line("done")
 	addr := shellQuote(spec.IPv4Address)
 	line(`ifconfig "$IFACE" inet ` + addr + " " + addr + " mtu " + strconv.Itoa(spec.MTU) + ` up || fail "Could not configure the tunnel interface"`)
+	line("ROUTED=1")
 	for _, r := range spec.Routes {
 		line(routeCommand("add", r) + ` >/dev/null 2>&1 || fail "Could not add the route ` + r + `"`)
 	}
-	line(`echo $$ > "$READY"`)
-	line("chown " + strconv.Itoa(spec.UserUid) + ` "$READY"`)
-	line(`while kill -0 "$HEV_PID" 2>/dev/null && kill -0 "$APP_PID" 2>/dev/null && [ ! -e "$STOP" ]; do sleep 1; done`)
+	line(`if stopped; then cleanup; exit 0; fi`)
+	line(`printf '%s %s\n' "$$" "$TOKEN" > "$READY"`)
+	line(`while kill -0 "$HEV_PID" 2>/dev/null && ! stopped; do sleep 1; done`)
 	line("cleanup")
-	line(`rm -f "$STOP"`)
 	return b.String(), nil
 }
 
@@ -212,14 +284,21 @@ func MacIPv4Of(addresses []string) (string, error) {
 	return "", errors.New("the macOS tunnel plan has no IPv4 address")
 }
 
-// ValidateMacPlan checks the hev block of a session plan on macOS: the executable, the run
-// directory and an interface plan with a name, an IPv4 address, a positive MTU and valid routes.
+// ValidateMacPlan checks the hev block of a session plan on macOS: an absolute executable, an
+// absolute run directory and an interface plan with a name, an IPv4 address, a positive MTU and
+// valid routes.
 func ValidateMacPlan(executable, runDirectory string, mac *MacInterface) error {
 	if strings.TrimSpace(executable) == "" {
 		return errors.New("hev.executable must not be blank")
 	}
+	if !cleanAbsolute(executable) {
+		return errors.New("hev.executable must be an absolute path")
+	}
 	if strings.TrimSpace(runDirectory) == "" {
 		return errors.New("hev.runDirectory must not be blank")
+	}
+	if !cleanAbsolute(runDirectory) {
+		return errors.New("hev.runDirectory must be an absolute path")
 	}
 	if mac == nil {
 		return errors.New("hev.macInterface is missing")

@@ -110,7 +110,21 @@ HEV TUN is the TUN implementation everywhere; what differs is how Core runs it
 | Android | static libs linked in process (cgo, `scripts/build-hev-android.sh`) | descriptor from the VpnService (`tunFd`) | ready callback (patch) | hev counters |
 | Linux amd64 | static libs linked in process (cgo, `scripts/build-hev-linux.sh`, `build/hev/linux-amd64`) | descriptor Core's desktop TUN opened (`tunFd`) | ready callback (patch) | hev counters |
 | Windows | supervised child process: `<executable> <temp config>`, run from the executable's directory (wintun.dll and the MSYS DLLs sit there); output goes to Core's log | hev creates the Wintun adapter itself, `tunFd` ignored | no callback across processes: Start waits a 150 ms grace and an earlier exit is a failure (first 4 KB of output in the error); WaitReady only reports whether the process is alive | zeros (counters live in another process) |
-| macOS | supervised privileged process (osascript administrator prompt), run by Core: a root `sh` supervisor starts the hev executable the app ships, installs the routes and removes them again on a stop request, hev exit or Core exit (`macsupervisor.go`, `macflow.go`, `hevtun_darwin.go`) | hev creates the utun interface itself, `tunFd` ignored; Core installs address, MTU and routes from `macInterface` | marker files in `runDirectory`: `tun-ready` (supervisor pid) or `tun-error` (reason), up to 30 s after the prompt is answered; `Running` is the ready file naming a live process and no pending `tun-stop` | zeros (counters live in the root process) |
+| macOS | supervised privileged process (osascript administrator prompt), run by Core: a root `sh` supervisor starts the hev executable the app ships, installs the routes and removes them again on a stop request, hev exit or Core exit (`macsupervisor.go`, `macflow.go`, `hevtun_darwin.go`) | hev creates the utun interface itself, `tunFd` ignored; Core installs address, MTU and routes from `macInterface` | markers in the root-owned `/var/run/skipi-hev.<uid>`, each carrying the session token: `tun-ready` (supervisor pid), `tun-error` (reason), `tun-exit` (cleaned up), up to 30 s after the prompt is answered; `Running` is this session's ready marker naming a live process and no pending `tun-stop` | zeros (counters live in the root process) |
+
+macOS privilege boundary: root writes only into its state directory, which it rebuilds under
+`/var/run` for every session (`set -C`, fixed `PATH`, no `chown`). The user's `runDirectory` holds
+only `tun-stop`, Core's stop request, which root tests and never touches. Root copies the shipped
+hev into the state directory and runs the copy only when its SHA-256 matches the hash Core took at
+Start; the config travels base64 inside the script and is written there 0600, and the copy, the
+config and the ready marker are removed at the end. A Stop while the administrator prompt is up
+ends osascript and leaves `tun-stop`, so a supervisor that still got started leaves before it
+configures anything.
+
+hev config policy (every target): `SanitizeConfig` lets through only the known keys of `tunnel`,
+`socks5`, `mapdns` and `misc` as single values and refuses everything else, among them
+`post-up-script`, `pre-down-script` and `pid-file`. `misc.log-file` is kept where hev runs in
+process and dropped in the process modes (Windows, macOS), where hev has more rights than the app.
 
 Windows Stop terminates the process and waits up to 5 s; a process still alive stays known so a
 later Stop or ForceStop can end it. The temporary config (0600) is deleted when the process is gone.

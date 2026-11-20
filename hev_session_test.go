@@ -175,7 +175,7 @@ func TestParseSessionPlanHevTunFdDependsOnTheTarget(t *testing.T) {
 	// In-process targets (Android, Linux) need the descriptor Core was given.
 	useHevTarget(t, &fakeHev{})
 	for _, fd := range []string{"0", "-1"} {
-		if _, err := parseSessionPlan(hevPlanWith(t, `{"configYaml":"a: b","tunFd":`+fd+`}`)); err == nil ||
+		if _, err := parseSessionPlan(hevPlanWith(t, `{"configYaml":"tunnel: {mtu: 1500}","tunFd":`+fd+`}`)); err == nil ||
 			!strings.Contains(err.Error(), "tunFd") {
 			t.Errorf("in-process tunFd %s: err = %v, want a tunFd error", fd, err)
 		}
@@ -184,9 +184,9 @@ func TestParseSessionPlanHevTunFdDependsOnTheTarget(t *testing.T) {
 	useHevTarget(t, &fakeHev{noFd: true})
 	exe, _ := json.Marshal(winExe)
 	for _, hev := range []string{
-		`{"configYaml":"a: b","tunFd":-1,"executable":` + string(exe) + `}`,
-		`{"configYaml":"a: b","tunFd":0,"executable":` + string(exe) + `}`,
-		`{"configYaml":"a: b","executable":` + string(exe) + `}`,
+		`{"configYaml":"tunnel: {mtu: 1500}","tunFd":-1,"executable":` + string(exe) + `}`,
+		`{"configYaml":"tunnel: {mtu: 1500}","tunFd":0,"executable":` + string(exe) + `}`,
+		`{"configYaml":"tunnel: {mtu: 1500}","executable":` + string(exe) + `}`,
 	} {
 		p, err := parseSessionPlan(hevPlanWith(t, hev))
 		if err != nil {
@@ -235,7 +235,7 @@ func TestParseSessionPlanHev(t *testing.T) {
 	}
 	for name, hev := range map[string]string{
 		"blank yaml": `{"configYaml":"  ","tunFd":42}`,
-		"no fd":      `{"configYaml":"a: b","tunFd":0}`,
+		"no fd":      `{"configYaml":"tunnel: {mtu: 1500}","tunFd":0}`,
 	} {
 		plan := strings.TrimSuffix(buildPlan(t, 0, false), "}") + `,"hev":` + hev + `}`
 		if _, err := parseSessionPlan(plan); err == nil || !strings.Contains(err.Error(), "hev") {
@@ -633,5 +633,41 @@ func TestMacOSSessionStopsItselfWhenTheSupervisorIsGone(t *testing.T) {
 	events := listener.snapshot()
 	if last := events[len(events)-1]; !strings.Contains(last.detail, "HEV TUN exited") {
 		t.Fatalf("last event = %+v", last)
+	}
+}
+
+// C2: hev scripts and pid-file never reach hev, and a privileged hev never sees a log-file path.
+func TestSessionPlanRefusesHevKeysThatRunOrWriteAnything(t *testing.T) {
+	for _, target := range []*fakeHev{{}, {noFd: true}} {
+		useHevTarget(t, target)
+		for _, yaml := range []string{
+			"tunnel:\n  mtu: 1500\n  post-up-script: /tmp/x\n",
+			"tunnel:\n  pre-down-script: /tmp/x\n",
+			"misc:\n  pid-file: /etc/sudoers\n",
+		} {
+			y, _ := json.Marshal(yaml)
+			_, err := parseSessionPlan(hevPlanWith(t, `{"configYaml":`+string(y)+`,"tunFd":42,"executable":"/opt/hev"}`))
+			if err == nil || !strings.Contains(err.Error(), "not allowed") {
+				t.Errorf("%q: err = %v", yaml, err)
+			}
+		}
+	}
+}
+
+func TestProcessModeHevGetsNoLogFile(t *testing.T) {
+	hev := &fakeHev{noFd: true}
+	installOrderedFakes(t, hev)
+	c := NewCoreController(nil)
+	yaml, _ := json.Marshal(hevTestYAML + "misc:\n  log-file: /etc/sudoers\n  log-level: warn\n")
+	exe, _ := json.Marshal(winExe)
+	plan := strings.TrimSuffix(buildPlan(t, reserveLocalPort(t), true), "}") +
+		fmt.Sprintf(`,"hev":{"configYaml":%s,"executable":%s}}`, yaml, exe)
+	if err := c.StartSession(plan, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.StopLoop() })
+	got, _ := hev.gotCfg.Load().(string)
+	if strings.Contains(got, "log-file") || !strings.Contains(got, "log-level: warn") {
+		t.Fatalf("hev got:\n%s", got)
 	}
 }

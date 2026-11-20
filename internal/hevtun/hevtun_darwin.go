@@ -46,8 +46,8 @@ func (osFS) Exists(path string) bool {
 
 // runLauncher runs the command; a failure carries the command's output (osascript reports a
 // cancelled prompt there), else the exec error.
-func runLauncher(command []string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), launchTimeout)
+func runLauncher(parent context.Context, command []string) error {
+	ctx, cancel := context.WithTimeout(parent, launchTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, command[0], command[1:]...).CombinedOutput()
 	if err == nil {
@@ -68,11 +68,13 @@ func isAlive(pid int64) bool {
 var tunnel = newMacTunnel(macEnv{
 	FS:           osFS{},
 	Launch:       runLauncher,
+	HashFile:     fileSHA256,
+	NewToken:     randomToken,
 	IsAlive:      isAlive,
 	Now:          time.Now,
 	Sleep:        time.Sleep,
 	AppPid:       int64(os.Getpid()),
-	UserUid:      os.Getuid(),
+	StateDir:     MacStateDirectory(os.Getuid()),
 	ReadyTimeout: MacReadyTimeout,
 	StopTimeout:  MacStopTimeout,
 })
