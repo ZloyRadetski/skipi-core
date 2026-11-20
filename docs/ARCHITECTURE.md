@@ -109,7 +109,7 @@ HEV TUN is the TUN implementation everywhere; what differs is how Core runs it
 |---|---|---|---|---|
 | Android | static libs linked in process (cgo, `scripts/build-hev-android.sh`) | descriptor from the VpnService (`tunFd`) | ready callback (patch) | hev counters |
 | Linux amd64 | static libs linked in process (cgo, `scripts/build-hev-linux.sh`, `build/hev/linux-amd64`) | descriptor Core's desktop TUN opened (`tunFd`) | ready callback (patch) | hev counters |
-| Windows | supervised child process: `<executable> <temp config>`, run from the executable's directory (wintun.dll and the MSYS DLLs sit there); output goes to Core's log | hev creates the Wintun adapter itself, `tunFd` ignored | no callback across processes: Start waits a 150 ms grace and an earlier exit is a failure (first 4 KB of output in the error); WaitReady only reports whether the process is alive | zeros (counters live in another process) |
+| Windows | supervised child process: `<executable> <temp config>`, run from the executable's directory (wintun.dll sits there); output goes to Core's log | hev creates the Wintun adapter itself, `tunFd` ignored | no callback across processes: Start waits a 150 ms grace and an earlier exit is a failure (first 4 KB of output in the error); WaitReady only reports whether the process is alive | zeros (counters live in another process) |
 | macOS | supervised privileged process (osascript administrator prompt), run by Core: a root `sh` supervisor starts the hev executable Core carries, installs the routes and removes them again on a stop request, hev exit or Core exit (`macsupervisor.go`, `macflow.go`, `hevtun_darwin.go`) | hev creates the utun interface itself, `tunFd` ignored; Core installs address, MTU and routes from `macInterface` | markers in the root-owned `/var/run/skipi-hev.<uid>`, each carrying the session token: `tun-ready` (supervisor pid), `tun-error` (reason), `tun-exit` (cleaned up), up to 30 s after the prompt is answered; `Running` is this session's ready marker naming a live process and no pending `tun-stop` | zeros (counters live in the root process) |
 
 macOS privilege boundary: root writes only into its state directory, which it rebuilds under
@@ -129,14 +129,14 @@ process and dropped in the process modes (Windows, macOS), where hev has more ri
 The process-mode runtime is part of the Core library. `scripts/stage-hev-payload.sh` puts it into
 `internal/hevpayload/payload/` before the release build, where `go:embed` carries it: on macOS hev
 built from the submodule (`scripts/build-hev-mac.sh`, hev's default build, no in-process patch), on
-Windows the official hev 2.19.3 archive (pinned by SHA-256, `scripts/package-hev-windows.sh`) plus the
-vendored `msys-gcc_s-seh-1.dll`. The host application ships and downloads no hev, the plan has no
+Windows the official hev 2.20.0 archive (pinned by SHA-256, `scripts/package-hev-windows.sh`: the
+executable and `wintun.dll`; since 2.20.0 it is a native build with no MSYS DLLs). The host application ships and downloads no hev, the plan has no
 `executable` (an old host that still sends one is ignored), and the hev version and checksums live in
 this repository. A build without the payload reports `hevpayload.ErrNotBundled`.
 
 macOS writes the carried hev into the run directory and gives the supervisor the SHA-256 of the
 *embedded* bytes: root copies the file and runs the copy only when it has that hash, so replacing the
-written file gains nothing. Windows installs the whole runtime (hev, Wintun, MSYS DLLs) into the `hev`
+written file gains nothing. Windows installs the whole runtime (hev and Wintun) into the `hev`
 directory next to the Core DLL (the install directory, writable only by administrators, where Core
 runs elevated for the adapter) before every start and rewrites any file that differs from what Core
 carries. It keeps hev in a kill-on-close job object so it ends with Core even after a crash, and

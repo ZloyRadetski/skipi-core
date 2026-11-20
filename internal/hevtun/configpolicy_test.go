@@ -135,3 +135,14 @@ func equalYAML(a, b map[string]map[string]any) bool {
 	}
 	return true
 }
+
+// hev 2.20.0 added the Windows Wintun ring size to misc: a number, harmless, so it may pass.
+func TestTheWintunRingCapacityIsAllowed(t *testing.T) {
+	got, err := SanitizeConfig("misc:\n  wintun-ring-capacity: 1048576\n", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := decode(t, got); m["misc"]["wintun-ring-capacity"] != 1048576 {
+		t.Fatalf("got %s", got)
+	}
+}

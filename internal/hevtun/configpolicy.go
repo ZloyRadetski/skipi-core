@@ -25,7 +25,7 @@ var allowedConfigKeys = map[string]map[string]bool{
 	"misc": {"task-stack-size": true, "tcp-buffer-size": true, "udp-recv-buffer-size": true,
 		"udp-copy-buffer-nums": true, "max-session-count": true, "connect-timeout": true,
 		"tcp-read-write-timeout": true, "udp-read-write-timeout": true, "log-level": true,
-		"limit-nofile": true, "log-file": true},
+		"limit-nofile": true, "log-file": true, "wintun-ring-capacity": true},
 }
 
 // SanitizeConfig checks the hev YAML against the allowed keys and returns it re-encoded. Every key

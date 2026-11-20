@@ -2,7 +2,7 @@
 # Puts the hev-socks5-tunnel runtime of a platform into internal/hevpayload/payload/, where
 # go:embed picks it up: the Core library then carries hev itself (see internal/hevpayload).
 #
-#   scripts/stage-hev-payload.sh windows   # official hev 2.19.3 + Wintun + MSYS DLLs (any host)
+#   scripts/stage-hev-payload.sh windows   # official hev 2.20.0 + Wintun (any host)
 #   scripts/stage-hev-payload.sh macos     # hev built from the submodule (needs a macOS host)
 #   scripts/stage-hev-payload.sh clean     # leaves only the placeholder
 #

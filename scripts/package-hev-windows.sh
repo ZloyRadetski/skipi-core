@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
-# Packages the hev-socks5-tunnel runtime for Windows: hev-socks5-tunnel.exe, the Wintun driver
-# library and the two MSYS runtime DLLs hev imports.
+# Packages the hev-socks5-tunnel runtime for Windows: hev-socks5-tunnel.exe and the Wintun driver
+# library.
 #
-# hev's Windows build cannot be loaded into the Core DLL (it needs its MSYS runtime), so Core runs
-# it as a supervised child process (internal/hevtun/hevtun_windows.go). The official release
-# archive is used as is, pinned by SHA-256, and the one DLL it leaves out
-# (msys-gcc_s-seh-1.dll, vendored under third_party/windows with its own checksum) is added.
+# hev's Windows build cannot be loaded into the Core DLL, so Core runs it as a supervised child
+# process (internal/hevtun/hevtun_windows.go). The official release archive is used as is, pinned by
+# SHA-256. Since 2.20.0 it is a native build that imports only system DLLs; earlier versions needed
+# the MSYS runtime (msys-2.0.dll, msys-gcc_s-seh-1.dll) beside the executable.
 #
-# Output: build/hev/windows/hev-windows-x64.zip with the four files, the licences and a notice.
+# Output: build/hev/windows/hev-windows-x64.zip with the two files, the licence and a notice.
 # Needs curl, python3 (or PYTHON=...) and sha256sum; it runs on any host.
 set -euo pipefail
 
-HEV_VERSION="2.19.3"
-HEV_ARCHIVE_SHA256="a9209ad121a3f636f814b0bb899b6464d3ec201eabbb3a82f2aa486e32879ba7"
-GCC_DLL_SHA256="a9cfd10e2a4bf74f60530fc2f4f8fbe4055b50ff7ccd61b9440ef2fbe9c85aef"
+HEV_VERSION="2.20.0"
+HEV_ARCHIVE_SHA256="34fb2bef8000c2c6f948694caeaaf90ee0c307a124e8e436485953804b06c99d"
 
 PYTHON="${PYTHON:-$(command -v python3 || command -v python || echo python3)}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUBMODULE="$ROOT/third_party/hev-socks5-tunnel"
-GCC_DLL="$ROOT/third_party/windows/msys-gcc_s-seh-1.dll"
 OUT="$ROOT/build/hev/windows"
 STAGE="$OUT/stage"
 
@@ -35,7 +33,6 @@ check_sha() { # file expected
   [ "$actual" = "$2" ] || { echo "$(basename "$1"): checksum mismatch, expected $2, got $actual" >&2; exit 1; }
 }
 
-check_sha "$GCC_DLL" "$GCC_DLL_SHA256"
 [ -f "$SUBMODULE/third-part/wintun/LICENSE.txt" ] || {
   echo "hev-socks5-tunnel nested submodules are missing; run: git submodule update --init --recursive" >&2
   exit 1
@@ -43,15 +40,15 @@ check_sha "$GCC_DLL" "$GCC_DLL_SHA256"
 
 rm -rf "$OUT"
 mkdir -p "$STAGE"
-ARCHIVE="$OUT/hev-socks5-tunnel-win64.zip"
+ARCHIVE="$OUT/hev-socks5-tunnel-win-x64.zip"
 curl -fsSL --retry 3 -o "$ARCHIVE" \
-  "https://github.com/heiher/hev-socks5-tunnel/releases/download/$HEV_VERSION/hev-socks5-tunnel-win64.zip"
+  "https://github.com/heiher/hev-socks5-tunnel/releases/download/$HEV_VERSION/hev-socks5-tunnel-win-x64.zip"
 check_sha "$ARCHIVE" "$HEV_ARCHIVE_SHA256"
 
 "$PYTHON" - "$ARCHIVE" "$STAGE" <<'PY'
 import sys, zipfile, os
 archive, stage = sys.argv[1], sys.argv[2]
-wanted = ["hev-socks5-tunnel.exe", "msys-2.0.dll", "wintun.dll"]
+wanted = ["hev-socks5-tunnel.exe", "wintun.dll"]
 with zipfile.ZipFile(archive) as z:
     names = {os.path.basename(n): n for n in z.namelist() if not n.endswith("/")}
     for w in wanted:
@@ -61,13 +58,10 @@ with zipfile.ZipFile(archive) as z:
             dst.write(src.read())
 PY
 
-cp "$GCC_DLL" "$STAGE/msys-gcc_s-seh-1.dll"
 cp "$SUBMODULE/third-part/wintun/LICENSE.txt" "$STAGE/WINTUN_LICENSE.txt"
 cat > "$STAGE/HEV_RUNTIME_NOTICE.txt" <<EOF
 hev-socks5-tunnel $HEV_VERSION (MIT) - https://github.com/heiher/hev-socks5-tunnel
 wintun.dll (Wintun, see WINTUN_LICENSE.txt) - https://www.wintun.net/
-msys-2.0.dll (MSYS2 runtime, LGPL-3.0 with linking exception) - https://www.msys2.org/
-msys-gcc_s-seh-1.dll (GCC runtime library, GPL-3.0 with GCC Runtime Library Exception) - https://www.msys2.org/
 EOF
 
 "$PYTHON" - "$STAGE" "$OUT/hev-windows-x64.zip" <<'PY'

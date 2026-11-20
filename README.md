@@ -67,7 +67,7 @@ application ships no hev and the session plan names no executable. A library bui
 works but reports "does not carry the HEV TUN runtime" when a tunnel is started.
 
 ```bash
-scripts/stage-hev-payload.sh windows   # any host: official hev 2.19.3 (pinned SHA-256) + Wintun + MSYS DLLs
+scripts/stage-hev-payload.sh windows   # any host: official hev 2.20.0 (pinned SHA-256) + Wintun
 scripts/stage-hev-payload.sh macos     # macOS host: hev built from the submodule (scripts/build-hev-mac.sh)
 scripts/stage-hev-payload.sh clean     # back to the placeholder
 ```
