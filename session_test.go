@@ -6,6 +6,7 @@ package skipicore
 import (
 	"errors"
 	"fmt"
+	"github.com/xtls/xray-core/core"
 	"net"
 	"strings"
 	"sync"
@@ -439,5 +440,36 @@ func TestStartSessionRejectsBadPlanWithoutStateChange(t *testing.T) {
 	}
 	if len(l.snapshot()) != 0 || c.State() != SessionIdle {
 		t.Fatal("a rejected plan must not change state")
+	}
+}
+
+// Perf 6: the Xray config is parsed while AmneziaWG comes up, not after it.
+func TestXrayConfigIsParsedWhileAwgStarts(t *testing.T) {
+	installFakeAwg(t, 0)
+	installFakeCore(t, newFakeCoreInstance())
+	parsing := make(chan struct{})
+	origLoad, origAwg := loadXrayConfig, startAmneziaWgFn
+	loadXrayConfig = func(text string) (*core.Config, error) {
+		close(parsing)
+		return origLoad(text)
+	}
+	overlapped := false
+	startAmneziaWgFn = func(cfg string, port int) error {
+		select {
+		case <-parsing:
+			overlapped = true
+		case <-time.After(2 * time.Second):
+		}
+		return origAwg(cfg, port)
+	}
+	t.Cleanup(func() { loadXrayConfig, startAmneziaWgFn = origLoad, origAwg })
+
+	c := NewCoreController(nil)
+	if err := c.StartSession(buildPlan(t, reserveLocalPort(t), true), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.StopLoop() })
+	if !overlapped {
+		t.Fatal("the Xray config was not parsed while AmneziaWG started")
 	}
 }

@@ -77,8 +77,11 @@ type coreInstance interface {
 	Close() error
 }
 
-// Seams for the slow Xray calls. Production behaviour is the real core.New and Start.
+// Seams for the slow Xray calls. Production behaviour is the real config loader, core.New and Start.
 var (
+	loadXrayConfig = func(configJSON string) (*core.Config, error) {
+		return coreserial.LoadJSONConfig(strings.NewReader(configJSON))
+	}
 	createCoreInstance = func(config *core.Config) (coreInstance, error) {
 		inst, err := core.New(config)
 		if err != nil {
@@ -136,7 +139,7 @@ func (c *CoreController) StartLoop(configJSON string, tunFd int64) error {
 	}
 	// If ForceStop gave up on this start, its abandoned mark ends when we return.
 	defer c.reapAbandonedStart(myGen)
-	return c.runStart(myGen, configJSON, tunFd, false, nil, nil, false)
+	return c.runStart(myGen, func() (*core.Config, error) { return loadXrayConfig(configJSON) }, tunFd, false, nil, nil, false)
 }
 
 // beginStart moves an idle controller to starting and returns the generation of this attempt.
@@ -171,7 +174,9 @@ func (c *CoreController) beginStart() (uint64, error) {
 // every failure before the controller returns to idle. afterXray, when set, runs once Xray
 // started and before the session is reported running (it starts HEV TUN); when it fails, Xray is
 // closed again and the start fails with its error. ownsHev marks the session as the owner of HEV TUN.
-func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, ownsAwg bool, beforeFail func(), afterXray func() error, ownsHev bool) error {
+// load returns the parsed Xray config; StartSession hands in one that was parsed while
+// AmneziaWG came up.
+func (c *CoreController) runStart(myGen uint64, load func() (*core.Config, error), tunFd int64, ownsAwg bool, beforeFail func(), afterXray func() error, ownsHev bool) error {
 	fail := func(err error) bool {
 		if beforeFail != nil {
 			beforeFail()
@@ -187,7 +192,7 @@ func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, 
 		go releaseMemory()
 	}()
 
-	config, err := coreserial.LoadJSONConfig(strings.NewReader(configJSON))
+	config, err := load()
 	if err != nil {
 		err = fmt.Errorf("failed to load xray config: %w", err)
 		fail(err)

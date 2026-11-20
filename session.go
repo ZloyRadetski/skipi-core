@@ -11,8 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xtls/xray-core/core"
+
 	"github.com/ZloyRadetski/skipi-core/internal/hevtun"
 	"github.com/ZloyRadetski/skipi-core/internal/lifecycle"
+	"github.com/ZloyRadetski/skipi-core/internal/runtimetuning"
 )
 
 // Session states reported by CoreController.State and StateListener.
@@ -189,6 +192,24 @@ func (c *CoreController) StartSession(planJSON string, tunFd int64) error {
 	}
 	defer c.reapAbandonedStart(myGen)
 
+	// Parse the Xray config (routing and geo data: the slow part of a start) while AmneziaWG
+	// resolves its peer and comes up, instead of after it. The GC pause covers both.
+	resumeGC := runtimetuning.PauseGCForStartup()
+	defer resumeGC()
+	type loaded struct {
+		config *core.Config
+		err    error
+	}
+	parsed := make(chan loaded, 1)
+	go func() {
+		config, err := loadXrayConfig(plan.XrayConfig)
+		parsed <- loaded{config, err}
+	}()
+	load := func() (*core.Config, error) {
+		l := <-parsed
+		return l.config, l.err
+	}
+
 	var runner *AmneziaWgRunner
 	stopOwnAwg := func() {
 		if runner != nil {
@@ -208,7 +229,7 @@ func (c *CoreController) StartSession(planJSON string, tunFd int64) error {
 	if plan.Hev != nil {
 		afterXray = func() error { return c.startSessionHev(myGen, plan.Hev) }
 	}
-	if err := c.runStart(myGen, plan.XrayConfig, tunFd, plan.AmneziaWg != nil, stopOwnAwg, afterXray, plan.Hev != nil); err != nil {
+	if err := c.runStart(myGen, load, tunFd, plan.AmneziaWg != nil, stopOwnAwg, afterXray, plan.Hev != nil); err != nil {
 		stopOwnAwg() // also covers a start that ForceStop aborted
 		return err
 	}
