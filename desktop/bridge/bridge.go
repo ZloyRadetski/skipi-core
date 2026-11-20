@@ -18,6 +18,7 @@ import (
 	"time"
 
 	skipicore "github.com/ZloyRadetski/skipi-core"
+	"github.com/ZloyRadetski/skipi-core/desktop/sysproxy"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
 )
@@ -85,6 +86,9 @@ type Runtime struct {
 	active      Handle
 	starting    map[Handle]bool // handles whose start is in flight; they hold the lease
 	assetDir    string
+
+	systemProxy    *sysproxy.Manager                        // set by SystemProxy("configure")
+	newSystemProxy func(directory string) *sysproxy.Manager // a seam for tests; nil means sysproxy.NewDefault
 }
 
 // NewRuntime creates an uninitialized desktop runtime.

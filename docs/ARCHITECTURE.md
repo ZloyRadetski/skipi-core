@@ -157,6 +157,26 @@ on <GOOS>". `scripts/build-hev-linux.sh` builds a patched copy of the submodule 
 Desktop exposes `SkipiCoreDesktopStartSession`, `SkipiCoreDesktopSessionState` (-1: unknown handle)
 and `SkipiCoreDesktopQueryTunnelStats`.
 
+## System proxy
+
+On the desktop the operating system's proxy settings belong to Core too (`desktop/sysproxy`). The host
+asks through one C function, `SkipiCoreDesktopSystemProxy(operation, jsonArguments)` (see
+`desktopbridge.Runtime.SystemProxy`), and words the result; it keeps no lease and runs no `netsh`,
+`reg`, `gsettings` or `networksetup` of its own.
+
+- **One lease protocol** (`Manager`): an exclusive lock file, a lease file written *before* the system is
+  touched (phase `prepared`) and marked `active` after, rollback on a failed apply, restore on release,
+  and recovery of a lease a crashed run left behind. A restore that fails keeps the lease, so it can be
+  retried.
+- **One backend per platform** (`Backend`): Windows writes the three WinINet values in HKCU in process
+  and tells WinInet (`InternetSetOption`), with a registry marker so a stale lease never overwrites values
+  somebody else set; Linux drives `gsettings` and `kwriteconfig` (GNOME and KDE at once); macOS drives
+  `networksetup` for every enabled service. Their logic carries no build tags and is tested against
+  fakes on every platform; only the registry and WinInet calls are Windows files.
+- **Old leases are read.** The files keep the names the Kotlin host used (`system-proxy-lease.json`,
+  `linux-…`, `mac-…`), and `decodeLease` accepts its format, so a session of an older app that ended
+  without releasing is restored by Core instead of blocking the proxy.
+
 ## Test seams
 
 `createCoreInstance`, `startCoreInstance`, `awgStop`, `startAmneziaWgFn`, `awgReadyTimeout`, `hevTun`, `hevReadyTimeout`,

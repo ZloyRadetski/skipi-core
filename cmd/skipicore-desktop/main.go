@@ -429,6 +429,25 @@ func SkipiCoreDesktopForceFreeMemory() *C.char {
 	})
 }
 
+// SkipiCoreDesktopSystemProxy runs one operation of the operating system's proxy settings (see
+// desktopbridge.Runtime.SystemProxy). arguments may be NULL. It returns an owned JSON result, or NULL on
+// error; inspect SkipiCoreDesktopLastError after NULL.
+//
+//export SkipiCoreDesktopSystemProxy
+func SkipiCoreDesktopSystemProxy(operation *C.char, arguments *C.char) *C.char {
+	return cString(func() (string, error) {
+		op, err := requiredCString(operation, "system proxy operation")
+		if err != nil {
+			return "", err
+		}
+		var args string
+		if arguments != nil {
+			args = C.GoString(arguments)
+		}
+		return desktopRuntime.SystemProxy(op, args)
+	})
+}
+
 // SkipiCoreDesktopLastError returns a diagnostic string for the last failed C
 // ABI call. The caller owns the returned string and must release it.
 //
