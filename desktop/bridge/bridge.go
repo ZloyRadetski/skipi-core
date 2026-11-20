@@ -46,6 +46,12 @@ var coreProcessState struct {
 	activeHandle   Handle
 }
 
+// Seams for the slow starts, so tests can hold one in flight.
+var (
+	startLoop    = (*skipicore.CoreController).StartLoop
+	startSession = (*skipicore.CoreController).StartSession
+)
+
 // Runtime serializes access to SKIPI Core's process-global state. A desktop
 // application may retain multiple handles for UI ownership, but exactly one may
 // run a core instance at any time.
@@ -54,6 +60,7 @@ type Runtime struct {
 	controllers map[Handle]*skipicore.CoreController
 	nextHandle  Handle
 	active      Handle
+	starting    map[Handle]bool // handles whose start is in flight; they hold the lease
 	assetDir    string
 }
 
@@ -159,35 +166,73 @@ func (r *Runtime) Start(handle Handle, configJSON string, tunFD int64) error {
 		return fmt.Errorf("SKIPI Core desktop TUN descriptor must not be negative: %d", tunFD)
 	}
 
+	return r.startWithLease(handle, func(c *skipicore.CoreController) error {
+		if err := startLoop(c, configJSON, tunFD); err != nil {
+			return fmt.Errorf("start SKIPI Core desktop controller %d: %w", handle, err)
+		}
+		return nil
+	})
+}
+
+// startWithLease takes the session lease for handle under the runtime locks and then runs start
+// without them, so ForceStop, Stop and the state reads never wait for a slow start (a hung Xray,
+// the macOS administrator prompt). The lease keeps any other controller from starting meanwhile
+// and is given up again when start fails.
+func (r *Runtime) startWithLease(handle Handle, start func(*skipicore.CoreController) error) error {
+	controller, err := r.takeLease(handle)
+	if err != nil {
+		return err
+	}
+	err = start(controller)
+
+	coreProcessState.Lock()
+	defer coreProcessState.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.starting, handle)
+	if err != nil {
+		if r.active == handle {
+			r.active = 0
+		}
+		clearProcessActiveLocked(r, handle)
+	}
+	return err
+}
+
+// takeLease checks that handle may start and takes the session lease for it.
+func (r *Runtime) takeLease(handle Handle) (*skipicore.CoreController, error) {
 	coreProcessState.Lock()
 	defer coreProcessState.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if coreProcessState.assetRuntime != r || coreProcessState.assetDirectory == "" {
-		return fmt.Errorf("%w: initialize this runtime before start", ErrAssetsNotInitialized)
+		return nil, fmt.Errorf("%w: initialize this runtime before start", ErrAssetsNotInitialized)
 	}
 	controller, err := r.controllerLocked(handle)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if coreProcessState.activeRuntime != nil &&
 		(coreProcessState.activeRuntime != r || coreProcessState.activeHandle != handle) {
-		return fmt.Errorf("%w: controller %d", ErrAnotherControllerActive, coreProcessState.activeHandle)
+		return nil, fmt.Errorf("%w: controller %d", ErrAnotherControllerActive, coreProcessState.activeHandle)
 	}
 	if r.active != 0 && r.active != handle {
-		return fmt.Errorf("%w: controller %d", ErrAnotherControllerActive, r.active)
+		return nil, fmt.Errorf("%w: controller %d", ErrAnotherControllerActive, r.active)
+	}
+	if r.starting[handle] {
+		return nil, fmt.Errorf("SKIPI Core desktop controller %d is already starting", handle)
 	}
 	if controller.IsRunning() {
-		return fmt.Errorf("SKIPI Core desktop controller %d is already running", handle)
+		return nil, fmt.Errorf("SKIPI Core desktop controller %d is already running", handle)
 	}
-
-	if err := controller.StartLoop(configJSON, tunFD); err != nil {
-		return fmt.Errorf("start SKIPI Core desktop controller %d: %w", handle, err)
+	if r.starting == nil {
+		r.starting = make(map[Handle]bool)
 	}
+	r.starting[handle] = true
 	r.active = handle
 	coreProcessState.activeRuntime = r
 	coreProcessState.activeHandle = handle
-	return nil
+	return controller, nil
 }
 
 // Stop stops a controller and releases the active-session lease even when Xray
@@ -236,12 +281,15 @@ func (r *Runtime) AbandonedInstances() int64 {
 	return skipicore.AbandonedInstances()
 }
 
-// releaseActive gives up the session lease held by handle.
+// releaseActive gives up the session lease held by handle, unless its start is still in flight.
 func (r *Runtime) releaseActive(handle Handle) {
 	coreProcessState.Lock()
 	defer coreProcessState.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.starting[handle] {
+		return // the start in flight gives the lease up itself when it fails
+	}
 	if r.active == handle {
 		r.active = 0
 	}
@@ -260,10 +308,10 @@ func (r *Runtime) IsRunning(handle Handle) (bool, error) {
 		return false, err
 	}
 	running := controller.IsRunning()
-	if !running && r.active == handle {
-		r.active = 0
-	}
-	if !running {
+	if !running && !r.starting[handle] {
+		if r.active == handle {
+			r.active = 0
+		}
 		clearProcessActiveLocked(r, handle)
 	}
 	return running, nil
@@ -470,36 +518,13 @@ func (r *Runtime) StartSession(handle Handle, planJSON string, tunFD int64) erro
 		return fmt.Errorf("SKIPI Core desktop TUN descriptor must not be negative: %d", tunFD)
 	}
 
-	coreProcessState.Lock()
-	defer coreProcessState.Unlock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if coreProcessState.assetRuntime != r || coreProcessState.assetDirectory == "" {
-		return fmt.Errorf("%w: initialize this runtime before start", ErrAssetsNotInitialized)
-	}
-	controller, err := r.controllerLocked(handle)
-	if err != nil {
-		return err
-	}
-	if coreProcessState.activeRuntime != nil &&
-		(coreProcessState.activeRuntime != r || coreProcessState.activeHandle != handle) {
-		return fmt.Errorf("%w: controller %d", ErrAnotherControllerActive, coreProcessState.activeHandle)
-	}
-	if r.active != 0 && r.active != handle {
-		return fmt.Errorf("%w: controller %d", ErrAnotherControllerActive, r.active)
-	}
-	if controller.IsRunning() {
-		return fmt.Errorf("SKIPI Core desktop controller %d is already running", handle)
-	}
-
-	skipicore.SetAmneziaWgSocketProtector(nil)
-	if err := controller.StartSession(planJSON, tunFD); err != nil {
-		return fmt.Errorf("start SKIPI Core desktop session %d: %w", handle, err)
-	}
-	r.active = handle
-	coreProcessState.activeRuntime = r
-	coreProcessState.activeHandle = handle
-	return nil
+	return r.startWithLease(handle, func(c *skipicore.CoreController) error {
+		skipicore.SetAmneziaWgSocketProtector(nil)
+		if err := startSession(c, planJSON, tunFD); err != nil {
+			return fmt.Errorf("start SKIPI Core desktop session %d: %w", handle, err)
+		}
+		return nil
+	})
 }
 
 // SessionState returns the controller's session state (skipicore.SessionIdle and friends). It

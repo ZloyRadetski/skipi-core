@@ -666,3 +666,67 @@ func TestRuntimeStartSessionAcceptsTheHevBlockAndReportsAFailedTunnelStart(t *te
 		t.Fatalf("lease still held by %d", runtime.ActiveHandle())
 	}
 }
+
+// H1: a start that hangs (a slow Xray, the macOS password prompt) must not block the calls that
+// are meant to end or watch it.
+func TestAHangingStartBlocksNeitherForceStopNorStateReads(t *testing.T) {
+	for _, viaSession := range []bool{false, true} {
+		runtime := initializedRuntime(t)
+		handle := runtime.CreateController()
+		other := runtime.CreateController()
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		hang := func(*skipicore.CoreController, string, int64) error {
+			close(entered)
+			<-release
+			return errors.New("aborted")
+		}
+		origLoop, origSession := startLoop, startSession
+		startLoop, startSession = hang, hang
+		t.Cleanup(func() { startLoop, startSession = origLoop, origSession })
+
+		startErr := make(chan error, 1)
+		go func() {
+			if viaSession {
+				startErr <- runtime.StartSession(handle, `{"xrayConfig":"{}"}`, 0)
+			} else {
+				startErr <- runtime.Start(handle, testXrayConfig(t), 0)
+			}
+		}()
+		<-entered
+
+		within := func(name string, f func()) {
+			t.Helper()
+			done := make(chan struct{})
+			go func() { f(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatalf("%s waited for the hanging start", name)
+			}
+		}
+		within("SessionState", func() { _, _ = runtime.SessionState(handle) })
+		within("IsRunning", func() { _, _ = runtime.IsRunning(handle) })
+		within("ActiveHandle", func() { _ = runtime.ActiveHandle() })
+		within("another Start", func() {
+			if err := runtime.Start(other, testXrayConfig(t), 0); !errors.Is(err, ErrAnotherControllerActive) {
+				t.Errorf("a second controller must not start while the first is starting: %v", err)
+			}
+		})
+		within("Stop", func() { _ = runtime.Stop(handle) })
+		within("ForceStop", func() { _ = runtime.ForceStop(handle) })
+		within("a start after the stops", func() {
+			if err := runtime.Start(other, testXrayConfig(t), 0); !errors.Is(err, ErrAnotherControllerActive) {
+				t.Errorf("the lease belongs to the start in flight until it returns: %v", err)
+			}
+		})
+
+		close(release)
+		if err := <-startErr; err == nil {
+			t.Fatal("the aborted start must fail")
+		}
+		if runtime.ActiveHandle() != 0 {
+			t.Fatalf("a failed start must free the lease, active = %d", runtime.ActiveHandle())
+		}
+	}
+}
