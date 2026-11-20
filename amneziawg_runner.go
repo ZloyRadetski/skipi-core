@@ -39,8 +39,11 @@ type AmneziaWgRunner struct {
 	// socksConns counts the SOCKS connections being served (see maxSocksConns).
 	socksConns atomic.Int32
 
-	dnsMu    sync.Mutex
-	dnsCache map[string]tunnelDNSEntry
+	dnsMu     sync.Mutex
+	dnsCache  map[string]tunnelDNSEntry
+	dnsFlight map[string]*tunnelDNSCall
+	// lookupHost resolves a name through the tunnel; nil means the netstack's resolver. A seam for tests.
+	lookupHost func(ctx context.Context, host string) ([]string, error)
 }
 
 // requireAwgProtector is true where Core always runs inside a VPN (Android): a runner without a

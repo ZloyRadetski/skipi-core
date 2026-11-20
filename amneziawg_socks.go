@@ -37,24 +37,98 @@ var errNoTunnelAddress = errors.New("lookup through AmneziaWG returned no usable
 
 type tunnelDNSEntry struct {
 	addr    string
+	err     error // a failed lookup, remembered for tunnelDNSNegativeTTL
 	expires time.Time
 }
 
-// lookupTunnelHost resolves a name through the tunnel's DNS with the caller's deadline. Answers
-// are cached briefly: Xray repeats a domain for every datagram of a UDP flow, and each uncached
-// lookup would otherwise stall the association's single reader.
+// tunnelDNSCall is one lookup in flight; callers asking for the same name wait on it.
+type tunnelDNSCall struct {
+	done chan struct{}
+	ip   net.IP
+	err  error
+}
+
+// tunnelDNSNegativeTTL is a variable so tests can shorten it.
+var tunnelDNSNegativeTTL = 5 * time.Second
+
+// lookupTunnelHost resolves a name through the tunnel's DNS. Answers are cached briefly: Xray
+// repeats a domain for every datagram of a UDP flow, and each uncached lookup would otherwise
+// stall the association's single reader. Failures are cached too (a dead name would cost the full
+// lookup timeout on every datagram), and callers asking for one name share a single query. The
+// query runs under its own timeout, so a caller that gives up never cancels it for the others.
 func (r *AmneziaWgRunner) lookupTunnelHost(ctx context.Context, host string) (net.IP, error) {
-	now := time.Now()
 	r.dnsMu.Lock()
-	entry, ok := r.dnsCache[host]
-	r.dnsMu.Unlock()
-	if ok && now.Before(entry.expires) {
+	if entry, ok := r.dnsCache[host]; ok && time.Now().Before(entry.expires) {
+		r.dnsMu.Unlock()
+		if entry.err != nil {
+			return nil, entry.err
+		}
 		return net.ParseIP(entry.addr), nil
 	}
+	call, inFlight := r.dnsFlight[host]
+	if !inFlight {
+		if r.dnsFlight == nil {
+			r.dnsFlight = make(map[string]*tunnelDNSCall)
+		}
+		call = &tunnelDNSCall{done: make(chan struct{})}
+		r.dnsFlight[host] = call
+		go r.runTunnelLookup(host, call)
+	}
+	r.dnsMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, socksLookupTimeout)
+	select {
+	case <-call.done:
+		return call.ip, call.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (r *AmneziaWgRunner) runTunnelLookup(host string, call *tunnelDNSCall) {
+	ctx, cancel := context.WithTimeout(context.Background(), socksLookupTimeout)
 	defer cancel()
-	addrs, err := r.tnet.LookupContextHost(ctx, host)
+	call.ip, call.err = r.resolveTunnelHost(ctx, host)
+
+	entry := tunnelDNSEntry{err: call.err}
+	if call.err == nil {
+		entry.addr = call.ip.String()
+		entry.expires = time.Now().Add(tunnelDNSCacheTTL)
+	} else {
+		entry.expires = time.Now().Add(tunnelDNSNegativeTTL)
+	}
+	r.dnsMu.Lock()
+	r.storeTunnelDNSLocked(host, entry)
+	delete(r.dnsFlight, host)
+	r.dnsMu.Unlock()
+	close(call.done)
+}
+
+// storeTunnelDNSLocked caches entry. A full cache gives up the entry that expires first, not
+// everything: dropping all of it would send every active name to the resolver at once.
+func (r *AmneziaWgRunner) storeTunnelDNSLocked(host string, entry tunnelDNSEntry) {
+	if r.dnsCache == nil {
+		r.dnsCache = make(map[string]tunnelDNSEntry)
+	}
+	if _, exists := r.dnsCache[host]; !exists && len(r.dnsCache) >= tunnelDNSCacheEntries {
+		var oldest string
+		var oldestExpiry time.Time
+		first := true
+		for k, e := range r.dnsCache {
+			if first || e.expires.Before(oldestExpiry) {
+				oldest, oldestExpiry, first = k, e.expires, false
+			}
+		}
+		delete(r.dnsCache, oldest)
+	}
+	r.dnsCache[host] = entry
+}
+
+func (r *AmneziaWgRunner) resolveTunnelHost(ctx context.Context, host string) (net.IP, error) {
+	lookup := r.lookupHost
+	if lookup == nil {
+		lookup = r.tnet.LookupContextHost
+	}
+	addrs, err := lookup(ctx, host)
 	if err != nil {
 		return nil, err
 	}
@@ -76,13 +150,6 @@ func (r *AmneziaWgRunner) lookupTunnelHost(ctx context.Context, host string) (ne
 	if chosen == nil {
 		return nil, errNoTunnelAddress
 	}
-
-	r.dnsMu.Lock()
-	if r.dnsCache == nil || len(r.dnsCache) >= tunnelDNSCacheEntries {
-		r.dnsCache = make(map[string]tunnelDNSEntry)
-	}
-	r.dnsCache[host] = tunnelDNSEntry{addr: chosen.String(), expires: now.Add(tunnelDNSCacheTTL)}
-	r.dnsMu.Unlock()
 	return chosen, nil
 }
 

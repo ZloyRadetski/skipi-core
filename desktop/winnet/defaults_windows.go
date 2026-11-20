@@ -8,8 +8,11 @@ package winnet
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -56,9 +59,12 @@ func applyPlatformDefaults(cfg *Config) {
 
 // runHidden runs a system command without a console window; a non-zero exit is a failure with its output.
 func runHidden(command []string) error {
+	if len(command) == 0 {
+		return errors.New("empty command")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+	cmd := exec.CommandContext(ctx, systemTool(command[0]), command[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW, HideWindow: true}
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
@@ -66,6 +72,23 @@ func runHidden(command []string) error {
 		return fmt.Errorf("%s failed: %s", strings.Join(command[:min(len(command), 4)], " "), strings.TrimSpace(out.String()+" "+err.Error()))
 	}
 	return nil
+}
+
+// systemTool gives the full path of a Windows tool Core starts, so a directory earlier on PATH can
+// never stand in for it while Core runs elevated. Names outside the pinned set are returned as given.
+func systemTool(name string) string {
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = `C:\Windows`
+	}
+	system32 := filepath.Join(filepath.Clean(root), "System32")
+	switch strings.ToLower(name) {
+	case "netsh", "netsh.exe":
+		return filepath.Join(system32, "netsh.exe")
+	case "powershell", "powershell.exe":
+		return filepath.Join(system32, "WindowsPowerShell", "v1.0", "powershell.exe")
+	}
+	return name
 }
 
 // removeAdapterCommand removes Wintun adapters named like name ("skipi0", "skipi0 1", ...).
