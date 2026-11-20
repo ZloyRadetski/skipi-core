@@ -53,6 +53,10 @@ type Config struct {
 	ListAdapters func() ([]string, error)
 	// RemoveAdapter removes the leftover Wintun adapters named like name.
 	RemoveAdapter func(name string) error
+	// AddRoute and DeleteRoute install an on-link route through the IP Helper API, without a process. They
+	// are optional: without them, or when one fails, the route goes in through netsh as it always did.
+	AddRoute    func(adapter string, prefix netip.Prefix) error
+	DeleteRoute func(adapter string, prefix netip.Prefix) error
 
 	Sleep    func(time.Duration)
 	Attempts int           // polls for the adapter before giving up
@@ -111,9 +115,8 @@ func (n *Net) Attach(plan Plan) error {
 	}
 	n.dnsApplied = dns != nil
 
-	routes := addRouteCommands(plan)
-	if failed := firstError(n.runAll(routes)); failed != nil {
-		n.runAll(deleteRouteCommands(plan))
+	if failed := firstError(n.runAll(n.routeTasks(plan, true))); failed != nil {
+		n.runAll(n.routeTasks(plan, false))
 		_ = n.cfg.Run(multicastUnblockCommand())
 		return failed
 	}
@@ -138,7 +141,7 @@ func (n *Net) Detach() error {
 		return nil
 	}
 	n.attached = nil
-	n.runAll(deleteRouteCommands(*plan))
+	n.runAll(n.routeTasks(*plan, false))
 	flush := n.dnsApplied
 	n.dnsApplied = false
 	n.background(func() {
@@ -230,21 +233,44 @@ func (n *Net) awaitAdapter(name string) bool {
 	return false
 }
 
-// runAll runs the commands, at once unless Serial, and returns each one's result in order.
-func (n *Net) runAll(commands [][]string) []error {
-	results := make([]error, len(commands))
-	if n.cfg.Serial || len(commands) < 2 {
-		for i, command := range commands {
-			results[i] = n.cfg.Run(command)
+// routeTasks is one task per route of the plan, adding them or deleting them. A task goes through the native
+// call when there is one, and through netsh when there is none or the native call failed.
+func (n *Net) routeTasks(plan Plan, add bool) []func() error {
+	tasks := make([]func() error, 0, len(plan.Routes))
+	for _, route := range plan.Routes {
+		command := deleteRouteCommand(plan, route)
+		native := n.cfg.DeleteRoute
+		if add {
+			command = addRouteCommand(plan, route)
+			native = n.cfg.AddRoute
+		}
+		tasks = append(tasks, func() error {
+			if native != nil {
+				if prefix, err := netip.ParsePrefix(route); err == nil && native(plan.Name, prefix) == nil {
+					return nil
+				}
+			}
+			return n.cfg.Run(command)
+		})
+	}
+	return tasks
+}
+
+// runAll runs the tasks, at once unless Serial, and returns each one's result in order.
+func (n *Net) runAll(tasks []func() error) []error {
+	results := make([]error, len(tasks))
+	if n.cfg.Serial || len(tasks) < 2 {
+		for i, task := range tasks {
+			results[i] = task()
 		}
 		return results
 	}
 	var wg sync.WaitGroup
-	for i, command := range commands {
+	for i, task := range tasks {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i] = n.cfg.Run(command)
+			results[i] = task()
 		}()
 	}
 	wg.Wait()
@@ -272,29 +298,37 @@ func routeFamily(prefix string) string {
 func addRouteCommands(plan Plan) [][]string {
 	commands := make([][]string, 0, len(plan.Routes))
 	for _, prefix := range plan.Routes {
-		family := routeFamily(prefix)
-		nextHop := "0.0.0.0"
-		if family == "ipv6" {
-			nextHop = "::"
-		}
-		commands = append(commands, []string{
-			"netsh", "interface", family, "add", "route",
-			"prefix=" + prefix, "interface=" + plan.Name,
-			"nexthop=" + nextHop, fmt.Sprintf("metric=%d", routeMetric), "store=active",
-		})
+		commands = append(commands, addRouteCommand(plan, prefix))
 	}
 	return commands
+}
+
+func addRouteCommand(plan Plan, prefix string) []string {
+	family := routeFamily(prefix)
+	nextHop := "0.0.0.0"
+	if family == "ipv6" {
+		nextHop = "::"
+	}
+	return []string{
+		"netsh", "interface", family, "add", "route",
+		"prefix=" + prefix, "interface=" + plan.Name,
+		"nexthop=" + nextHop, fmt.Sprintf("metric=%d", routeMetric), "store=active",
+	}
 }
 
 func deleteRouteCommands(plan Plan) [][]string {
 	commands := make([][]string, 0, len(plan.Routes))
 	for _, prefix := range plan.Routes {
-		commands = append(commands, []string{
-			"netsh", "interface", routeFamily(prefix), "delete", "route",
-			"prefix=" + prefix, "interface=" + plan.Name, "store=active",
-		})
+		commands = append(commands, deleteRouteCommand(plan, prefix))
 	}
 	return commands
+}
+
+func deleteRouteCommand(plan Plan, prefix string) []string {
+	return []string{
+		"netsh", "interface", routeFamily(prefix), "delete", "route",
+		"prefix=" + prefix, "interface=" + plan.Name, "store=active",
+	}
 }
 
 const multicastRuleName = "SKIPI TUN multicast block"

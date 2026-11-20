@@ -465,3 +465,46 @@ func TestPlanDecodesTheHostsDevicePlan(t *testing.T) {
 		t.Fatal("a plan needs the adapter name")
 	}
 }
+
+func TestNativeRoutesStartNoProcessAndAreRemovedNatively(t *testing.T) {
+	r := &recorder{}
+	routes := &fakeRoutes{}
+	n := nativeNet(r, routes)
+
+	if err := n.Attach(ipv4Plan); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"skipi0 0.0.0.0/1", "skipi0 128.0.0.0/1"}; !reflect.DeepEqual(routes.added, want) {
+		t.Fatalf("added %v", routes.added)
+	}
+	for _, c := range r.commands() {
+		if c[0] == "netsh" {
+			t.Fatalf("a native route must not start netsh: %v", c)
+		}
+	}
+
+	_ = n.Detach()
+	if want := []string{"skipi0 0.0.0.0/1", "skipi0 128.0.0.0/1"}; !reflect.DeepEqual(routes.deleted, want) {
+		t.Fatalf("deleted %v", routes.deleted)
+	}
+}
+
+// The native path is new; a route the system refuses natively is still installed the way it always was.
+func TestAFailedNativeRouteFallsBackToNetsh(t *testing.T) {
+	r := &recorder{}
+	routes := &fakeRoutes{addErr: errors.New("ERROR_INVALID_PARAMETER")}
+	n := nativeNet(r, routes)
+
+	if err := n.Attach(ipv4Plan); err != nil {
+		t.Fatalf("netsh must take over: %v", err)
+	}
+	var adds [][]string
+	for _, c := range r.commands() {
+		if c[0] == "netsh" && slices.Contains(c, "add") {
+			adds = append(adds, c)
+		}
+	}
+	if !reflect.DeepEqual(adds, addRouteCommands(ipv4Plan)) {
+		t.Fatalf("got %v", adds)
+	}
+}

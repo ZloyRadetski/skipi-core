@@ -24,6 +24,13 @@ const commandTimeout = 30 * time.Second
 func applyPlatformDefaults(cfg *Config) {
 	if cfg.Run == nil {
 		cfg.Run = runHidden
+		// With the real command runner the routes go in natively, without a process each.
+		if cfg.AddRoute == nil {
+			cfg.AddRoute = nativeAddRoute
+		}
+		if cfg.DeleteRoute == nil {
+			cfg.DeleteRoute = nativeDeleteRoute
+		}
 	}
 	if cfg.ListAdapters == nil {
 		cfg.ListAdapters = netbind.AdapterNames
