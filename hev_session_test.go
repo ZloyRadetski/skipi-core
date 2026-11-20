@@ -58,8 +58,10 @@ type fakeHev struct {
 	// reports not ready yet. Later calls are not held.
 	firstWaitGate chan struct{}
 	waits         atomic.Int32
+	// readyOK, once set, ends the readyErr answers of WaitReady.
+	readyOK atomic.Bool
 	// exited, when set, is what Exited returns: closed when hev ended. nil makes the session poll.
-	exited chan struct{}
+	exited      chan struct{}
 	running     atomic.Bool
 	stats       [4]uint64
 	gotCfg      atomic.Value
@@ -96,7 +98,7 @@ func (f *fakeHev) WaitReady(timeout time.Duration) error {
 		<-f.firstWaitGate
 		return hevtun.ErrReadyTimeout
 	}
-	if f.readyErr != nil {
+	if f.readyErr != nil && !f.readyOK.Load() {
 		time.Sleep(min(timeout, 10*time.Millisecond))
 		return f.readyErr
 	}
@@ -614,7 +616,7 @@ func TestSessionWaitsForTheTargetsOwnReadyBudget(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- c.StartSession(hevPlanWith(t, macHevBlock(t, nil)), 0) }()
 	time.Sleep(300 * time.Millisecond) // well past the session default, within the target budget
-	hev.readyErr = nil
+	hev.readyOK.Store(true)
 	select {
 	case err := <-done:
 		if err != nil {

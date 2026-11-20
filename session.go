@@ -201,8 +201,9 @@ func (c *CoreController) StartSession(planJSON string, tunFd int64) error {
 		err    error
 	}
 	parsed := make(chan loaded, 1)
+	parse := loadXrayConfig // read here, not in the goroutine, which may outlive a failed start
 	go func() {
-		config, err := loadXrayConfig(plan.XrayConfig)
+		config, err := parse(plan.XrayConfig)
 		parsed <- loaded{config, err}
 	}()
 	load := func() (*core.Config, error) {

@@ -289,7 +289,7 @@ func (c *CoreController) runStart(myGen uint64, load func() (*core.Config, error
 	c.mu.Unlock()
 	c.deliverStates()
 	if ownsHev {
-		go c.watchHev(myGen)
+		go c.watchHev(myGen, hevTun, hevWatchInterval)
 	}
 
 	if c.callback != nil {

@@ -65,7 +65,10 @@ const hevExitedReason = "HEV TUN exited unexpectedly"
 
 // watchHev stops session gen when HEV TUN exits under it: without hev the TUN drops every packet
 // while Xray and the session still look healthy. It returns once that session is no longer running.
-func (c *CoreController) watchHev(gen uint64) {
+//
+// The target and the poll interval are read by the caller, not here: this goroutine can outlive
+// the session by a moment, and the package variables are swapped by tests (and by nothing else).
+func (c *CoreController) watchHev(gen uint64, tun hevTunnel, interval time.Duration) {
 	stillCurrent := func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -77,20 +80,20 @@ func (c *CoreController) watchHev(gen uint64) {
 	}
 	// Where the target reports the exit, wait for it: no wake-ups, and the stop follows at once.
 	// A normal stop ends hev too, and the check below then finds the session no longer current.
-	if exited := hevTun.Exited(); exited != nil {
+	if exited := tun.Exited(); exited != nil {
 		<-exited
 		if stillCurrent() {
 			exitedUnder()
 		}
 		return
 	}
-	ticker := time.NewTicker(hevWatchInterval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
 		if !stillCurrent() {
 			return
 		}
-		if hevTun.Running() {
+		if tun.Running() {
 			continue
 		}
 		exitedUnder()

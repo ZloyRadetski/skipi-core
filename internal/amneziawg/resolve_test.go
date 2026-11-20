@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sync/atomic"
 	"syscall"
 	"testing"
 )
@@ -61,13 +62,13 @@ func TestAmneziaWgEndpointLookupFallsBackToConfiguredDNS(t *testing.T) {
 
 // C6: the lookup of the peer's name goes out through a socket the caller can protect or bind.
 func TestConfiguredDNSLookupDialsThroughTheGivenControl(t *testing.T) {
-	called := 0
+	var called atomic.Int32
 	control := func(network, address string, c syscall.RawConn) error {
-		called++
+		called.Add(1)
 		return errors.New("refused by the protector")
 	}
 	_, err := LookupHostWithConfiguredDNS(context.Background(), "relay.example", []netip.Addr{netip.MustParseAddr("127.0.0.1")}, control)
-	if err == nil || called == 0 {
-		t.Fatalf("err = %v, control called %d times", err, called)
+	if err == nil || called.Load() == 0 {
+		t.Fatalf("err = %v, control called %d times", err, called.Load())
 	}
 }
