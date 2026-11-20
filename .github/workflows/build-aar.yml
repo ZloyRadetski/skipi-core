@@ -57,8 +57,7 @@ jobs:
         # exact dependency versions pinned in go.mod / go.sum.
         # scripts/build-android.sh builds the HEV TUN static libraries (NDK) and then runs gomobile bind.
         env:
-          GOMOBILE_EXTRA_FLAGS: -v -trimpath
-          SKIPI_LDFLAGS: -s -w -buildid= -checklinkname=0
+          GOMOBILE_EXTRA_FLAGS: -v
         run: bash scripts/build-android.sh
 
       - name: Upload AAR Artifact

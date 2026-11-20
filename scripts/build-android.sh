@@ -2,8 +2,9 @@
 # Builds skipicore.aar: HEV TUN static libraries first, then the gomobile bind that links them
 # into libgojni.so. Needs ANDROID_NDK_HOME, Go, and gomobile (go install golang.org/x/mobile/cmd/gomobile@latest; gomobile init).
 #
-# Extra gomobile flags can be passed through GOMOBILE_EXTRA_FLAGS (CI adds -v -trimpath and a
-# stripped -ldflags through it); the default ldflags only carry -checklinkname=0.
+# The library is built like the release in CI by default: -trimpath and stripped ldflags
+# (-s -w -buildid=), about half the size of an unstripped one. For a debuggable local build pass
+# SKIPI_LDFLAGS=-checklinkname=0. Extra gomobile flags go through GOMOBILE_EXTRA_FLAGS.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,9 +16,9 @@ cd "$ROOT"
 # 16 KB page alignment keeps the native library valid on Android 15+.
 export CGO_LDFLAGS="${CGO_LDFLAGS:-} -Wl,-z,max-page-size=16384"
 
-LDFLAGS="${SKIPI_LDFLAGS:--checklinkname=0}"
+LDFLAGS="${SKIPI_LDFLAGS:--s -w -buildid= -checklinkname=0}"
 # shellcheck disable=SC2086
-gomobile bind ${GOMOBILE_EXTRA_FLAGS:-} -target=android -androidapi 24 -javapkg=app.skipi.core \
+gomobile bind -trimpath ${GOMOBILE_EXTRA_FLAGS:-} -target=android -androidapi 24 -javapkg=app.skipi.core \
   -ldflags="$LDFLAGS" -o skipicore.aar .
 
 echo "built $ROOT/skipicore.aar"
