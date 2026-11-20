@@ -42,6 +42,12 @@ type CoreController struct {
 	ownsAwg            bool                        // the running session started AmneziaWG; guarded by mu
 	ownsHev            bool                        // the running session started HEV TUN; guarded by mu
 	stateListener      atomic.Pointer[listenerBox] // see SetStateListener
+
+	// Transitions are queued under mu in the order they happen and handed to the listener in
+	// that order by one goroutine at a time (see deliverStates).
+	eventsMu   sync.Mutex
+	events     []queuedState
+	delivering bool
 }
 
 // NewCoreController creates a new CoreController with the provided callback handler.
@@ -88,6 +94,14 @@ var (
 		}
 		return real.Start()
 	}
+)
+
+// Test hooks; nil in production.
+var (
+	// testHookAfterStopUnlock runs once a stop has made the controller idle again.
+	testHookAfterStopUnlock func()
+	// testHookBeforeDeliver runs before the state listener hears a transition.
+	testHookBeforeDeliver func(state int)
 )
 
 // ErrStopTimedOut marks a stop that gave up waiting for Xray (or AmneziaWG) to close. The
@@ -147,8 +161,9 @@ func (c *CoreController) beginStart() (uint64, error) {
 	c.trafficStatsTotals = make(map[string]int64)
 	c.ownsAwg = false
 	c.ownsHev = false
+	c.queueStateLocked(stateStarting, "")
 	c.mu.Unlock()
-	c.notifyState(stateStarting, "")
+	c.deliverStates()
 	return myGen, nil
 }
 
@@ -202,9 +217,7 @@ func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, 
 	server, err := createCoreInstance(config)
 	if err != nil {
 		err = fmt.Errorf("failed to create xray instance: %w", err)
-		if fail(err) {
-			clearTunFdEnv()
-		}
+		fail(err)
 		return err
 	}
 	if c.superseded(myGen) {
@@ -231,9 +244,7 @@ func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, 
 		_, _ = lifecycle.RunBounded(server.Close, defaultStopTimeout, nil)
 		connlog.Clear(connLog)
 		err = fmt.Errorf("failed to start xray instance: %w", err)
-		if fail(err) {
-			clearTunFdEnv()
-		}
+		fail(err)
 		return err
 	}
 
@@ -245,9 +256,7 @@ func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, 
 			if errors.Is(err, errStartAborted) {
 				return err // ForceStop already reset the controller; the caller stops AmneziaWG
 			}
-			if fail(err) {
-				clearTunFdEnv()
-			}
+			fail(err)
 			return err
 		}
 	}
@@ -259,7 +268,7 @@ func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, 
 		connlog.Clear(connLog)
 		lifecycle.CloseInBackground(server)
 		if ownsHev {
-			_ = stopHevBounded(defaultStopTimeout, nil)
+			_ = stopHevIfOwned(c, myGen, defaultStopTimeout)
 		}
 		return errStartAborted
 	}
@@ -272,8 +281,9 @@ func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, 
 	c.ownsAwg = ownsAwg
 	c.ownsHev = ownsHev
 	c.isRunning.Store(true)
+	c.queueStateLocked(stateRunning, "")
 	c.mu.Unlock()
-	c.notifyState(stateRunning, "")
+	c.deliverStates()
 	if ownsHev {
 		go c.watchHev(myGen)
 	}
@@ -294,19 +304,21 @@ func (c *CoreController) superseded(gen uint64) bool {
 }
 
 // failStart returns the controller to idle after start attempt gen failed and tells the state
-// listener why. It reports whether that attempt was still the current one, i.e. whether it owns
-// the process-wide env vars.
+// listener why. It reports whether that attempt was still the current one. The TUN descriptor it
+// may have published is dropped before the controller is idle, so a next start's is never touched.
 func (c *CoreController) failStart(gen uint64, detail string) bool {
 	c.mu.Lock()
 	if c.gen != gen || c.state != stateStarting {
 		c.mu.Unlock()
 		return false
 	}
+	clearTunFdEnv()
 	c.state = stateIdle
 	c.statsManager = nil
 	c.trafficStatsTotals = nil
+	c.queueStateLocked(stateIdle, detail)
 	c.mu.Unlock()
-	c.notifyState(stateIdle, detail)
+	c.deliverStates()
 	return true
 }
 
@@ -362,18 +374,33 @@ func (c *CoreController) stopWithinReason(d time.Duration, reason string) error 
 	ownsHev := c.ownsHev
 	c.stop = op
 	c.state = stateStopping
+	c.queueStateLocked(stateStopping, "")
 	c.mu.Unlock()
-	c.notifyState(stateStopping, "")
+	c.deliverStates()
 
 	// Reverse of the start order: HEV TUN, then Xray, then AmneziaWG, each bounded by d.
 	var hevErr error
 	if ownsHev {
 		hevErr = stopHevBounded(d, op.Force())
+		releaseHevOwner()
 	}
 	closeErr, timedOut := lifecycle.RunBounded(inst.Close, d, op.Force())
 	var awgErr error
 	if ownsAwg {
 		awgErr = stopAnyAmneziaWg(d.Milliseconds())
+	}
+
+	stopErr := closeErr
+	if timedOut {
+		stopErr = fmt.Errorf("%w: xray instance did not close within %v", ErrStopTimedOut, d)
+	}
+	stopErr = errors.Join(hevErr, stopErr, awgErr)
+	detail := reason
+	if stopErr != nil {
+		if detail != "" {
+			detail += ": "
+		}
+		detail += stopErr.Error()
 	}
 
 	c.mu.Lock()
@@ -386,27 +413,18 @@ func (c *CoreController) stopWithinReason(d time.Duration, reason string) error 
 	c.stop = nil
 	c.ownsAwg = false
 	c.ownsHev = false
-	c.state = stateIdle
-	c.mu.Unlock()
-
-	// Drop the TUN descriptor env vars so later instances (latency probes,
-	// URL-test racers) never observe an already-closed file descriptor.
+	// Drop the TUN descriptor env vars so later instances (latency probes, URL-test racers) never
+	// observe an already-closed file descriptor. This happens before the controller is idle: a
+	// start can only begin after it, so its own descriptor is never cleared here.
 	clearTunFdEnv()
-
-	stopErr := closeErr
-	if timedOut {
-		stopErr = fmt.Errorf("%w: xray instance did not close within %v", ErrStopTimedOut, d)
+	c.state = stateIdle
+	c.queueStateLocked(stateIdle, detail)
+	c.mu.Unlock()
+	if testHookAfterStopUnlock != nil {
+		testHookAfterStopUnlock()
 	}
-	stopErr = errors.Join(hevErr, stopErr, awgErr)
 	op.Finish(stopErr)
-	detail := reason
-	if stopErr != nil {
-		if detail != "" {
-			detail += ": "
-		}
-		detail += stopErr.Error()
-	}
-	c.notifyState(stateIdle, detail)
+	c.deliverStates()
 
 	if c.callback != nil {
 		c.callback.Shutdown()
@@ -438,9 +456,10 @@ func (c *CoreController) ForceStop() error {
 		c.ownsAwg = false
 		c.ownsHev = false
 		clearTunFdEnv()
-		c.mu.Unlock()
 		xrayErr = fmt.Errorf("%w: the start in flight was abandoned", ErrStopTimedOut)
-		c.notifyState(stateIdle, xrayErr.Error())
+		c.queueStateLocked(stateIdle, xrayErr.Error())
+		c.mu.Unlock()
+		c.deliverStates()
 	case stateStopping:
 		op := c.stop
 		c.mu.Unlock()
@@ -459,6 +478,7 @@ func (c *CoreController) ForceStop() error {
 	// it is stopped (a no-op when it is not running).
 	if !hevStopped {
 		hevErr = stopHevBounded(forceStopTimeout, nil)
+		releaseHevOwner()
 	}
 	return errors.Join(xrayErr, hevErr, stopAnyAmneziaWg(forceStopTimeout.Milliseconds()))
 }

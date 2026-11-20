@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/ZloyRadetski/skipi-core/internal/hevtun"
@@ -93,6 +94,45 @@ type sessionPlanHev struct {
 	MacInterface *hevtun.MacInterface `json:"macInterface"`
 }
 
+// hevOwner is the start attempt (controller and generation) that started the HEV TUN now running.
+// HEV TUN is a process singleton: a start that ForceStop aborted cleans up after itself late,
+// and by then a newer session may run its own hev, which that cleanup must leave alone.
+var hevOwner struct {
+	sync.Mutex
+	c   *CoreController
+	gen uint64
+}
+
+func claimHev(c *CoreController, gen uint64) {
+	hevOwner.Lock()
+	hevOwner.c, hevOwner.gen = c, gen
+	hevOwner.Unlock()
+}
+
+// releaseHevOwner forgets the owner after a stop that stopped HEV TUN whoever started it.
+func releaseHevOwner() {
+	hevOwner.Lock()
+	hevOwner.c, hevOwner.gen = nil, 0
+	hevOwner.Unlock()
+}
+
+// stopHevIfOwned stops HEV TUN only while start attempt gen of c still owns it.
+func stopHevIfOwned(c *CoreController, gen uint64, d time.Duration) error {
+	hevOwner.Lock()
+	owned := hevOwner.c == c && hevOwner.gen == gen
+	hevOwner.Unlock()
+	if !owned {
+		return nil
+	}
+	err := stopHevBounded(d, nil)
+	hevOwner.Lock()
+	if hevOwner.c == c && hevOwner.gen == gen {
+		hevOwner.c, hevOwner.gen = nil, 0
+	}
+	hevOwner.Unlock()
+	return err
+}
+
 // stopHevBounded stops HEV TUN within d; a stop that hangs is counted in AbandonedInstances
 // until it returns and reported as ErrStopTimedOut. cancel, when set, also ends the wait.
 func stopHevBounded(d time.Duration, cancel <-chan struct{}) error {
@@ -113,20 +153,21 @@ func (c *CoreController) startSessionHev(gen uint64, cfg *sessionPlanHev) error 
 		return errStartAborted
 	}
 	opts := hevtun.Options{TunFd: cfg.TunFd, Executable: cfg.Executable, RunDirectory: cfg.RunDirectory, MacInterface: cfg.MacInterface}
+	claimHev(c, gen)
 	if err := hevTun.Start(cfg.ConfigYAML, opts); err != nil {
-		_ = stopHevBounded(defaultStopTimeout, nil)
+		_ = stopHevIfOwned(c, gen, defaultStopTimeout)
 		return fmt.Errorf("HEV TUN failed to start: %w", err)
 	}
 	readyTimeout := max(hevReadyTimeout, hevTun.ReadyTimeout())
 	deadline := time.Now().Add(readyTimeout)
 	for {
 		if c.superseded(gen) {
-			_ = stopHevBounded(defaultStopTimeout, nil)
+			_ = stopHevIfOwned(c, gen, defaultStopTimeout)
 			return errStartAborted
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			_ = stopHevBounded(defaultStopTimeout, nil)
+			_ = stopHevIfOwned(c, gen, defaultStopTimeout)
 			return fmt.Errorf("HEV TUN was not ready: timed out after %v", readyTimeout)
 		}
 		err := hevTun.WaitReady(min(remaining, hevReadyPoll))
@@ -136,7 +177,7 @@ func (c *CoreController) startSessionHev(gen uint64, cfg *sessionPlanHev) error 
 		if errors.Is(err, hevtun.ErrReadyTimeout) {
 			continue
 		}
-		_ = stopHevBounded(defaultStopTimeout, nil)
+		_ = stopHevIfOwned(c, gen, defaultStopTimeout)
 		return fmt.Errorf("HEV TUN was not ready: %w", err)
 	}
 }

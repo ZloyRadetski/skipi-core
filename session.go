@@ -23,9 +23,10 @@ const (
 	SessionStopping = 3
 )
 
-// StateListener is told about every session state change. It is called synchronously on the
-// goroutine that caused the change, after the controller released its lock, so it may call back
-// into the controller. A panic in it is recovered; keep it quick.
+// StateListener is told about every session state change, in the order the changes happened. It
+// is called after the controller released its lock, so it may call back into the controller,
+// normally on the goroutine that caused the change; while another goroutine is still delivering
+// earlier changes, that one delivers this one too. A panic in it is recovered; keep it quick.
 type StateListener interface {
 	OnStateChanged(state int, detail string)
 }
@@ -49,13 +50,50 @@ func (c *CoreController) State() int {
 	return int(c.state)
 }
 
-// notifyState tells the listener about a transition. Callers must not hold c.mu.
+type queuedState struct {
+	state  lifecycleState
+	detail string
+}
+
+// queueStateLocked records a transition for the listener. Callers hold c.mu and made the
+// transition in the same critical section, so the queue has the order the transitions had.
+func (c *CoreController) queueStateLocked(s lifecycleState, detail string) {
+	c.eventsMu.Lock()
+	c.events = append(c.events, queuedState{state: s, detail: detail})
+	c.eventsMu.Unlock()
+}
+
+// deliverStates hands the queued transitions to the listener in order. Only one goroutine
+// delivers at a time; a caller that finds another one delivering leaves its events to it.
+// Callers must not hold c.mu (the listener may call back into the controller).
+func (c *CoreController) deliverStates() {
+	c.eventsMu.Lock()
+	if c.delivering {
+		c.eventsMu.Unlock()
+		return
+	}
+	c.delivering = true
+	for len(c.events) > 0 {
+		e := c.events[0]
+		c.events = c.events[1:]
+		c.eventsMu.Unlock()
+		c.notifyState(e.state, e.detail)
+		c.eventsMu.Lock()
+	}
+	c.delivering = false
+	c.eventsMu.Unlock()
+}
+
+// notifyState tells the listener about one transition; deliverStates calls it in order.
 func (c *CoreController) notifyState(s lifecycleState, detail string) {
 	box := c.stateListener.Load()
 	if box == nil {
 		return
 	}
 	defer func() { _ = recover() }()
+	if testHookBeforeDeliver != nil {
+		testHookBeforeDeliver(int(s))
+	}
 	box.l.OnStateChanged(int(s), detail)
 }
 

@@ -54,6 +54,10 @@ type fakeHev struct {
 	readyErr    error // returned by every WaitReady slice
 	stopRelease chan struct{}
 	stopEntered chan struct{}
+	// firstWaitGate, when set, holds the first WaitReady until it is closed; that call then
+	// reports not ready yet. Later calls are not held.
+	firstWaitGate chan struct{}
+	waits         atomic.Int32
 	running     atomic.Bool
 	stats       [4]uint64
 	gotCfg      atomic.Value
@@ -86,6 +90,10 @@ func (f *fakeHev) Start(cfg string, opts hevtun.Options) error {
 
 func (f *fakeHev) WaitReady(timeout time.Duration) error {
 	f.log.add("hev.waitReady")
+	if f.firstWaitGate != nil && f.waits.Add(1) == 1 {
+		<-f.firstWaitGate
+		return hevtun.ErrReadyTimeout
+	}
 	if f.readyErr != nil {
 		time.Sleep(min(timeout, 10*time.Millisecond))
 		return f.readyErr
