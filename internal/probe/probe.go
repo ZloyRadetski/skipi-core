@@ -24,16 +24,46 @@ import (
 	coreserial "github.com/xtls/xray-core/infra/conf/serial"
 
 	"github.com/ZloyRadetski/skipi-core/internal/connlog"
+	"github.com/ZloyRadetski/skipi-core/internal/lifecycle"
 )
+
+// Every probe builds a whole Xray instance. The host decides how many it runs at once, but Core
+// bounds that itself, and a Close that hangs is abandoned (and counted) instead of holding the
+// probe's caller.
+const defaultProbeSlots = 32
+
+var (
+	// newProbeInstance builds the stripped-down instance of one probe. Tests replace it.
+	newProbeInstance = startOutboundTestInstance
+	probeSlots       = make(chan struct{}, defaultProbeSlots)
+	// probeCloseTimeout bounds closing a probe instance.
+	probeCloseTimeout = 5 * time.Second
+)
+
+func setProbeSlots(n int) { probeSlots = make(chan struct{}, n) }
+
+// acquireProbeSlot waits for room for one more probe instance and returns its release.
+func acquireProbeSlot() func() {
+	slots := probeSlots
+	slots <- struct{}{}
+	return func() { <-slots }
+}
+
+// closeProbeInstance closes a probe instance within probeCloseTimeout.
+func closeProbeInstance(c io.Closer) {
+	_, _ = lifecycle.RunBounded(c.Close, probeCloseTimeout, nil)
+}
 
 // Delay tests the latency of an outbound proxy configuration against a target URL.
 // It optimizes performance by stripping inbounds and non-essential app modules.
 func Delay(configJSON string, targetURL string) (int64, error) {
-	server, err := startOutboundTestInstance(configJSON)
+	release := acquireProbeSlot()
+	defer release()
+	server, err := newProbeInstance(configJSON)
 	if err != nil {
 		return -1, err
 	}
-	defer server.Close()
+	defer closeProbeInstance(server)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
@@ -51,7 +81,43 @@ type outboundDownloadResult struct {
 	StatusCode      int   `json:"statusCode"`
 }
 
-var outboundDownloadCancels sync.Map // map[string]context.CancelFunc
+// downloads tracks the cancel of every download that has a request ID. A cancel for an ID that is
+// not running yet is kept for a while, so a cancel that overtakes its download is not lost.
+var downloads struct {
+	sync.Mutex
+	running map[string]context.CancelFunc
+	early   map[string]time.Time
+}
+
+const (
+	earlyCancelTTL = time.Minute
+	maxEarlyCancel = 256
+)
+
+var errDownloadCancelled = errors.New("download was cancelled")
+
+// registerDownload records cancel for id; it reports false when id was cancelled already.
+func registerDownload(id string, cancel context.CancelFunc) bool {
+	downloads.Lock()
+	defer downloads.Unlock()
+	if at, ok := downloads.early[id]; ok {
+		delete(downloads.early, id)
+		if time.Since(at) < earlyCancelTTL {
+			return false
+		}
+	}
+	if downloads.running == nil {
+		downloads.running = make(map[string]context.CancelFunc)
+	}
+	downloads.running[id] = cancel
+	return true
+}
+
+func unregisterDownload(id string) {
+	downloads.Lock()
+	delete(downloads.running, id)
+	downloads.Unlock()
+}
 
 const (
 	maxOutboundDownloadBytes         int64 = 100 << 20
@@ -84,21 +150,33 @@ func Download(
 		return "", errors.New("download target URL is empty")
 	}
 
-	server, err := startOutboundTestInstance(configJSON)
+	// The cancel is reachable before the instance exists: building it takes a while, and a
+	// cancel in that time must still stop the download.
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if requestID != "" {
+		if !registerDownload(requestID, cancel) {
+			return "", errDownloadCancelled
+		}
+		defer unregisterDownload(requestID)
+	}
+
+	release := acquireProbeSlot()
+	defer release()
+	if cancelCtx.Err() != nil {
+		return "", errDownloadCancelled
+	}
+	server, err := newProbeInstance(configJSON)
 	if err != nil {
 		return "", err
 	}
-	defer server.Close()
-
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		time.Duration(timeoutMillis)*time.Millisecond,
-	)
-	defer cancel()
-	if requestID != "" {
-		outboundDownloadCancels.Store(requestID, context.CancelFunc(cancel))
-		defer outboundDownloadCancels.Delete(requestID)
+	defer closeProbeInstance(server)
+	if cancelCtx.Err() != nil {
+		return "", errDownloadCancelled
 	}
+
+	ctx, stop := context.WithTimeout(cancelCtx, time.Duration(timeoutMillis)*time.Millisecond)
+	defer stop()
 
 	result, err := instanceDownload(ctx, server, targetURL, maxBytes)
 	if err != nil {
@@ -118,9 +196,23 @@ func CancelDownload(requestID string) {
 	if requestID == "" {
 		return
 	}
-	if cancel, ok := outboundDownloadCancels.Load(requestID); ok {
-		cancel.(context.CancelFunc)()
+	downloads.Lock()
+	defer downloads.Unlock()
+	if cancel, ok := downloads.running[requestID]; ok {
+		cancel()
+		return
 	}
+	// Not running yet (or already done): keep the cancel briefly for a download that comes late.
+	now := time.Now()
+	if downloads.early == nil {
+		downloads.early = make(map[string]time.Time)
+	}
+	for id, at := range downloads.early {
+		if now.Sub(at) >= earlyCancelTTL || len(downloads.early) >= maxEarlyCancel {
+			delete(downloads.early, id)
+		}
+	}
+	downloads.early[requestID] = now
 }
 
 // startOutboundTestInstance strips a normal app configuration down to the
@@ -339,11 +431,13 @@ func FastSelect(configJSON string, candidateTags string, probeURL string, timeou
 
 	// Same stripped-down instance as the other probes: no inbounds, routing, geo data or
 	// observatory, only what a forced-outbound dial needs.
-	server, err := startOutboundTestInstance(configJSON)
+	release := acquireProbeSlot()
+	defer release()
+	server, err := newProbeInstance(configJSON)
 	if err != nil {
 		return candidates[0]
 	}
-	defer server.Close()
+	defer closeProbeInstance(server)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
