@@ -57,6 +57,11 @@ type Config struct {
 	// are optional: without them, or when one fails, the route goes in through netsh as it always did.
 	AddRoute    func(adapter string, prefix netip.Prefix) error
 	DeleteRoute func(adapter string, prefix netip.Prefix) error
+	// SetDNS gives the adapter its DNS servers and the lowest interface metric, and FlushDNS drops the resolver
+	// cache; both through the system's API, without a process. Optional like the routes: without them, or when one
+	// fails, the PowerShell script that did this before runs in the background.
+	SetDNS   func(adapter string, servers []netip.Addr) error
+	FlushDNS func() error
 
 	Sleep    func(time.Duration)
 	Attempts int           // polls for the adapter before giving up
@@ -113,12 +118,18 @@ func (n *Net) Attach(plan Plan) error {
 	if err != nil {
 		return err
 	}
-	n.dnsApplied = dns != nil
+	servers := dnsServers(plan)
+	n.dnsApplied = len(servers) > 0
 
 	if failed := firstError(n.runAll(n.routeTasks(plan, true))); failed != nil {
 		n.runAll(n.routeTasks(plan, false))
 		_ = n.cfg.Run(multicastUnblockCommand())
 		return failed
+	}
+	// The DNS servers decide where the first lookups go, so they are set before the connect returns; set natively
+	// that is a call, not a process. Only when it fails does the old script follow in the background.
+	if len(servers) > 0 && n.cfg.SetDNS != nil && n.cfg.SetDNS(plan.Name, servers) == nil {
+		dns = nil
 	}
 	for _, command := range [][]string{dns, block} {
 		if command != nil {
@@ -146,7 +157,7 @@ func (n *Net) Detach() error {
 	n.dnsApplied = false
 	n.background(func() {
 		_ = n.cfg.Run(multicastUnblockCommand())
-		if flush {
+		if flush && (n.cfg.FlushDNS == nil || n.cfg.FlushDNS() != nil) {
 			_ = n.cfg.Run(dnsFlushCommand())
 		}
 	})
@@ -356,6 +367,17 @@ func multicastUnblockCommand() []string {
 	return powershell(fmt.Sprintf("Remove-NetFirewallRule -DisplayName '%s' -ErrorAction SilentlyContinue", multicastRuleName))
 }
 
+// dnsServers are the plan's DNS servers that are IP addresses; anything else is dropped.
+func dnsServers(plan Plan) []netip.Addr {
+	var servers []netip.Addr
+	for _, server := range plan.DNS {
+		if addr, err := netip.ParseAddr(strings.TrimSpace(server)); err == nil {
+			servers = append(servers, addr)
+		}
+	}
+	return servers
+}
+
 // dnsCommand gives the adapter the plan's DNS servers and the lowest interface metric. Windows keeps the DNS
 // servers of the physical adapter and its DNS client sends a query out of the adapter that owns the server,
 // so a tunnel adapter without DNS never resolves through the tunnel. Nil when the plan has no DNS: the system
@@ -365,10 +387,8 @@ func dnsCommand(plan Plan) ([]string, error) {
 		return nil, errors.New("invalid adapter name")
 	}
 	var servers []string
-	for _, server := range plan.DNS {
-		if addr, err := netip.ParseAddr(strings.TrimSpace(server)); err == nil {
-			servers = append(servers, "'"+addr.String()+"'")
-		}
+	for _, addr := range dnsServers(plan) {
+		servers = append(servers, "'"+addr.String()+"'")
 	}
 	if len(servers) == 0 {
 		return nil, nil

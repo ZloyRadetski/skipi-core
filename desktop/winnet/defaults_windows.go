@@ -31,6 +31,12 @@ func applyPlatformDefaults(cfg *Config) {
 		if cfg.DeleteRoute == nil {
 			cfg.DeleteRoute = nativeDeleteRoute
 		}
+		if cfg.SetDNS == nil {
+			cfg.SetDNS = nativeSetDNS
+		}
+		if cfg.FlushDNS == nil {
+			cfg.FlushDNS = nativeFlushDNS
+		}
 	}
 	if cfg.ListAdapters == nil {
 		cfg.ListAdapters = netbind.AdapterNames
