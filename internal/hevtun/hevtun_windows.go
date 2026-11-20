@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -313,6 +314,9 @@ func Start(configYAML string, opts Options) error {
 	out := &outputWriter{}
 	cmd := exec.Command(executable, cfgPath)
 	cmd.Dir = filepath.Dir(executable)
+	// hev is a console program and Core lives in a GUI process: without this flag every tunnel
+	// start opens a console window. Its output is piped to Core's log, so nothing is lost.
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW, HideWindow: true}
 	cmd.Stdout = out
 	cmd.Stderr = out
 	cmd.WaitDelay = 2 * time.Second // a grandchild holding the pipe must not hang Wait

@@ -127,3 +127,16 @@ func TestWindowsConfigIsWritableOnlyBySystemAdministratorsAndTheOwner(t *testing
 		}
 	}
 }
+
+// hev is a console program, and Core lives in a GUI process: started plainly it opens a console
+// window of its own on every tunnel start. It runs without one; its output is piped to Core's log.
+func TestWindowsHevRunsWithoutAConsoleWindow(t *testing.T) {
+	isolate(t)
+	if err := Start("mode: run\n", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	attr := current().cmd.SysProcAttr
+	if attr == nil || attr.CreationFlags&windows.CREATE_NO_WINDOW == 0 {
+		t.Fatalf("SysProcAttr = %+v, want CREATE_NO_WINDOW", attr)
+	}
+}
