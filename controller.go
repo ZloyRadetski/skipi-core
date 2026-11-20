@@ -6,7 +6,6 @@ package skipicore
 import (
 	"errors"
 	"fmt"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -185,7 +184,7 @@ func (c *CoreController) runStart(myGen uint64, configJSON string, tunFd int64, 
 	resumeGC := runtimetuning.PauseGCForStartup()
 	defer func() {
 		resumeGC()
-		go runtime.GC()
+		go releaseMemory()
 	}()
 
 	config, err := coreserial.LoadJSONConfig(strings.NewReader(configJSON))
@@ -430,6 +429,7 @@ func (c *CoreController) stopWithinReason(d time.Duration, reason string) error 
 		c.callback.Shutdown()
 		c.callback.OnEmitStatus(0, "Core stopped")
 	}
+	go releaseMemory()
 
 	return stopErr
 }

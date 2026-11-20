@@ -38,6 +38,11 @@ func ReadMemoryStats() string {
 	return memstats.JSON()
 }
 
+// releaseMemory collects and hands freed memory back to the OS. Core runs it in the background
+// after a start (the parsed config and geo data are garbage then) and after a stop (the whole
+// instance is). A variable so tests can count it.
+var releaseMemory = debug.FreeOSMemory
+
 // ForceFreeMemory triggers a garbage collection cycle and releases unused memory back to the OS.
 func ForceFreeMemory() {
 	debug.FreeOSMemory()

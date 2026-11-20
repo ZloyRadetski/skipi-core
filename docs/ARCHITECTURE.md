@@ -34,7 +34,7 @@ internal/probe        delay / download / fast-select implementations
 internal/certfetch    TLS and QUIC certificate fingerprints
 internal/memstats     runtime/metrics reading
 internal/amneziawg    value parsing/validation, endpoint resolution, SOCKS5 wire helpers, outbound rewrite
-internal/runtimetuning GC percent, memory limit, GOMAXPROCS, startup GC pause
+internal/runtimetuning GC percent and soft memory limit (mobile only), GOMAXPROCS, startup GC pause
 internal/assets       Xray asset reader (filesystem on desktop, APK fallback on Android/iOS)
 
 desktop/              bridge (C exports), netbind, nmtun, notify, tunhost, include (C header)

@@ -3,7 +3,9 @@ package skipicore
 import (
 	"encoding/json"
 	"runtime"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestMemoryStats(t *testing.T) {
@@ -50,4 +52,35 @@ func BenchmarkLegacyReadMemStats(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		runtime.ReadMemStats(&m)
 	}
+}
+
+// Perf 5: a start leaves the parsed routing and geo data behind as garbage and a stop frees the
+// whole instance; both hand the freed memory back to the OS in the background, so the resident
+// size in the background (what Android's low-memory killer looks at) drops.
+func TestStartAndStopReturnFreedMemoryToTheOS(t *testing.T) {
+	var calls atomic.Int32
+	orig := releaseMemory
+	releaseMemory = func() { calls.Add(1) }
+	defer func() { releaseMemory = orig }()
+
+	installFakeCore(t, newFakeCoreInstance())
+	c := NewCoreController(nil)
+	if err := c.StartLoop(stopTestConfig, 0); err != nil {
+		t.Fatal(err)
+	}
+	waitFor := func(n int32, what string) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for calls.Load() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("memory was not released after the %s", what)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	waitFor(1, "start")
+	if err := c.StopLoop(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(2, "stop")
 }

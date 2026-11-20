@@ -59,3 +59,27 @@ func TestPauseGCForStartupNestsAndRestoreIsIdempotent(t *testing.T) {
 		t.Fatalf("GC percent after the last restore = %d, want 50", got)
 	}
 }
+
+// Perf 4: GOGC 50 and the 256 MiB soft limit are a mobile profile. On a desktop a big heap is
+// normal, and the limit there means a collection all the time; it keeps the Go defaults.
+func TestTheMobileProfileStaysOnMobile(t *testing.T) {
+	none := func(string) string { return "" }
+	for _, goos := range []string{"android", "ios"} {
+		gc, limit := ResolveProfile(goos, none)
+		if gc != 50 || limit != 256<<20 {
+			t.Errorf("%s: gc=%d limit=%d", goos, gc, limit)
+		}
+	}
+	for _, goos := range []string{"windows", "linux", "darwin"} {
+		gc, limit := ResolveProfile(goos, none)
+		if gc != KeepDefault || limit != KeepDefault {
+			t.Errorf("%s: gc=%d limit=%d, want the Go defaults", goos, gc, limit)
+		}
+	}
+	env := func(k string) string {
+		return map[string]string{"SKIPI_GOGC": "80", "SKIPI_GOMEMLIMIT": "1073741824"}[k]
+	}
+	if gc, limit := ResolveProfile("windows", env); gc != 80 || limit != 1<<30 {
+		t.Errorf("overrides apply everywhere: gc=%d limit=%d", gc, limit)
+	}
+}

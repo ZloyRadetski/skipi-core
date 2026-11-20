@@ -77,33 +77,49 @@ func ApplyMaxProcs() {
 	runtime.GOMAXPROCS(ResolveMaxProcs(runtime.NumCPU(), os.Getenv("SKIPI_GOMAXPROCS")))
 }
 
-// Init applies the mobile-first runtime profile before any core starts:
-//   - GOGC 50 keeps the live heap tighter than the Go default (100), which
-//     matters on Android where a fat Go heap invites the low-memory killer.
-//     Proxy forwarding is I/O bound, so the extra minor-cycle CPU cost is
-//     negligible next to the stability gain.
-//   - A soft memory limit acts purely as a safety net: it only starts forcing
-//     GC once total runtime memory approaches the ceiling, preventing runaway
-//     growth under connection bursts from turning into an OOM kill.
+// KeepDefault in a ResolveProfile result leaves that Go runtime setting as it is.
+const KeepDefault = -1
+
+const (
+	mobileGCPercent   = 50
+	mobileMemoryLimit = 256 << 20 // 256 MiB soft ceiling
+)
+
+// ResolveProfile picks the GC percent and soft memory limit for goos:
+//   - On a phone (android, ios) GOGC 50 keeps the live heap tighter than the Go default (100),
+//     which matters where a fat Go heap invites the low-memory killer, and a 256 MiB soft limit
+//     is a safety net against runaway growth under connection bursts.
+//   - On a desktop both stay at the Go defaults: a large heap is normal there, and the limit
+//     would keep the collector running all the time.
 //
-// Both values can be overridden per install via SKIPI_GOGC and
-// SKIPI_GOMEMLIMIT (bytes) environment variables.
-func Init() {
-	gcPercent := 50
-	if raw := os.Getenv("SKIPI_GOGC"); raw != "" {
+// SKIPI_GOGC and SKIPI_GOMEMLIMIT (bytes), read through env, override either value everywhere.
+func ResolveProfile(goos string, env func(string) string) (gcPercent int, memoryLimit int64) {
+	gcPercent, memoryLimit = KeepDefault, KeepDefault
+	if goos == "android" || goos == "ios" {
+		gcPercent, memoryLimit = mobileGCPercent, mobileMemoryLimit
+	}
+	if raw := env("SKIPI_GOGC"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
 			gcPercent = parsed
 		}
 	}
-	debug.SetGCPercent(gcPercent)
-
-	const defaultMemoryLimitBytes = 256 << 20 // 256 MiB soft ceiling
-	memoryLimit := int64(defaultMemoryLimitBytes)
-	if raw := os.Getenv("SKIPI_GOMEMLIMIT"); raw != "" {
+	if raw := env("SKIPI_GOMEMLIMIT"); raw != "" {
 		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
 			memoryLimit = parsed
 		}
 	}
-	debug.SetMemoryLimit(memoryLimit)
+	return gcPercent, memoryLimit
+}
+
+// Init applies the runtime profile of this platform (see ResolveProfile) and GOMAXPROCS before
+// any core starts.
+func Init() {
+	gcPercent, memoryLimit := ResolveProfile(runtime.GOOS, os.Getenv)
+	if gcPercent != KeepDefault {
+		debug.SetGCPercent(gcPercent)
+	}
+	if memoryLimit != KeepDefault {
+		debug.SetMemoryLimit(memoryLimit)
+	}
 	ApplyMaxProcs()
 }
