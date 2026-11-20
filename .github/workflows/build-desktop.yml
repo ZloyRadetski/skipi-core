@@ -106,9 +106,59 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # macOS and Windows run hev as a process of its own (see internal/hevtun), so Core ships the
+  # executables itself, built or packaged here, and the app only downloads them.
+  hev-macos:
+    name: Build hev-socks5-tunnel (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build hev-socks5-tunnel
+        run: bash scripts/build-hev-mac.sh
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          mkdir -p dist
+          tar -czf "dist/hev-macos-$arch.tar.gz" -C build/hev/macos .
+          tar -tzf "dist/hev-macos-$arch.tar.gz"
+
+      - name: Upload hev
+        uses: actions/upload-artifact@v4
+        with:
+          name: hev-macos
+          path: dist/
+          if-no-files-found: error
+
+  hev-windows:
+    name: Package hev-socks5-tunnel (Windows x64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Package hev-socks5-tunnel
+        run: bash scripts/package-hev-windows.sh
+
+      - name: Upload hev
+        uses: actions/upload-artifact@v4
+        with:
+          name: hev-windows
+          path: build/hev/windows/hev-windows-x64.zip
+          if-no-files-found: error
+
   release:
     name: Release SKIPI Core Desktop
-    needs: [windows-amd64, linux-amd64]
+    needs: [windows-amd64, linux-amd64, hev-macos, hev-windows]
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '')
     runs-on: ubuntu-latest
     permissions:
@@ -126,9 +176,23 @@ jobs:
           name: skipicore-desktop-linux-amd64
           path: dist-linux
 
+      - name: Download hev for macOS
+        uses: actions/download-artifact@v4
+        with:
+          name: hev-macos
+          path: dist-hev-macos
+
+      - name: Download hev for Windows
+        uses: actions/download-artifact@v4
+        with:
+          name: hev-windows
+          path: dist-hev-windows
+
       - name: Package Release Assets
         run: |
           mkdir -p release-assets
+          cp dist-hev-macos/*.tar.gz release-assets/
+          cp dist-hev-windows/hev-windows-x64.zip release-assets/
           find dist-windows -name "skipicore.dll" -exec cp {} release-assets/ \;
           (cd dist-windows && zip -9 -r ../release-assets/skipicore-windows-amd64.zip .)
           find dist-linux -name "libskipicore.so" -exec cp {} release-assets/ \;

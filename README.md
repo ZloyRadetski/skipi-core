@@ -61,6 +61,14 @@ CGO_ENABLED=1 go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -
 nm -D libskipicore.so | grep hev_socks5_tunnel_main_from_str   # HEV TUN is in the library
 ```
 
+On macOS and Windows hev runs as a process of its own, so Core builds and ships the executables
+(they are release assets of every Core version, and the app downloads them):
+
+```bash
+scripts/build-hev-mac.sh         # macOS host -> build/hev/macos/hev-socks5-tunnel (host architecture)
+scripts/package-hev-windows.sh   # any host   -> build/hev/windows/hev-windows-x64.zip (pinned official build + DLLs)
+```
+
 On Windows the library needs no hev build: the host ships the hev executable (with `wintun.dll`
 and its MSYS runtime DLLs next to it) and passes its path as `hev.executable` in the session plan.
 

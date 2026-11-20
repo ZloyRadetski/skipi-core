@@ -126,6 +126,12 @@ hev config policy (every target): `SanitizeConfig` lets through only the known k
 `post-up-script`, `pre-down-script` and `pid-file`. `misc.log-file` is kept where hev runs in
 process and dropped in the process modes (Windows, macOS), where hev has more rights than the app.
 
+Core builds and ships the process-mode executables itself, as release assets of every Core
+version (`build-desktop.yml`): `hev-macos-<arch>.tar.gz` from `scripts/build-hev-mac.sh` (hev's
+default build, no in-process patch) and `hev-windows-x64.zip` from `scripts/package-hev-windows.sh`
+(the official hev 2.19.3 archive, pinned by SHA-256, plus the vendored `msys-gcc_s-seh-1.dll`). The
+app only downloads them, so the hev version and its checksums live in this repository.
+
 Windows runs only an executable given as an absolute path inside the Core library's own directory
 (links resolved), keeps it in a kill-on-close job object so it ends with Core even after a crash,
 and writes the config into a new temp file whose protected DACL admits only SYSTEM, Administrators
