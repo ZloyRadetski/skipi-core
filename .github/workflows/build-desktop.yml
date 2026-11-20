@@ -93,7 +93,8 @@ jobs:
       - name: Verify HEV TUN is linked into the library
         run: |
           # The dynamic symbol table survives -s.
-          if ! nm -D dist/libskipicore.so | grep -q ' T hev_socks5_tunnel_main_from_str'; then
+          # No `grep -q`: with pipefail, nm getting SIGPIPE from an early-exiting grep fails the check.
+          if ! nm -D dist/libskipicore.so | grep ' T hev_socks5_tunnel_main_from_str' >/dev/null; then
             echo "hev_socks5_tunnel_main_from_str is not exported by libskipicore.so" >&2
             exit 1
           fi

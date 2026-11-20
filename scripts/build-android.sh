@@ -28,7 +28,9 @@ NM="$(ls "${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-/nonexistent}}"/toolchains/llv
 if [ -n "$NM" ]; then
   CHECK_DIR="$(mktemp -d)"
   unzip -q -o skipicore.aar jni/arm64-v8a/libgojni.so -d "$CHECK_DIR"
-  if ! "$NM" -D "$CHECK_DIR/jni/arm64-v8a/libgojni.so" | grep -q ' T hev_socks5_tunnel_main_from_str'; then
+  # No `grep -q` here: it exits at the first match, llvm-nm then gets SIGPIPE on its remaining
+  # output (about 90 KB, more than a pipe holds), and pipefail turns that into a failed check.
+  if ! "$NM" -D "$CHECK_DIR/jni/arm64-v8a/libgojni.so" | grep ' T hev_socks5_tunnel_main_from_str' >/dev/null; then
     echo "hev_socks5_tunnel_main_from_str is not exported by libgojni.so" >&2
     rm -rf "$CHECK_DIR"
     exit 1
