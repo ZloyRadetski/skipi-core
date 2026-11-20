@@ -31,6 +31,8 @@ type AmneziaWgRunner struct {
 	running    bool
 	cancel     context.CancelFunc
 	protector  SocketProtector
+	// sessionOwned marks the runner of a session; the public start and stop leave it alone.
+	sessionOwned bool
 
 	dnsMu    sync.Mutex
 	dnsCache map[string]tunnelDNSEntry

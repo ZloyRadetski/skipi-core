@@ -61,7 +61,7 @@ func (c *CoreController) notifyState(s lifecycleState, detail string) {
 
 // Seams for the session start: tests replace the AmneziaWG start and the readiness deadline.
 var (
-	startAmneziaWgFn = StartAmneziaWg
+	startAmneziaWgFn = startSessionAmneziaWg
 	// awgReadyTimeout is how long StartSession waits for the AmneziaWG SOCKS listener.
 	awgReadyTimeout = 8000 * time.Millisecond
 )
@@ -181,6 +181,9 @@ func (c *CoreController) startSessionAwg(gen uint64, cfg *sessionPlanAwg, stopOw
 	}
 	awgGlobalMu.Lock()
 	runner := activeAwgRunner
+	if runner != nil {
+		runner.sessionOwned = true
+	}
 	awgGlobalMu.Unlock()
 
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.SocksPort)

@@ -136,47 +136,110 @@ func ParseAmneziaWgSettings(rawJSON string) (*AmneziaWgSettings, error) {
 	return nil, errors.New("no wireguard/amneziawg outbound settings found in json")
 }
 
-// StartAmneziaWg creates and starts an AmneziaWG tunnel using github.com/amnezia-vpn/amneziawg-go/v3.
-func StartAmneziaWg(configJSON string, socksPort int) error {
-	awgGlobalMu.Lock()
-	defer awgGlobalMu.Unlock()
+// ErrAmneziaWgInUse is returned by StartAmneziaWg while a session owns the runner: a probe must
+// not take the tunnel's runner away.
+var ErrAmneziaWgInUse = errors.New("AmneziaWG is in use by the running session")
 
-	if activeAwgRunner != nil && activeAwgRunner.running {
-		old := activeAwgRunner
-		activeAwgRunner = nil
+// errAwgStartOvertaken is returned by a start that a stop overtook while the runner came up.
+var errAwgStartOvertaken = errors.New("AmneziaWG start was cancelled by a stop")
+
+var (
+	// awgStartMu serializes starts. It is held while a runner resolves its peer and comes up;
+	// awgGlobalMu is not, so stops and state reads never wait for that.
+	awgStartMu sync.Mutex
+	// awgGen is bumped by every stop (guarded by awgGlobalMu); a start that sees it changed when
+	// it is ready to publish its runner stops that runner instead.
+	awgGen uint64
+	// awgStartingForSession tells a probe's stop to leave a session's start in flight alone.
+	awgStartingForSession bool
+)
+
+// buildAwgRunner parses the config and brings a runner up: the slow part of a start. Tests replace it.
+var buildAwgRunner = func(configJSON string, socksPort int) (*AmneziaWgRunner, error) {
+	settings, err := ParseAmneziaWgSettings(configJSON)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse AmneziaWG settings: %w", err)
+	}
+	runner, err := NewAmneziaWgRunner(settings, socksPort)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize AmneziaWG runner: %w", err)
+	}
+	if err := runner.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start AmneziaWG runner: %w", err)
+	}
+	return runner, nil
+}
+
+// StartAmneziaWg creates and starts an AmneziaWG tunnel using github.com/amnezia-vpn/amneziawg-go/v3.
+// It replaces a runner started the same way, but never the runner of a running session: then it
+// fails with ErrAmneziaWgInUse.
+func StartAmneziaWg(configJSON string, socksPort int) error {
+	return startAmneziaWg(configJSON, socksPort, false)
+}
+
+// startSessionAmneziaWg starts the runner a session owns; only that session's stop ends it.
+func startSessionAmneziaWg(configJSON string, socksPort int) error {
+	return startAmneziaWg(configJSON, socksPort, true)
+}
+
+func startAmneziaWg(configJSON string, socksPort int, forSession bool) error {
+	awgStartMu.Lock()
+	defer awgStartMu.Unlock()
+
+	awgGlobalMu.Lock()
+	old := activeAwgRunner
+	if old != nil && old.sessionOwned && !forSession {
+		awgGlobalMu.Unlock()
+		return ErrAmneziaWgInUse
+	}
+	activeAwgRunner = nil
+	awgGen++
+	myGen := awgGen
+	awgStartingForSession = forSession
+	awgGlobalMu.Unlock()
+	if old != nil {
 		_, _ = lifecycle.RunBounded(func() error { return awgStop(old) }, defaultStopTimeout, nil)
 	}
 
-	settings, err := ParseAmneziaWgSettings(configJSON)
+	runner, err := buildAwgRunner(configJSON, socksPort)
 	if err != nil {
-		return fmt.Errorf("failed to parse AmneziaWG settings: %w", err)
+		return err
 	}
 
-	runner, err := NewAmneziaWgRunner(settings, socksPort)
-	if err != nil {
-		return fmt.Errorf("failed to initialize AmneziaWG runner: %w", err)
+	awgGlobalMu.Lock()
+	if awgGen != myGen {
+		awgGlobalMu.Unlock()
+		_, _ = lifecycle.RunBounded(func() error { return awgStop(runner) }, defaultStopTimeout, nil)
+		return errAwgStartOvertaken
 	}
-
-	if err := runner.Start(); err != nil {
-		return fmt.Errorf("failed to start AmneziaWG runner: %w", err)
-	}
-
+	runner.sessionOwned = forSession
 	activeAwgRunner = runner
+	awgGlobalMu.Unlock()
 	return nil
 }
 
 // awgStop closes one runner. It is a variable so tests can simulate a Close that hangs.
 var awgStop = func(r *AmneziaWgRunner) error { return r.Stop() }
 
-// StopAmneziaWg stops the currently active AmneziaWG runner, giving up after the default timeout.
+// StopAmneziaWg stops the runner StartAmneziaWg started, giving up after the default timeout.
 func StopAmneziaWg() error {
 	return StopAmneziaWgWithTimeout(0)
 }
 
-// StopAmneziaWgWithTimeout stops the active runner and waits at most timeoutMillis for it
-// (non-positive: 5000 ms). A runner whose Stop hangs is detached anyway and counted in
+// StopAmneziaWgWithTimeout stops the runner StartAmneziaWg started and waits at most timeoutMillis
+// for it (non-positive: 5000 ms); a start of one in flight fails. A session's runner is left alone:
+// its session stops it. A runner whose Stop hangs is detached anyway and counted in
 // AbandonedInstances until Stop returns; the error then wraps ErrStopTimedOut.
 func StopAmneziaWgWithTimeout(timeoutMillis int64) error {
+	return stopAmneziaWg(timeoutMillis, false)
+}
+
+// stopAnyAmneziaWg is the stop of ForceStop: whoever owns the runner, it goes.
+func stopAnyAmneziaWg(timeoutMillis int64) error {
+	return stopAmneziaWg(timeoutMillis, true)
+}
+
+func stopAmneziaWg(timeoutMillis int64, evenSession bool) error {
 	d := defaultStopTimeout
 	if timeoutMillis > 0 {
 		d = time.Duration(timeoutMillis) * time.Millisecond
@@ -184,6 +247,13 @@ func StopAmneziaWgWithTimeout(timeoutMillis int64) error {
 
 	awgGlobalMu.Lock()
 	runner := activeAwgRunner
+	if runner != nil && runner.sessionOwned && !evenSession {
+		awgGlobalMu.Unlock()
+		return nil
+	}
+	if evenSession || !awgStartingForSession {
+		awgGen++
+	}
 	activeAwgRunner = nil
 	awgGlobalMu.Unlock()
 	if runner == nil {

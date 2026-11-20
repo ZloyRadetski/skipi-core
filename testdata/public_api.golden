@@ -187,4 +187,6 @@ type StateListener interface {
 	OnStateChanged(state int, detail string)
 }
 
+var ErrAmneziaWgInUse = errors.New("AmneziaWG is in use by the running session")
+
 var ErrStopTimedOut = errors.New("SKIPI Core stop timed out")

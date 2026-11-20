@@ -373,7 +373,7 @@ func (c *CoreController) stopWithinReason(d time.Duration, reason string) error 
 	closeErr, timedOut := lifecycle.RunBounded(inst.Close, d, op.Force())
 	var awgErr error
 	if ownsAwg {
-		awgErr = StopAmneziaWgWithTimeout(d.Milliseconds())
+		awgErr = stopAnyAmneziaWg(d.Milliseconds())
 	}
 
 	c.mu.Lock()
@@ -460,7 +460,7 @@ func (c *CoreController) ForceStop() error {
 	if !hevStopped {
 		hevErr = stopHevBounded(forceStopTimeout, nil)
 	}
-	return errors.Join(xrayErr, hevErr, StopAmneziaWgWithTimeout(forceStopTimeout.Milliseconds()))
+	return errors.Join(xrayErr, hevErr, stopAnyAmneziaWg(forceStopTimeout.Milliseconds()))
 }
 
 // IsRunning returns whether the core instance is currently running.
