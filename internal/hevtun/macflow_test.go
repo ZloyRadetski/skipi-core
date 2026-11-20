@@ -83,6 +83,7 @@ const (
 	stateDir = "/var/run/skipi-hev.501"
 	token    = "00112233445566778899aabbccddeeff"
 	hevHash  = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	hevPath  = "/Users/test/SKIPI/run/hev-socks5-tunnel"
 )
 
 type macHarness struct {
@@ -91,12 +92,12 @@ type macHarness struct {
 	launches  [][]string
 	launchErr error
 	// onLaunch runs while the prompt is "up"; ctx is the launch context.
-	onLaunch func(ctx context.Context) error
-	hashErr  error
-	alive    map[int64]bool
-	clock    time.Time
-	onSleep  func()
-	tun      *macTunnel
+	onLaunch   func(ctx context.Context) error
+	runtimeErr error
+	alive      map[int64]bool
+	clock      time.Time
+	onSleep    func()
+	tun        *macTunnel
 }
 
 func newHarness() *macHarness {
@@ -114,7 +115,12 @@ func newHarness() *macHarness {
 			}
 			return h.onLaunch(ctx)
 		},
-		HashFile: func(p string) (string, error) { return hevHash, h.hashErr },
+		Runtime: func(dir string) (string, string, error) {
+			if h.runtimeErr != nil {
+				return "", "", h.runtimeErr
+			}
+			return hevPath, hevHash, nil
+		},
 		NewToken: func() string { return token },
 		IsAlive:  func(pid int64) bool { h.mu.Lock(); defer h.mu.Unlock(); return h.alive[pid] },
 		Now:      func() time.Time { h.mu.Lock(); defer h.mu.Unlock(); return h.clock },
@@ -137,7 +143,6 @@ func newHarness() *macHarness {
 
 func macOpts() Options {
 	return Options{
-		Executable:   "/Applications/SKIPI.app/Contents/Resources/hev/hev-socks5-tunnel",
 		RunDirectory: runDir,
 		MacInterface: &MacInterface{Name: "utun9", MTU: 1400, Addresses: []string{"172.19.0.1/30"}, Routes: []string{"0.0.0.0/1", "128.0.0.0/1"}},
 	}
@@ -176,6 +181,7 @@ func TestStartAsksForRightsRunsTheSupervisorAndWaitsUntilReady(t *testing.T) {
 	wantIn(t, script, "STOP='"+runDir+"/tun-stop'")
 	wantIn(t, script, "TOKEN='"+token+"'")
 	wantIn(t, script, "HEV_SHA='"+hevHash+"'")
+	wantIn(t, script, "HEV_SRC='"+hevPath+"'")
 	wantIn(t, script, base64.StdEncoding.EncodeToString([]byte("tunnel:\n  mtu: 1400\n")))
 	wantIn(t, script, "IFACE='utun9'")
 	wantIn(t, script, "'172.19.0.1' '172.19.0.1' mtu 1400 up")
@@ -201,10 +207,12 @@ func TestNoConfigIsWrittenIntoTheUsersDirectory(t *testing.T) {
 	}
 }
 
-func TestAnExecutableThatCannotBeHashedIsNotStarted(t *testing.T) {
+// The hev comes from what Core carries, and its hash is the one of those bytes: a build without the
+// runtime, or one that cannot write it out, never reaches the password prompt.
+func TestWithoutTheCarriedRuntimeNothingIsStarted(t *testing.T) {
 	h := newHarness()
-	h.hashErr = errors.New("no such file")
-	if err := h.start(t); err == nil || !strings.Contains(err.Error(), "no such file") {
+	h.runtimeErr = errors.New("this SKIPI Core build does not carry the HEV TUN runtime")
+	if err := h.start(t); err == nil || !strings.Contains(err.Error(), "does not carry") {
 		t.Fatalf("err = %v", err)
 	}
 	if len(h.launches) != 0 {
@@ -513,11 +521,6 @@ func TestStartRejectsBadInputBeforeAskingForRights(t *testing.T) {
 	o.MacInterface.Addresses = []string{"fc00::1/64"}
 	if err := h.tun.start("y", o); err == nil {
 		t.Error("no IPv4 address accepted")
-	}
-	o = macOpts()
-	o.Executable = "hev-socks5-tunnel"
-	if err := h.tun.start("y", o); err == nil {
-		t.Error("relative executable accepted")
 	}
 	if len(h.launches) != 0 {
 		t.Fatalf("the prompt must not be shown for an invalid plan: %v", h.launches)

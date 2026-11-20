@@ -66,7 +66,6 @@ type fakeHev struct {
 	stats       [4]uint64
 	gotCfg      atomic.Value
 	gotFd       atomic.Int64
-	gotExe      atomic.Value
 	noFd        bool // a process-mode target: no TUN descriptor is needed
 	mac         bool // the macOS target: takes the interface plan, no descriptor
 	readyBudget time.Duration
@@ -81,7 +80,6 @@ func (f *fakeHev) ReadyTimeout() time.Duration { return f.readyBudget }
 
 func (f *fakeHev) Start(cfg string, opts hevtun.Options) error {
 	f.log.add("hev.start")
-	f.gotExe.Store(opts.Executable)
 	f.gotCfg.Store(cfg)
 	f.gotFd.Store(int64(opts.TunFd))
 	f.gotOpts.Store(opts)
@@ -207,13 +205,8 @@ func TestParseSessionPlanHevTunFdDependsOnTheTarget(t *testing.T) {
 		`{"configYaml":"tunnel: {mtu: 1500}","tunFd":0,"executable":` + string(exe) + `}`,
 		`{"configYaml":"tunnel: {mtu: 1500}","executable":` + string(exe) + `}`,
 	} {
-		p, err := parseSessionPlan(hevPlanWith(t, hev))
-		if err != nil {
+		if _, err := parseSessionPlan(hevPlanWith(t, hev)); err != nil {
 			t.Errorf("process mode %s: %v", hev, err)
-			continue
-		}
-		if p.Hev.Executable != winExe {
-			t.Errorf("executable = %q", p.Hev.Executable)
 		}
 	}
 	// Blank YAML is rejected everywhere.
@@ -222,7 +215,9 @@ func TestParseSessionPlanHevTunFdDependsOnTheTarget(t *testing.T) {
 	}
 }
 
-func TestSessionPassesHevExecutableAndRunsProcessModeWithoutFd(t *testing.T) {
+// A plan of an older host still names the hev executable: it is accepted and never used, because
+// Core runs the hev it carries.
+func TestProcessModeStartsWithoutAFdAndIgnoresAnExecutableInThePlan(t *testing.T) {
 	hev := &fakeHev{noFd: true}
 	installOrderedFakes(t, hev)
 	c := NewCoreController(nil)
@@ -234,8 +229,8 @@ func TestSessionPassesHevExecutableAndRunsProcessModeWithoutFd(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = c.StopLoop() })
-	if got := hev.gotExe.Load(); got != winExe {
-		t.Fatalf("hev got executable %v", got)
+	if hev.log.count("hev.start") != 1 {
+		t.Fatalf("hev was not started: %s", hev.log)
 	}
 }
 
@@ -556,7 +551,7 @@ func TestParseSessionPlanMacOSHevBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Hev.Executable != macExe || p.Hev.RunDirectory != macRunDir {
+	if p.Hev.RunDirectory != macRunDir {
 		t.Fatalf("hev = %+v", p.Hev)
 	}
 	m := p.Hev.MacInterface
@@ -569,7 +564,6 @@ func TestParseSessionPlanMacOSRejectsAnInvalidBlockBeforeAnythingStarts(t *testi
 	useHevTarget(t, &fakeHev{mac: true})
 	iface := func(m map[string]any) map[string]any { return m["macInterface"].(map[string]any) }
 	cases := map[string]func(m map[string]any){
-		"executable":   func(m map[string]any) { delete(m, "executable") },
 		"runDirectory": func(m map[string]any) { m["runDirectory"] = " " },
 		"macInterface": func(m map[string]any) { delete(m, "macInterface") },
 		"name":         func(m map[string]any) { iface(m)["name"] = "" },
@@ -595,7 +589,7 @@ func TestMacOSPlanFieldsReachTheTunnelAndNoDescriptorIsNeeded(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.StopLoop() })
 	opts, _ := hev.gotOpts.Load().(hevtun.Options)
-	if opts.Executable != macExe || opts.RunDirectory != macRunDir || opts.TunFd != 0 {
+	if opts.RunDirectory != macRunDir || opts.TunFd != 0 {
 		t.Fatalf("opts = %+v", opts)
 	}
 	if opts.MacInterface == nil || opts.MacInterface.Name != "utun9" || opts.MacInterface.MTU != 1500 ||

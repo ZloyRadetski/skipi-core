@@ -107,8 +107,6 @@ const hevReadyPoll = 100 * time.Millisecond
 type sessionPlanHev struct {
 	ConfigYAML string `json:"configYaml"`
 	TunFd      int    `json:"tunFd"`
-	// Executable is the hev executable of the process modes (Windows, macOS); ignored by in-process targets.
-	Executable string `json:"executable"`
 	// RunDirectory is where the macOS supervisor keeps its marker files and the hev config.
 	RunDirectory string `json:"runDirectory"`
 	// MacInterface is the macOS utun plan (name, mtu, addresses, routes, dns).
@@ -173,7 +171,7 @@ func (c *CoreController) startSessionHev(gen uint64, cfg *sessionPlanHev) error 
 	if c.superseded(gen) {
 		return errStartAborted
 	}
-	opts := hevtun.Options{TunFd: cfg.TunFd, Executable: cfg.Executable, RunDirectory: cfg.RunDirectory, MacInterface: cfg.MacInterface}
+	opts := hevtun.Options{TunFd: cfg.TunFd, RunDirectory: cfg.RunDirectory, MacInterface: cfg.MacInterface}
 	claimHev(c, gen)
 	if err := hevTun.Start(cfg.ConfigYAML, opts); err != nil {
 		_ = stopHevIfOwned(c, gen, defaultStopTimeout)

@@ -32,8 +32,6 @@ var (
 type Options struct {
 	// TunFd is the TUN descriptor the host opened (Android, Linux in process); ignored elsewhere.
 	TunFd int
-	// Executable is the hev executable of the process modes (Windows, macOS); ignored in process.
-	Executable string
 	// RunDirectory is where the macOS supervisor keeps its marker files and the generated hev
 	// config (created 0700); ignored elsewhere.
 	RunDirectory string

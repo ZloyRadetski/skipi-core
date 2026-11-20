@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ZloyRadetski/skipi-core/internal/hevpayload"
 )
 
 // The supervisor, the launch command and the launch-failure text. The script runs as root, so the
@@ -293,32 +295,30 @@ func TestValidateMacPlan(t *testing.T) {
 		return &MacInterface{Name: "utun9", MTU: 1500, Addresses: []string{"198.18.0.1/15", "fc00::1/64"},
 			Routes: []string{"0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"}}
 	}
-	if err := ValidateMacPlan("/h", "/run", good()); err != nil {
+	if err := ValidateMacPlan("/run", good()); err != nil {
 		t.Fatal(err)
 	}
-	cases := map[string]func() (string, string, *MacInterface){
-		"no exe":       func() (string, string, *MacInterface) { return " ", "/run", good() },
-		"relative exe": func() (string, string, *MacInterface) { return "hev", "/run", good() },
-		"no dir":       func() (string, string, *MacInterface) { return "/h", "", good() },
-		"relative dir": func() (string, string, *MacInterface) { return "/h", "run", good() },
-		"no mac":       func() (string, string, *MacInterface) { return "/h", "/run", nil },
-		"no name":      func() (string, string, *MacInterface) { m := good(); m.Name = ""; return "/h", "/run", m },
-		"v6 only": func() (string, string, *MacInterface) {
+	cases := map[string]func() (string, *MacInterface){
+		"no dir":       func() (string, *MacInterface) { return "", good() },
+		"relative dir": func() (string, *MacInterface) { return "run", good() },
+		"no mac":       func() (string, *MacInterface) { return "/run", nil },
+		"no name":      func() (string, *MacInterface) { m := good(); m.Name = ""; return "/run", m },
+		"v6 only": func() (string, *MacInterface) {
 			m := good()
 			m.Addresses = []string{"fc00::1/64"}
-			return "/h", "/run", m
+			return "/run", m
 		},
-		"mtu":       func() (string, string, *MacInterface) { m := good(); m.MTU = 0; return "/h", "/run", m },
-		"no routes": func() (string, string, *MacInterface) { m := good(); m.Routes = nil; return "/h", "/run", m },
-		"bad route": func() (string, string, *MacInterface) {
+		"mtu":       func() (string, *MacInterface) { m := good(); m.MTU = 0; return "/run", m },
+		"no routes": func() (string, *MacInterface) { m := good(); m.Routes = nil; return "/run", m },
+		"bad route": func() (string, *MacInterface) {
 			m := good()
 			m.Routes = []string{"default"}
-			return "/h", "/run", m
+			return "/run", m
 		},
 	}
 	for name, c := range cases {
-		e, d, m := c()
-		if err := ValidateMacPlan(e, d, m); err == nil {
+		d, m := c()
+		if err := ValidateMacPlan(d, m); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}
@@ -400,7 +400,7 @@ func startShellSupervisor(t *testing.T, mut func(*MacTunSupervisorSpec), hevBody
 	if err := os.WriteFile(hev, []byte("#!/bin/sh\n"+hevBody+"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	sum, err := fileSHA256(hev)
+	sum, err := hevpayload.File{Data: mustRead(t, hev)}.SHA256(), error(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -557,4 +557,13 @@ func TestShellSupervisorThatFindsAStopRequestDoesNothing(t *testing.T) {
 	if got := strings.TrimSpace(r.read("tun-exit")); got != testToken {
 		t.Errorf("exit marker = %q", got)
 	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

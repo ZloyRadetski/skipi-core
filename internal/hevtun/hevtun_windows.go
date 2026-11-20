@@ -8,6 +8,7 @@ package hevtun
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/ZloyRadetski/skipi-core/internal/hevpayload"
 	"golang.org/x/sys/windows"
 )
 
@@ -70,16 +72,22 @@ func (p *process) closeJob() {
 	})
 }
 
-// trustedHevRoot is the directory the hev executable must be inside: the Core library's own
-// (in Program Files once installed). Core runs hev with its own rights, so it must not run an
-// executable from anywhere a plan names. A variable so tests can point it at their fake.
-var trustedHevRoot = coreModuleDirectory
+// hevExecutableName is the hev executable inside the install directory.
+const hevExecutableName = "hev-socks5-tunnel.exe"
+
+// Seams: the embedded runtime and where it is installed. Tests replace them.
+var (
+	payloadFiles = hevpayload.Files
+	installRoot  = coreHevDirectory
+)
 
 // moduleAnchor lives in this module's data, so its address names the module.
 var moduleAnchor uint16
 
-// coreModuleDirectory is the directory of the module (the Core DLL) that holds this code.
-func coreModuleDirectory() (string, error) {
+// coreHevDirectory is the hev directory next to the module (the Core DLL) that holds this code.
+// It sits in the application's install directory, where only an administrator can write, which is
+// also where Core runs elevated for the Wintun adapter.
+func coreHevDirectory() (string, error) {
 	var module windows.Handle
 	if err := windows.GetModuleHandleEx(
 		windows.GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|windows.GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -91,37 +99,56 @@ func coreModuleDirectory() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("locate the Core library: %w", err)
 	}
-	return filepath.Dir(windows.UTF16ToString(buf[:n])), nil
+	return filepath.Join(filepath.Dir(windows.UTF16ToString(buf[:n])), "hev"), nil
 }
 
-// checkExecutable accepts an absolute path to a file inside trustedHevRoot, links resolved.
-func checkExecutable(executable string) error {
-	if !filepath.IsAbs(executable) {
-		return fmt.Errorf("HEV TUN executable must be an absolute path: %s", executable)
-	}
-	info, err := os.Stat(executable)
+// prepareExecutable installs the runtime this Core carries (hev, Wintun, the MSYS DLLs) into the
+// install directory and returns the hev executable. The executable never comes from the plan: Core
+// runs only bytes it carries itself. A file already there that differs is written again, so an
+// edited hev.exe or DLL is never executed. hev needs its DLLs beside it, hence one directory.
+func prepareExecutable() (string, error) {
+	files, err := payloadFiles()
 	if err != nil {
-		return fmt.Errorf("HEV TUN executable %s: %w", executable, err)
+		if errors.Is(err, hevpayload.ErrNotBundled) {
+			return "", fmt.Errorf("HEV TUN is not available: %w", err)
+		}
+		return "", err
 	}
-	if info.IsDir() {
-		return fmt.Errorf("HEV TUN executable %s is a directory", executable)
-	}
-	root, err := trustedHevRoot()
+	dir, err := installRoot()
 	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("HEV TUN install directory %s: %w", dir, err)
+	}
+	hasExecutable := false
+	for _, f := range files {
+		if f.Name == hevExecutableName {
+			hasExecutable = true
+		}
+		if err := installFile(filepath.Join(dir, f.Name), f); err != nil {
+			return "", fmt.Errorf("HEV TUN install %s: %w", f.Name, err)
+		}
+	}
+	if !hasExecutable {
+		return "", fmt.Errorf("HEV TUN is not available: the runtime this SKIPI Core carries has no %s", hevExecutableName)
+	}
+	return filepath.Join(dir, hevExecutableName), nil
+}
+
+// installFile makes path hold exactly f: left alone when it already does, otherwise written next to
+// it and renamed over it.
+func installFile(path string, f hevpayload.File) error {
+	if current, err := os.ReadFile(path); err == nil && sha256.Sum256(current) == sha256.Sum256(f.Data) {
+		return nil
+	}
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, f.Data, 0o755); err != nil {
 		return err
 	}
-	realRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return fmt.Errorf("resolve %s: %w", root, err)
-	}
-	realExe, err := filepath.EvalSymlinks(executable)
-	if err != nil {
-		return fmt.Errorf("HEV TUN executable %s: %w", executable, err)
-	}
-	rel, err := filepath.Rel(realRoot, realExe)
-	up := ".." + string(filepath.Separator)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, up) || filepath.IsAbs(rel) {
-		return fmt.Errorf("HEV TUN executable %s is outside %s, where the Core library is", executable, root)
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
 	return nil
 }
@@ -256,23 +283,21 @@ func current() *process {
 	return active
 }
 
-// Start writes the YAML to a temporary file only SYSTEM, Administrators and its owner can reach and
-// runs "<executable> <config>" from the executable's directory, inside a job that ends it with
-// Core. The executable must be an absolute path inside the Core library's directory. A process that exits within the startup grace is a failed start; the
+// Start installs the runtime Core carries, writes the YAML to a temporary file only SYSTEM,
+// Administrators and its owner can reach and runs "<hev> <config>" from the install directory,
+// inside a job that ends it with Core. A process that exits within the startup grace is a failed start; the
 // error carries its first 4 KB of output. tunFd is ignored.
 func Start(configYAML string, opts Options) error {
-	executable := opts.Executable
 	if configYAML == "" {
 		return errors.New("HEV TUN config is empty")
 	}
-	if strings.TrimSpace(executable) == "" {
-		return errors.New("HEV TUN executable path is required on Windows")
-	}
-	if err := checkExecutable(executable); err != nil {
-		return err
-	}
+	// opts.Executable is ignored: Core runs the hev it carries.
 	if current() != nil {
 		return errors.New("HEV TUN is already running")
+	}
+	executable, err := prepareExecutable()
+	if err != nil {
+		return err
 	}
 
 	cfgPath, err := writeConfig(configYAML)

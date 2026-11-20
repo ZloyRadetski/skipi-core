@@ -13,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/ZloyRadetski/skipi-core/internal/hevpayload"
 	"golang.org/x/sys/windows"
 )
 
@@ -20,39 +21,64 @@ import (
 // that ships next to the Core library, keeps it in a job that dies with Core, and writes its
 // config where only Core can change it.
 
-func TestWindowsRefusesARelativeExecutable(t *testing.T) {
-	isolate(t)
-	err := Start("mode: run\n", Options{Executable: `hev\hev-socks5-tunnel.exe`})
-	if err == nil || !strings.Contains(err.Error(), "absolute") {
-		t.Fatalf("err = %v", err)
+// Core runs only the hev it carries, from a directory it owns: the plan has no executable to name,
+// so nothing a host (or anything that can edit a plan) offers can be run with Core's rights.
+func TestWindowsRunsTheCarriedHevFromTheInstallDirectory(t *testing.T) {
+	tmp, _ := isolate(t)
+	if err := Start("mode: run\n", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	got := current().cmd.Path
+	if !strings.HasPrefix(got, filepath.Join(tmp, "install")) || filepath.Base(got) != hevExecutableName {
+		t.Fatalf("ran %s, want the carried hev under the install directory", got)
 	}
 }
 
-func TestWindowsRefusesAnExecutableOutsideCoresDirectory(t *testing.T) {
+func TestWindowsInstallsTheWholeRuntimeBesideTheExecutable(t *testing.T) {
 	tmp, _ := isolate(t)
-	elsewhere := filepath.Join(tmp, "hev.exe")
-	if err := os.WriteFile(elsewhere, []byte("MZ"), 0o755); err != nil {
+	base := payloadFiles
+	payloadFiles = func() ([]hevpayload.File, error) {
+		files, err := base()
+		return append(files, hevpayload.File{Name: "wintun.dll", Data: []byte("driver")}), err
+	}
+	if err := Start("mode: run\n", Options{}); err != nil {
 		t.Fatal(err)
 	}
-	err := Start("mode: run\n", Options{Executable: elsewhere})
-	if err == nil || !strings.Contains(err.Error(), "outside") || !strings.Contains(err.Error(), elsewhere) {
-		t.Fatalf("err = %v", err)
+	dir := filepath.Dir(current().cmd.Path)
+	if b, err := os.ReadFile(filepath.Join(dir, "wintun.dll")); err != nil || string(b) != "driver" {
+		t.Fatalf("wintun.dll = %q, %v", b, err)
 	}
-	// A path that only looks inside by its text is not inside.
-	root := filepath.Dir(fakeHev(t))
-	rel, err := filepath.Rel(filepath.Dir(root), elsewhere)
-	if err != nil {
+	if !strings.HasPrefix(dir, filepath.Join(tmp, "install")) {
+		t.Fatalf("installed into %s", dir)
+	}
+}
+
+// A file of the install directory that no longer matches what Core carries is written again
+// before hev runs: an edited hev.exe or DLL is never executed.
+func TestWindowsRestoresAChangedRuntimeFile(t *testing.T) {
+	isolate(t)
+	if err := Start("mode: run\n", Options{}); err != nil {
 		t.Fatal(err)
 	}
-	sneaky := root + `\..\` + rel
-	if err := Start("mode: run\n", Options{Executable: sneaky}); err == nil || !strings.Contains(err.Error(), "outside") {
-		t.Fatalf("sneaky err = %v", err)
+	exe := current().cmd.Path
+	want, _ := os.ReadFile(exe)
+	if err := Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, []byte("tampered"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Start("mode: run\n", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(exe); string(got) != string(want) {
+		t.Fatalf("the changed hev.exe was run as it was (%d bytes, want %d)", len(got), len(want))
 	}
 }
 
 func TestWindowsHevDiesWithItsJob(t *testing.T) {
 	isolate(t)
-	if err := Start("mode: run\n", Options{Executable: fakeHev(t)}); err != nil {
+	if err := Start("mode: run\n", Options{}); err != nil {
 		t.Fatal(err)
 	}
 	p := current()
@@ -80,7 +106,7 @@ func TestWindowsHevDiesWithItsJob(t *testing.T) {
 
 func TestWindowsConfigIsWritableOnlyBySystemAdministratorsAndTheOwner(t *testing.T) {
 	tmp, _ := isolate(t)
-	if err := Start("mode: run\n", Options{Executable: fakeHev(t)}); err != nil {
+	if err := Start("mode: run\n", Options{}); err != nil {
 		t.Fatal(err)
 	}
 	files := configFiles(t, tmp)

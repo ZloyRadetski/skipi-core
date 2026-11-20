@@ -21,6 +21,7 @@ jobs:
   windows-amd64:
     name: Build desktop DLL (Windows x64)
     runs-on: windows-latest
+    needs: hev-windows
 
     steps:
       - name: Check out source
@@ -31,6 +32,17 @@ jobs:
         with:
           go-version: '1.27'
           check-latest: true
+
+      # The DLL carries the hev runtime itself (internal/hevpayload), so the host application ships none.
+      - name: Download the hev runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: hev-windows
+          path: hev-runtime
+
+      - name: Put the hev runtime into the payload
+        shell: pwsh
+        run: Expand-Archive -Path hev-runtime/hev-windows-x64.zip -DestinationPath internal/hevpayload/payload -Force
 
       - name: Set up GCC
         uses: msys2/setup-msys2@v2
@@ -107,10 +119,10 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  # macOS and Windows run hev as a process of its own (see internal/hevtun), so Core ships the
-  # executables itself, built or packaged here, and the app only downloads them.
-  hev-macos:
-    name: Build hev-socks5-tunnel (macOS)
+  # macOS and Windows run hev as a process of its own (see internal/hevtun). The runtime is built
+  # or packaged here and embedded into the Core library, so the app ships and downloads no hev.
+  macos:
+    name: Build desktop library (macOS)
     runs-on: macos-latest
 
     steps:
@@ -119,21 +131,31 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Build hev-socks5-tunnel
-        run: bash scripts/build-hev-mac.sh
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          check-latest: true
 
-      - name: Package
+      # hev runs as a process of its own on macOS; the library carries it (internal/hevpayload).
+      - name: Build hev-socks5-tunnel and put it into the payload
+        run: bash scripts/stage-hev-payload.sh macos
+
+      - name: Vet and build shared library
         run: |
           set -euo pipefail
+          export CGO_ENABLED=1
+          # The tests run on Linux and Windows; here the macOS-only code (hevtun_darwin, netbind) must compile.
+          go vet ./...
           arch="$(uname -m)"
           mkdir -p dist
-          tar -czf "dist/hev-macos-$arch.tar.gz" -C build/hev/macos .
-          tar -tzf "dist/hev-macos-$arch.tar.gz"
+          go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o "dist/libskipicore-macos-$arch.dylib" ./cmd/skipicore-desktop
+          cp desktop/include/skipicore_desktop.h dist/
 
-      - name: Upload hev
+      - name: Upload desktop library
         uses: actions/upload-artifact@v4
         with:
-          name: hev-macos
+          name: skipicore-desktop-macos
           path: dist/
           if-no-files-found: error
 
@@ -159,7 +181,7 @@ jobs:
 
   release:
     name: Release SKIPI Core Desktop
-    needs: [windows-amd64, linux-amd64, hev-macos, hev-windows]
+    needs: [windows-amd64, linux-amd64, macos]
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '')
     runs-on: ubuntu-latest
     permissions:
@@ -177,23 +199,16 @@ jobs:
           name: skipicore-desktop-linux-amd64
           path: dist-linux
 
-      - name: Download hev for macOS
+      - name: Download macOS Artifact
         uses: actions/download-artifact@v4
         with:
-          name: hev-macos
-          path: dist-hev-macos
-
-      - name: Download hev for Windows
-        uses: actions/download-artifact@v4
-        with:
-          name: hev-windows
-          path: dist-hev-windows
+          name: skipicore-desktop-macos
+          path: dist-macos
 
       - name: Package Release Assets
         run: |
           mkdir -p release-assets
-          cp dist-hev-macos/*.tar.gz release-assets/
-          cp dist-hev-windows/hev-windows-x64.zip release-assets/
+          cp dist-macos/libskipicore-macos-*.dylib release-assets/
           find dist-windows -name "skipicore.dll" -exec cp {} release-assets/ \;
           (cd dist-windows && zip -9 -r ../release-assets/skipicore-windows-amd64.zip .)
           find dist-linux -name "libskipicore.so" -exec cp {} release-assets/ \;

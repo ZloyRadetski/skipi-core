@@ -152,7 +152,7 @@ func parseSessionPlan(planJSON string) (*sessionPlan, error) {
 			return nil, errors.New("session plan: hev.tunFd must be positive")
 		}
 		if hevTun.NeedsMacInterface() {
-			if err := hevtun.ValidateMacPlan(p.Hev.Executable, p.Hev.RunDirectory, p.Hev.MacInterface); err != nil {
+			if err := hevtun.ValidateMacPlan(p.Hev.RunDirectory, p.Hev.MacInterface); err != nil {
 				return nil, fmt.Errorf("session plan: %w", err)
 			}
 		}

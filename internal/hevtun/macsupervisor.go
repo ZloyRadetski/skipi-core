@@ -284,16 +284,10 @@ func MacIPv4Of(addresses []string) (string, error) {
 	return "", errors.New("the macOS tunnel plan has no IPv4 address")
 }
 
-// ValidateMacPlan checks the hev block of a session plan on macOS: an absolute executable, an
-// absolute run directory and an interface plan with a name, an IPv4 address, a positive MTU and
-// valid routes.
-func ValidateMacPlan(executable, runDirectory string, mac *MacInterface) error {
-	if strings.TrimSpace(executable) == "" {
-		return errors.New("hev.executable must not be blank")
-	}
-	if !cleanAbsolute(executable) {
-		return errors.New("hev.executable must be an absolute path")
-	}
+// ValidateMacPlan checks the hev block of a session plan on macOS: an absolute run directory and
+// an interface plan with a name, an IPv4 address, a positive MTU and valid routes. The hev
+// executable is not part of the plan: Core runs the one it carries.
+func ValidateMacPlan(runDirectory string, mac *MacInterface) error {
 	if strings.TrimSpace(runDirectory) == "" {
 		return errors.New("hev.runDirectory must not be blank")
 	}

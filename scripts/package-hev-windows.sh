@@ -15,7 +15,7 @@ HEV_VERSION="2.19.3"
 HEV_ARCHIVE_SHA256="a9209ad121a3f636f814b0bb899b6464d3ec201eabbb3a82f2aa486e32879ba7"
 GCC_DLL_SHA256="a9cfd10e2a4bf74f60530fc2f4f8fbe4055b50ff7ccd61b9440ef2fbe9c85aef"
 
-PYTHON="${PYTHON:-python3}"
+PYTHON="${PYTHON:-$(command -v python3 || command -v python || echo python3)}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUBMODULE="$ROOT/third_party/hev-socks5-tunnel"
 GCC_DLL="$ROOT/third_party/windows/msys-gcc_s-seh-1.dll"

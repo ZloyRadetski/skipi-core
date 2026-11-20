@@ -34,10 +34,10 @@ with `ndk-build`, so it works in Git Bash on Windows as well as on Linux. It the
 `CGO_LDFLAGS=-Wl,-z,max-page-size=16384` (16 KB page alignment for Android 15+;
 `-checklinkname=0` is required by github.com/wlynxg/anet with Go 1.23+), which links the hev
 libraries into `libgojni.so` through cgo. `internal/hevtun` is the Go side: Android and Linux
-(cgo) link hev in process, Windows runs the hev executable named in the session plan as a
-supervised process, macOS runs the same executable under a root supervisor started through the
-system's administrator prompt (osascript), and every other build gets a stub that returns "HEV TUN is not built into this
-Core on <GOOS>".
+(cgo) link hev in process, Windows runs the hev executable the library carries as a supervised
+process, macOS runs the one it carries under a root supervisor started through the system's
+administrator prompt (osascript), and every other build gets a stub that returns "HEV TUN is not
+built into this Core on <GOOS>".
 
 In PowerShell, quote `'-javapkg=app.skipi.core'` so the dotted Java package
 prefix is passed to `gomobile` as one argument.
@@ -61,16 +61,16 @@ CGO_ENABLED=1 go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -
 nm -D libskipicore.so | grep hev_socks5_tunnel_main_from_str   # HEV TUN is in the library
 ```
 
-On macOS and Windows hev runs as a process of its own, so Core builds and ships the executables
-(they are release assets of every Core version, and the app downloads them):
+On macOS and Windows hev runs as a process of its own, and the library carries it: the files go
+into `internal/hevpayload/payload/` before `go build` and are embedded (`go:embed`), so the host
+application ships no hev and the session plan names no executable. A library built without them
+works but reports "does not carry the HEV TUN runtime" when a tunnel is started.
 
 ```bash
-scripts/build-hev-mac.sh         # macOS host -> build/hev/macos/hev-socks5-tunnel (host architecture)
-scripts/package-hev-windows.sh   # any host   -> build/hev/windows/hev-windows-x64.zip (pinned official build + DLLs)
+scripts/stage-hev-payload.sh windows   # any host: official hev 2.19.3 (pinned SHA-256) + Wintun + MSYS DLLs
+scripts/stage-hev-payload.sh macos     # macOS host: hev built from the submodule (scripts/build-hev-mac.sh)
+scripts/stage-hev-payload.sh clean     # back to the placeholder
 ```
-
-On Windows the library needs no hev build: the host ships the hev executable (with `wintun.dll`
-and its MSYS runtime DLLs next to it) and passes its path as `hev.executable` in the session plan.
 
 ```powershell
 $env:CGO_ENABLED = "1"

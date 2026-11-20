@@ -6,10 +6,8 @@ package hevtun
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"io"
 	"os"
 	"path"
 	"strconv"
@@ -46,8 +44,11 @@ type macFS interface {
 type macEnv struct {
 	FS macFS
 	// Launch runs the privileged command; cancelling ctx ends it (and the password prompt).
-	Launch       func(ctx context.Context, command []string) error
-	HashFile     func(path string) (string, error)
+	Launch func(ctx context.Context, command []string) error
+	// Runtime writes the hev this Core carries into dir and returns its path and SHA-256. The hash is
+	// that of the embedded bytes, so the root copy is checked against what Core itself carries, not
+	// against a file a user could have replaced.
+	Runtime      func(dir string) (path, sha256 string, err error)
 	NewToken     func() string
 	IsAlive      func(pid int64) bool
 	Now          func() time.Time
@@ -81,20 +82,6 @@ type macTunnel struct {
 }
 
 func newMacTunnel(env macEnv) *macTunnel { return &macTunnel{env: env} }
-
-// fileSHA256 is the lowercase hex SHA-256 of the file at p.
-func fileSHA256(p string) (string, error) {
-	f, err := os.Open(p)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
 
 // randomToken is 16 random bytes in hex.
 func randomToken() string {
@@ -162,13 +149,10 @@ func (m *macTunnel) start(configYAML string, opts Options) error {
 	if strings.TrimSpace(opts.RunDirectory) == "" {
 		return errors.New("HEV TUN run directory is required on macOS")
 	}
-	if strings.TrimSpace(opts.Executable) == "" {
-		return errors.New("HEV TUN executable path is required on macOS")
-	}
 	if opts.MacInterface == nil {
 		return errors.New("HEV TUN needs the macOS interface plan")
 	}
-	if err := ValidateMacPlan(opts.Executable, opts.RunDirectory, opts.MacInterface); err != nil {
+	if err := ValidateMacPlan(opts.RunDirectory, opts.MacInterface); err != nil {
 		return err
 	}
 	dir := opts.RunDirectory
@@ -178,7 +162,11 @@ func (m *macTunnel) start(configYAML string, opts Options) error {
 	if err != nil {
 		return err
 	}
-	sum, err := m.env.HashFile(opts.Executable)
+	if err := m.env.FS.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	m.restrict(dir, 0o700)
+	hevPath, sum, err := m.env.Runtime(dir)
 	if err != nil {
 		return err
 	}
@@ -188,7 +176,7 @@ func (m *macTunnel) start(configYAML string, opts Options) error {
 		MTU:           mac.MTU,
 		IPv4Address:   ipv4,
 		Routes:        mac.Routes,
-		HevExecutable: opts.Executable,
+		HevExecutable: hevPath,
 		HevSHA256:     sum,
 		HevConfigYAML: configYAML,
 		StateDir:      m.env.StateDir,
@@ -200,10 +188,6 @@ func (m *macTunnel) start(configYAML string, opts Options) error {
 		return err
 	}
 
-	if err := m.env.FS.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	m.restrict(dir, 0o700)
 	// Leftovers of an earlier session, including the hev config (with its SOCKS password) that
 	// older versions kept here.
 	for _, name := range []string{"tun-ready", "tun-error", "tun-stop", "tun-hev.yaml"} {

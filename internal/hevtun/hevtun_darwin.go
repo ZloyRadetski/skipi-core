@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/ZloyRadetski/skipi-core/internal/hevpayload"
 )
 
 // macOS runs hev as a root supervisor started through the system's administrator prompt
@@ -68,7 +70,7 @@ func isAlive(pid int64) bool {
 var tunnel = newMacTunnel(macEnv{
 	FS:           osFS{},
 	Launch:       runLauncher,
-	HashFile:     fileSHA256,
+	Runtime:      func(dir string) (string, string, error) { return installMacRuntime(hevpayload.Files, dir) },
 	NewToken:     randomToken,
 	IsAlive:      isAlive,
 	Now:          time.Now,
@@ -82,8 +84,8 @@ var tunnel = newMacTunnel(macEnv{
 // NeedsTunFd is false: hev creates the utun interface itself.
 func NeedsTunFd() bool { return false }
 
-// Start writes the config (0600) into opts.RunDirectory (0700), shows the administrator prompt and
-// starts the supervisor; it returns once the prompt is answered. WaitReady follows the supervisor.
+// Start writes the hev Core carries into opts.RunDirectory (0700), shows the administrator prompt and
+// starts the supervisor with the config; it returns once the prompt is answered. WaitReady follows the supervisor.
 func Start(configYAML string, opts Options) error { return tunnel.start(configYAML, opts) }
 
 // WaitReady polls for the supervisor's ready or error marker; see macTunnel.waitReady.

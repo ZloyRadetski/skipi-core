@@ -15,3 +15,7 @@ dist/
 *.aar.version
 *.test
 /build/
+
+# The hev runtime a release build embeds (scripts/stage-hev-payload.sh); only the placeholder is tracked.
+internal/hevpayload/payload/*
+!internal/hevpayload/payload/.keep

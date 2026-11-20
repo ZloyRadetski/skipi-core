@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ZloyRadetski/skipi-core/internal/hevpayload"
 )
 
 var (
@@ -27,8 +29,6 @@ var (
 func TestMain(m *testing.M) {
 	// Built before any test redirects the temp directory.
 	fakeOnce.Do(buildFake)
-	// The test binary is not the Core library; the fake hev's directory stands in for Core's.
-	trustedHevRoot = func() (string, error) { return fakeDir, nil }
 	code := m.Run()
 	if fakeDir != "" {
 		_ = os.RemoveAll(fakeDir)
@@ -65,6 +65,16 @@ func isolate(t *testing.T) (tmp string, logged func() string) {
 	tmp = t.TempDir()
 	t.Setenv("TMP", tmp)
 	t.Setenv("TEMP", tmp)
+	// The embedded runtime is the fake hev, installed under tmp instead of next to the Core library.
+	fake, err := os.ReadFile(fakeHev(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origFiles, origRoot := payloadFiles, installRoot
+	payloadFiles = func() ([]hevpayload.File, error) {
+		return []hevpayload.File{{Name: hevExecutableName, Data: fake}}, nil
+	}
+	installRoot = func() (string, error) { return filepath.Join(tmp, "install"), nil }
 	var mu sync.Mutex
 	var sb strings.Builder
 	orig := logf
@@ -73,7 +83,7 @@ func isolate(t *testing.T) (tmp string, logged func() string) {
 		sb.WriteString(strings.TrimSpace(fmt.Sprintf(format, args...)) + "\n")
 		mu.Unlock()
 	}
-	t.Cleanup(func() { _ = Stop(); logf = orig })
+	t.Cleanup(func() { _ = Stop(); logf = orig; payloadFiles, installRoot = origFiles, origRoot })
 	return tmp, func() string { mu.Lock(); defer mu.Unlock(); return sb.String() }
 }
 
@@ -94,9 +104,8 @@ func TestWindowsNeedsNoTunFd(t *testing.T) {
 
 func TestWindowsStartRunsStopsAndCleansUp(t *testing.T) {
 	tmp, logged := isolate(t)
-	exe := fakeHev(t)
 
-	if err := Start("mode: run\n", Options{TunFd: -1, Executable: exe}); err != nil {
+	if err := Start("mode: run\n", Options{TunFd: -1}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if !Running() {
@@ -109,7 +118,8 @@ func TestWindowsStartRunsStopsAndCleansUp(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatalf("config files while running = %v, want one", files)
 	}
-	if err := Start("mode: run\n", Options{TunFd: 0, Executable: exe}); err == nil || !strings.Contains(err.Error(), "already running") {
+	installDir := filepath.Dir(current().cmd.Path)
+	if err := Start("mode: run\n", Options{TunFd: 0}); err == nil || !strings.Contains(err.Error(), "already running") {
 		t.Fatalf("second Start = %v, want already running", err)
 	}
 	if a, b, c, d := Stats(); a|b|c|d != 0 {
@@ -134,23 +144,22 @@ func TestWindowsStartRunsStopsAndCleansUp(t *testing.T) {
 	}
 	// Output was drained to the Core log, and the process ran from the executable's directory.
 	deadline := time.Now().Add(2 * time.Second)
-	for !strings.Contains(logged(), "hello from fakehev cwd="+filepath.Dir(exe)) && time.Now().Before(deadline) {
+	for !strings.Contains(logged(), "hello from fakehev cwd="+installDir) && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if got := logged(); !strings.Contains(got, "hello from fakehev cwd="+filepath.Dir(exe)) {
+	if got := logged(); !strings.Contains(got, "hello from fakehev cwd="+installDir) {
 		t.Fatalf("log = %q, want the process output with its working directory", got)
 	}
 }
 
 func TestWindowsEarlyExitIsAFailureWithOutput(t *testing.T) {
 	tmp, _ := isolate(t)
-	exe := fakeHev(t)
 
-	err := Start("mode: exit\n", Options{TunFd: 0, Executable: exe})
+	err := Start("mode: exit\n", Options{TunFd: 0})
 	if err == nil {
 		t.Fatal("Start must fail when the process exits during the grace window")
 	}
-	for _, want := range []string{"exited", "code 3", "boom", "stderr-line", filepath.Dir(exe)} {
+	for _, want := range []string{"exited", "code 3", "boom", "stderr-line", filepath.Join(tmp, "install")} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q lacks %q", err, want)
 		}
@@ -165,7 +174,7 @@ func TestWindowsEarlyExitIsAFailureWithOutput(t *testing.T) {
 
 func TestWindowsEarlyExitOutputIsCapped(t *testing.T) {
 	isolate(t)
-	err := Start("mode: flood\n", Options{TunFd: 0, Executable: fakeHev(t)})
+	err := Start("mode: flood\n", Options{TunFd: 0})
 	if err == nil {
 		t.Fatal("Start must fail")
 	}
@@ -176,7 +185,7 @@ func TestWindowsEarlyExitOutputIsCapped(t *testing.T) {
 
 func TestWindowsExitAfterStartIsReportedByWaitReadyAndStopIsClean(t *testing.T) {
 	tmp, _ := isolate(t)
-	if err := Start("mode: exitlater\n", Options{TunFd: 0, Executable: fakeHev(t)}); err != nil {
+	if err := Start("mode: exitlater\n", Options{TunFd: 0}); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
@@ -197,18 +206,14 @@ func TestWindowsExitAfterStartIsReportedByWaitReadyAndStopIsClean(t *testing.T) 
 	}
 }
 
-func TestWindowsMissingExecutableIsAClearError(t *testing.T) {
+func TestWindowsWithoutTheEmbeddedRuntimeFailsClearly(t *testing.T) {
 	tmp, _ := isolate(t)
-	missing := filepath.Join(tmp, "nope", "hev.exe")
-	err := Start("mode: run\n", Options{TunFd: 0, Executable: missing})
-	if err == nil || !strings.Contains(err.Error(), missing) {
-		t.Fatalf("Start with missing exe = %v, want an error naming %s", err, missing)
+	payloadFiles = func() ([]hevpayload.File, error) { return nil, hevpayload.ErrNotBundled }
+	err := Start("mode: run\n", Options{TunFd: 0})
+	if err == nil || !strings.Contains(err.Error(), "does not carry") {
+		t.Fatalf("Start without a payload = %v, want the build to say it carries no hev", err)
 	}
-	err = Start("mode: run\n", Options{})
-	if err == nil || !strings.Contains(err.Error(), "executable") {
-		t.Fatalf("Start without exe = %v, want an error about the executable", err)
-	}
-	if err := Start("", Options{TunFd: 0, Executable: fakeHev(t)}); err == nil {
+	if err := Start("", Options{TunFd: 0}); err == nil {
 		t.Fatal("blank config must be rejected")
 	}
 	if left := configFiles(t, tmp); len(left) != 0 {
