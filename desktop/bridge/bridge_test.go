@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	skipicore "github.com/ZloyRadetski/skipi-core"
+	"github.com/ZloyRadetski/skipi-core/internal/hevpayload"
 	"github.com/xtls/xray-core/transport/internet"
 )
 
@@ -641,13 +643,18 @@ func TestRuntimeQueryTunnelStatsIsZeroWithoutATunnelAndRejectsUnknownHandle(t *t
 }
 
 func TestRuntimeStartSessionAcceptsTheHevBlockAndReportsAFailedTunnelStart(t *testing.T) {
+	// A library that carries a hev runtime (the release build on Windows and macOS) would really
+	// start it here, which is not a unit test; the release itself checks those builds.
+	if files, err := hevpayload.Files(); err == nil && len(files) > 0 && goruntime.GOOS != "linux" {
+		t.Skip("this build carries a HEV TUN runtime")
+	}
 	runtime := initializedRuntime(t)
 	handle := runtime.CreateController()
 	t.Cleanup(func() { _ = runtime.DestroyController(handle) })
 
-	// On Windows the executable is missing; elsewhere the build has no HEV TUN or the descriptor
-	// is invalid. Either way the plan is parsed, HEV TUN is attempted after Xray, its failure is
-	// reported by name, and the session lease is released again.
+	// Without a runtime in the build (or with an invalid descriptor on Linux) the plan is parsed,
+	// HEV TUN is attempted after Xray, its failure is reported by name, and the session lease is
+	// released again. An executable in the plan is an old host's and is ignored.
 	hev := map[string]any{
 		"configYaml": "tunnel:\n  mtu: 1500\n",
 		"tunFd":      -1,

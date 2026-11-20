@@ -33,6 +33,24 @@ jobs:
           go-version: '1.27'
           check-latest: true
 
+      - name: Set up GCC
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+          path-type: inherit
+
+      - name: Test
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export CGO_ENABLED=1
+          export CC=gcc
+          export CXX=g++
+          go test ./...
+
       # The DLL carries the hev runtime itself (internal/hevpayload), so the host application ships none.
       - name: Download the hev runtime
         uses: actions/download-artifact@v4
@@ -44,23 +62,13 @@ jobs:
         shell: pwsh
         run: Expand-Archive -Path hev-runtime/hev-windows-x64.zip -DestinationPath internal/hevpayload/payload -Force
 
-      - name: Set up GCC
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            mingw-w64-ucrt-x86_64-gcc
-          path-type: inherit
-
-      - name: Test and build shared library
+      - name: Build shared library
         shell: msys2 {0}
         run: |
           set -euo pipefail
           export CGO_ENABLED=1
           export CC=gcc
           export CXX=g++
-          go test ./...
           mkdir -p dist
           go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o dist/skipicore.dll ./cmd/skipicore-desktop
           cp desktop/include/skipicore_desktop.h dist/
