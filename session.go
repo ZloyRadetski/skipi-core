@@ -94,8 +94,8 @@ func (c *CoreController) notifyState(s lifecycleState, detail string) {
 		return
 	}
 	defer func() { _ = recover() }()
-	if testHookBeforeDeliver != nil {
-		testHookBeforeDeliver(int(s))
+	if hook := testHookBeforeDeliver.Load(); hook != nil {
+		(*hook)(int(s))
 	}
 	box.l.OnStateChanged(int(s), detail)
 }

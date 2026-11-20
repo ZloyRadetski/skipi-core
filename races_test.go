@@ -23,15 +23,16 @@ func TestAStopDoesNotClearTheDescriptorOfTheNextStart(t *testing.T) {
 	}
 
 	secondErr := make(chan error, 1)
-	testHookAfterStopUnlock = func() {
+	afterStop := func() {
 		go func() { secondErr <- c.StartLoop(stopTestConfig, 22) }()
 		waitSignal(t, second.startEntered, "the next start")
 	}
-	defer func() { testHookAfterStopUnlock = nil }()
+	testHookAfterStopUnlock.Store(&afterStop)
+	defer testHookAfterStopUnlock.Store(nil)
 	if err := c.StopLoop(); err != nil {
 		t.Fatal(err)
 	}
-	testHookAfterStopUnlock = nil
+	testHookAfterStopUnlock.Store(nil)
 	got := os.Getenv(tunFdKey)
 	close(second.startRelease)
 	if err := <-secondErr; err != nil {
@@ -90,12 +91,13 @@ func TestStateNotificationsArriveInOrder(t *testing.T) {
 
 	inHook, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	testHookBeforeDeliver = func(state int) {
+	beforeDeliver := func(state int) {
 		if state == SessionStarting {
 			once.Do(func() { close(inHook); <-release })
 		}
 	}
-	defer func() { testHookBeforeDeliver = nil }()
+	testHookBeforeDeliver.Store(&beforeDeliver)
+	defer testHookBeforeDeliver.Store(nil)
 
 	startErr := make(chan error, 1)
 	go func() { startErr <- c.StartLoop(stopTestConfig, 0) }()

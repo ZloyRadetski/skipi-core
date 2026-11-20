@@ -101,9 +101,10 @@ var (
 // Test hooks; nil in production.
 var (
 	// testHookAfterStopUnlock runs once a stop has made the controller idle again.
-	testHookAfterStopUnlock func()
+	// Atomic, because goroutines of an earlier test may still pass through them.
+	testHookAfterStopUnlock atomic.Pointer[func()]
 	// testHookBeforeDeliver runs before the state listener hears a transition.
-	testHookBeforeDeliver func(state int)
+	testHookBeforeDeliver atomic.Pointer[func(state int)]
 )
 
 // ErrStopTimedOut marks a stop that gave up waiting for Xray (or AmneziaWG) to close. The
@@ -424,8 +425,8 @@ func (c *CoreController) stopWithinReason(d time.Duration, reason string) error 
 	c.state = stateIdle
 	c.queueStateLocked(stateIdle, detail)
 	c.mu.Unlock()
-	if testHookAfterStopUnlock != nil {
-		testHookAfterStopUnlock()
+	if hook := testHookAfterStopUnlock.Load(); hook != nil {
+		(*hook)()
 	}
 	op.Finish(stopErr)
 	c.deliverStates()

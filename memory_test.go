@@ -59,9 +59,10 @@ func BenchmarkLegacyReadMemStats(b *testing.B) {
 // size in the background (what Android's low-memory killer looks at) drops.
 func TestStartAndStopReturnFreedMemoryToTheOS(t *testing.T) {
 	var calls atomic.Int32
-	orig := releaseMemory
-	releaseMemory = func() { calls.Add(1) }
-	defer func() { releaseMemory = orig }()
+	orig := releaseMemoryFn.Load()
+	count := func() { calls.Add(1) }
+	releaseMemoryFn.Store(&count)
+	defer releaseMemoryFn.Store(orig)
 
 	installFakeCore(t, newFakeCoreInstance())
 	c := NewCoreController(nil)

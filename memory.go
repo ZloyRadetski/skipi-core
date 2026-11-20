@@ -5,6 +5,7 @@ package skipicore
 
 import (
 	"runtime/debug"
+	"sync/atomic"
 
 	"github.com/ZloyRadetski/skipi-core/internal/memstats"
 )
@@ -40,8 +41,16 @@ func ReadMemoryStats() string {
 
 // releaseMemory collects and hands freed memory back to the OS. Core runs it in the background
 // after a start (the parsed config and geo data are garbage then) and after a stop (the whole
-// instance is). A variable so tests can count it.
-var releaseMemory = debug.FreeOSMemory
+// instance is). The function is behind an atomic pointer so tests can swap it while goroutines
+// of an earlier test (a watcher that stopped its session) may still call it.
+var releaseMemoryFn atomic.Pointer[func()]
+
+func init() {
+	f := debug.FreeOSMemory
+	releaseMemoryFn.Store(&f)
+}
+
+func releaseMemory() { (*releaseMemoryFn.Load())() }
 
 // ForceFreeMemory triggers a garbage collection cycle and releases unused memory back to the OS.
 func ForceFreeMemory() {
