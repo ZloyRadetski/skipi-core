@@ -389,6 +389,26 @@ func SkipiCoreDesktopMeasureTcpDelay(host *C.char, port C.int32_t, timeoutMillis
 	})
 }
 
+// SkipiCoreDesktopMeasureOutboundDelays measures every outbound named in candidate_tags (comma
+// separated) of one config through a single isolated Core instance and returns an owned JSON
+// object of tag to milliseconds (-1 for a tag that failed), or NULL on error (see
+// SkipiCoreDesktopLastError).
+//
+//export SkipiCoreDesktopMeasureOutboundDelays
+func SkipiCoreDesktopMeasureOutboundDelays(configJSON *C.char, candidateTags *C.char, targetURL *C.char, timeoutMillis C.int64_t) *C.char {
+	return cString(func() (string, error) {
+		config, err := requiredCString(configJSON, "probe configuration")
+		if err != nil {
+			return "", err
+		}
+		target, err := requiredCString(targetURL, "delay target URL")
+		if err != nil {
+			return "", err
+		}
+		return desktopRuntime.MeasureOutboundDelays(config, C.GoString(candidateTags), target, int64(timeoutMillis))
+	})
+}
+
 // SkipiCoreDesktopReadMemoryStats returns an owned JSON memory snapshot.
 //
 //export SkipiCoreDesktopReadMemoryStats

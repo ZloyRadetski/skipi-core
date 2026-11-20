@@ -223,3 +223,37 @@ func TestAProbeInstanceIsBuiltWithoutReadingRoutingOrDNS(t *testing.T) {
 	}
 	_ = inst.Close()
 }
+
+// Perf 3: pinging N servers builds one instance for all of them, not one each, and reports every
+// tag: its delay, or -1 when it failed.
+func TestDelaysMeasureEveryTagThroughOneInstance(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	built := 0
+	orig := newProbeInstance
+	newProbeInstance = func(cfg string) (*core.Instance, error) { built++; return orig(cfg) }
+	defer func() { newProbeInstance = orig }()
+
+	config := `{"log":{"loglevel":"none"},"outbounds":[
+		{"protocol":"freedom","tag":"a"},{"protocol":"freedom","tag":"b"},{"protocol":"blackhole","tag":"dead"}]}`
+	out := Delays(config, "a, b,dead,missing", ts.URL, 3000)
+	var got map[string]int64
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if built != 1 {
+		t.Fatalf("built %d instances, want 1", built)
+	}
+	if got["a"] < 0 || got["b"] < 0 {
+		t.Fatalf("reachable tags failed: %v", got)
+	}
+	if got["dead"] != -1 || got["missing"] != -1 || len(got) != 4 {
+		t.Fatalf("failed tags must be -1 and every tag reported: %v", got)
+	}
+	if out := Delays("not json", "a", ts.URL, 1000); out != `{"a":-1}` {
+		t.Fatalf("a config that does not load fails every tag: %s", out)
+	}
+}

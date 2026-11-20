@@ -752,3 +752,20 @@ func TestSessionAndAwgStartsInstallTheDesktopSocketProtector(t *testing.T) {
 		t.Fatalf("installed = %v", installed)
 	}
 }
+
+func TestMeasureOutboundDelaysReportsEveryTag(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer ts.Close()
+	runtime := NewRuntime()
+	out, err := runtime.MeasureOutboundDelays(`{"outbounds":[{"protocol":"freedom","tag":"a"},{"protocol":"blackhole","tag":"b"}]}`, "a,b", ts.URL, 3000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]int64
+	if err := json.Unmarshal([]byte(out), &got); err != nil || got["a"] < 0 || got["b"] != -1 {
+		t.Fatalf("got %s (%v)", out, err)
+	}
+	if _, err := runtime.MeasureOutboundDelays(" ", "a", ts.URL, 0); err == nil {
+		t.Fatal("a blank config must be rejected")
+	}
+}

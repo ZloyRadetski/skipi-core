@@ -19,6 +19,14 @@ func MeasureOutboundDelay(configJSON string, targetURL string) (int64, error) {
 	return probe.Delay(configJSON, targetURL)
 }
 
+// MeasureOutboundDelays measures the delay through every outbound in candidateTags (comma
+// separated) of one config with a single isolated instance, instead of one instance per server.
+// Each tag is measured like MeasureOutboundDelay within timeoutMs (non-positive: 12 s). It returns
+// a JSON object of tag to milliseconds, -1 for a tag that failed.
+func MeasureOutboundDelays(configJSON string, candidateTags string, targetURL string, timeoutMs int64) string {
+	return probe.Delays(configJSON, candidateTags, targetURL, timeoutMs)
+}
+
 // MeasureOutboundDownload downloads exactly maxBytes through an isolated
 // outbound configuration and returns a JSON result containing the measured
 // payload, elapsed time, first-byte time and HTTP status. requestID is optional

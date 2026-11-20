@@ -276,6 +276,11 @@ func startOutboundTestInstance(configJSON string) (*core.Instance, error) {
 
 // InstanceDelay measures network latency for an instance to a given target URL with 2 attempts and jitter reduction.
 func InstanceDelay(ctx context.Context, inst *core.Instance, targetURL string) (int64, error) {
+	return instanceDelayVia(ctx, inst, targetURL, "")
+}
+
+// instanceDelayVia is InstanceDelay through the outbound tagged tag, or the routed one when tag is empty.
+func instanceDelayVia(ctx context.Context, inst *core.Instance, targetURL string, tag string) (int64, error) {
 	if inst == nil {
 		return -1, errors.New("core instance is nil")
 	}
@@ -291,6 +296,9 @@ func InstanceDelay(ctx context.Context, inst *core.Instance, targetURL string) (
 			dest, err := corenet.ParseDestination(fmt.Sprintf("%s:%s", network, addr))
 			if err != nil {
 				return nil, err
+			}
+			if tag != "" {
+				ctx = session.SetForcedOutboundTagToContext(ctx, tag)
 			}
 			return core.Dial(ctx, inst, dest)
 		},
@@ -423,6 +431,74 @@ func instanceDownload(
 		TtfbMillis:      ttfbMillis,
 		StatusCode:      resp.StatusCode,
 	}, nil
+}
+
+// maxDelaysInFlight bounds how many tags one Delays call measures at once.
+const maxDelaysInFlight = 16
+
+// splitTags turns "a, b,,c" into [a b c].
+func splitTags(candidateTags string) []string {
+	var tags []string
+	for _, t := range strings.Split(candidateTags, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			tags = append(tags, t)
+		}
+	}
+	return tags
+}
+
+// Delays measures the delay through every outbound in candidateTags (comma separated) with one
+// stripped-down instance for all of them, instead of one instance per server. Each tag is
+// measured like Delay (two attempts, the faster counts) within timeoutMs (non-positive: 12 s).
+// The result is a JSON object of tag to milliseconds, -1 for a tag that failed; when the config
+// does not load, every tag is -1.
+func Delays(configJSON string, candidateTags string, targetURL string, timeoutMs int64) string {
+	tags := splitTags(candidateTags)
+	results := make(map[string]int64, len(tags))
+	for _, tag := range tags {
+		results[tag] = -1
+	}
+	encode := func() string {
+		out, _ := json.Marshal(results)
+		return string(out)
+	}
+	if len(tags) == 0 {
+		return encode()
+	}
+	if timeoutMs <= 0 {
+		timeoutMs = 12_000
+	}
+
+	release := acquireProbeSlot()
+	defer release()
+	server, err := newProbeInstance(configJSON)
+	if err != nil {
+		return encode()
+	}
+	defer closeProbeInstance(server)
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, maxDelaysInFlight)
+	for _, tag := range tags {
+		wg.Add(1)
+		slots <- struct{}{}
+		go func(tag string) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+			defer cancel()
+			delay, err := instanceDelayVia(ctx, server, targetURL, tag)
+			if err != nil {
+				delay = -1
+			}
+			mu.Lock()
+			results[tag] = delay
+			mu.Unlock()
+		}(tag)
+	}
+	wg.Wait()
+	return encode()
 }
 
 // FastSelect concurrently tests candidate outbounds against a probe URL (defaulting to

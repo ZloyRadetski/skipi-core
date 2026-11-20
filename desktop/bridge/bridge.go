@@ -402,6 +402,18 @@ func (r *Runtime) MeasureDelay(handle Handle, targetURL string) (int64, error) {
 // MeasureOutboundDelay measures the latency of one outbound through an isolated Core
 // instance, without a controller and without touching the running session. The probe can
 // take seconds and holds no runtime lock.
+// MeasureOutboundDelays measures every outbound in candidateTags (comma separated) of one config
+// through a single isolated instance; see skipicore.MeasureOutboundDelays for the JSON it returns.
+func (r *Runtime) MeasureOutboundDelays(configJSON, candidateTags, targetURL string, timeoutMillis int64) (string, error) {
+	if strings.TrimSpace(configJSON) == "" {
+		return "", errors.New("SKIPI Core desktop probe configuration must not be blank")
+	}
+	if strings.TrimSpace(targetURL) == "" {
+		return "", errors.New("SKIPI Core desktop delay target must not be blank")
+	}
+	return skipicore.MeasureOutboundDelays(configJSON, candidateTags, targetURL, timeoutMillis), nil
+}
+
 func (r *Runtime) MeasureOutboundDelay(configJSON string, targetURL string) (int64, error) {
 	if strings.TrimSpace(configJSON) == "" {
 		return -1, errors.New("SKIPI Core desktop probe configuration must not be blank")

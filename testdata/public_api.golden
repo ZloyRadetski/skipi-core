@@ -66,6 +66,8 @@ func IsAmneziaWgRunning() bool
 
 func MeasureOutboundDelay(configJSON string, targetURL string) (int64, error)
 
+func MeasureOutboundDelays(configJSON string, candidateTags string, targetURL string, timeoutMs int64) string
+
 func MeasureOutboundDownload(
 	configJSON string,
 	targetURL string,
