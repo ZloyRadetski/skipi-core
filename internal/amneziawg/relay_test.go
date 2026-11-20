@@ -48,3 +48,56 @@ func TestRelayKeepsTheAnswerAfterTheClientHalfCloses(t *testing.T) {
 		t.Fatalf("A read %q, %v", answer, err)
 	}
 }
+
+// chunkReader returns the given chunk sizes one per Read, then EOF.
+type chunkReader struct{ sizes []int }
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if len(r.sizes) == 0 {
+		return 0, io.EOF
+	}
+	n := min(r.sizes[0], len(p))
+	r.sizes = r.sizes[1:]
+	for i := range p[:n] {
+		p[i] = 'x'
+	}
+	return n, nil
+}
+
+// Perf 7: an idle or quiet direction holds a small buffer; the large pooled one is taken only
+// while reads fill the small one, and handed back once the flow quiets down.
+func TestCopyTakesTheLargeBufferOnlyWhileTrafficFillsTheSmallOne(t *testing.T) {
+	taken, returned := 0, 0
+	origTake, origReturn := takeCopyBuffer, returnCopyBuffer
+	takeCopyBuffer = func() *[]byte { taken++; return origTake() }
+	returnCopyBuffer = func(b *[]byte) { returned++; origReturn(b) }
+	defer func() { takeCopyBuffer, returnCopyBuffer = origTake, origReturn }()
+
+	var sink countingWriter
+	if err := copyPooled(&sink, &chunkReader{sizes: []int{10, 200, 1000}}); err != nil {
+		t.Fatal(err)
+	}
+	if taken != 0 || sink.n != 1210 {
+		t.Fatalf("quiet traffic took %d large buffers, copied %d bytes", taken, sink.n)
+	}
+
+	sink = countingWriter{}
+	bulk := []int{smallCopyBufferSize, 32 << 10, 32 << 10, 32 << 10, 100, 5, smallCopyBufferSize, 7}
+	if err := copyPooled(&sink, &chunkReader{sizes: bulk}); err != nil {
+		t.Fatal(err)
+	}
+	want := 0
+	for _, n := range bulk {
+		want += n
+	}
+	if sink.n != want {
+		t.Fatalf("copied %d bytes, want %d", sink.n, want)
+	}
+	if taken != 2 || returned != 2 {
+		t.Fatalf("bulk traffic: taken %d, returned %d; want the large buffer twice, each handed back", taken, returned)
+	}
+}
+
+type countingWriter struct{ n int }
+
+func (w *countingWriter) Write(p []byte) (int, error) { w.n += len(p); return len(p), nil }

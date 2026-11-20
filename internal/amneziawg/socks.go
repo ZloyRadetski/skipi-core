@@ -29,13 +29,56 @@ var (
 	UDPBuffers = sync.Pool{New: func() any { b := make([]byte, udpBufferSize); return &b }}
 )
 
-// copyPooled copies src to dst through a pooled buffer. The wrappers hide ReadFrom/WriteTo so
-// the supplied buffer is really used instead of a fresh 32 KiB one per call.
+// smallCopyBufferSize is what a relay direction holds while it waits or carries little traffic.
+const smallCopyBufferSize = 2 * 1024
+
+// Seams for the large pooled copy buffer, so tests can count them.
+var (
+	takeCopyBuffer   = func() *[]byte { return copyBuffers.Get().(*[]byte) }
+	returnCopyBuffer = func(b *[]byte) { copyBuffers.Put(b) }
+)
+
+// copyPooled copies src to dst. Most relayed connections sit idle most of the time, and a 32 KiB
+// buffer per direction made every one of them cost 64 KiB. A direction now reads into a small
+// buffer and takes a large pooled one only while reads fill the small one (bulk traffic), and
+// hands it back as soon as a read comes in under the small size. Calls go straight to Read and
+// Write, so the buffer used is really this one.
 func copyPooled(dst io.Writer, src io.Reader) error {
-	buf := copyBuffers.Get().(*[]byte)
-	defer copyBuffers.Put(buf)
-	_, err := io.CopyBuffer(struct{ io.Writer }{dst}, struct{ io.Reader }{src}, *buf)
-	return err
+	small := make([]byte, smallCopyBufferSize)
+	buf := small
+	var large *[]byte
+	defer func() {
+		if large != nil {
+			returnCopyBuffer(large)
+		}
+	}()
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			w, werr := dst.Write(buf[:n])
+			if werr != nil {
+				return werr
+			}
+			if w != n {
+				return io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return nil
+			}
+			return rerr
+		}
+		switch {
+		case large == nil && n == len(small):
+			large = takeCopyBuffer()
+			buf = *large
+		case large != nil && n < len(small):
+			returnCopyBuffer(large)
+			large = nil
+			buf = small
+		}
+	}
 }
 
 type closeWriter interface{ CloseWrite() error }
