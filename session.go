@@ -211,8 +211,18 @@ func (c *CoreController) StartSession(planJSON string, tunFd int64) error {
 		return l.config, l.err
 	}
 
+	// hev starts at once, beside AmneziaWG and the loading of the Xray config; see hevStart.
+	var hev *hevStart
+	if plan.Hev != nil {
+		hev = c.beginSessionHev(myGen, plan.Hev)
+	}
+
 	var runner *AmneziaWgRunner
 	stopOwnAwg := func() {
+		// Reverse of the start order: hev first, then AmneziaWG.
+		if hev != nil {
+			hev.cancel()
+		}
 		if runner != nil {
 			stopAwgRunner(runner, defaultStopTimeout)
 		}
@@ -228,7 +238,7 @@ func (c *CoreController) StartSession(planJSON string, tunFd int64) error {
 	c.SetConnectionLogEnabled(plan.ConnectionLog)
 	var afterXray func() error
 	if plan.Hev != nil {
-		afterXray = func() error { return c.startSessionHev(myGen, plan.Hev) }
+		afterXray = hev.await
 	}
 	if err := c.runStart(myGen, load, tunFd, plan.AmneziaWg != nil, stopOwnAwg, afterXray, plan.Hev != nil); err != nil {
 		stopOwnAwg() // also covers a start that ForceStop aborted

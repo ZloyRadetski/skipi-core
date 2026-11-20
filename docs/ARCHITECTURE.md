@@ -94,7 +94,7 @@ only valid IPv4/IPv6 CIDR routes (`dns` is accepted but not configured yet).
    first dial normally succeeds; the poll keeps the contract independent of that. Not ready in time:
    AmneziaWG is stopped (bounded) and the error names the port and the timeout.
 2. Apply `connectionLog`, then the ordinary `StartLoop` path. An Xray failure stops AmneziaWG.
-   With `hev`, HEV TUN starts after Xray and Core waits for its readiness (`hevReadyTimeout`, 5 s; on macOS the supervisor's own 30 s budget when longer).
+   With `hev`, HEV TUN is started first, in its own goroutine (`hevStart`), beside AmneziaWG and the loading of the Xray config: bringing hev up (a console process and a Wintun adapter on Windows, the administrator prompt on macOS) does not depend on Xray, and it was the slow part of a tunnel start. The session joins it once Xray is up and waits for its readiness (`hevReadyTimeout`, 5 s; on macOS the supervisor's own 30 s budget when longer). hev only meets traffic when the host installs the routes, after the session returns. A failed or aborted start cancels it (a late answer to the macOS prompt stops the hev that then comes up).
    Not ready or failed: HEV TUN, Xray and AmneziaWG are stopped in reverse.
    Stop order is HEV TUN, Xray, AmneziaWG, each bounded; a hung HEV TUN stop counts as abandoned.
    `QueryTunnelStats` returns hev's packet and byte counters as JSON (desktop:

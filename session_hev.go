@@ -152,6 +152,23 @@ func stopHevIfOwned(c *CoreController, gen uint64, d time.Duration) error {
 	return err
 }
 
+// stopHevUnlessOwnedByOther stops HEV TUN unless a different start attempt has claimed it since.
+// It stops through tun, the target the start used, so a late goroutine never reads the package variable.
+func stopHevUnlessOwnedByOther(c *CoreController, gen uint64, tun hevTunnel, d time.Duration) {
+	hevOwner.Lock()
+	other := hevOwner.c != nil && (hevOwner.c != c || hevOwner.gen != gen)
+	hevOwner.Unlock()
+	if other {
+		return
+	}
+	_, _ = lifecycle.RunBounded(tun.Stop, d, nil)
+	hevOwner.Lock()
+	if hevOwner.c == c && hevOwner.gen == gen {
+		hevOwner.c, hevOwner.gen = nil, 0
+	}
+	hevOwner.Unlock()
+}
+
 // stopHevBounded stops HEV TUN within d; a stop that hangs is counted in AbandonedInstances
 // until it returns and reported as ErrStopTimedOut. cancel, when set, also ends the wait.
 func stopHevBounded(d time.Duration, cancel <-chan struct{}) error {
@@ -165,17 +182,87 @@ func stopHevBounded(d time.Duration, cancel <-chan struct{}) error {
 	return nil
 }
 
-// startSessionHev starts HEV TUN and waits for it to be ready. On any failure it stops it again
-// before returning. gen is the start attempt; a ForceStop that supersedes it ends the wait.
-func (c *CoreController) startSessionHev(gen uint64, cfg *sessionPlanHev) error {
-	if c.superseded(gen) {
-		return errStartAborted
-	}
-	opts := hevtun.Options{TunFd: cfg.TunFd, RunDirectory: cfg.RunDirectory, MacInterface: cfg.MacInterface}
+// hevStart is the start of HEV TUN inside a session. It begins at the very start of StartSession, in
+// its own goroutine, and the session joins it (await) once Xray is up. Starting hev is the slow part
+// of a tunnel start that does not depend on Xray (a console process and a Wintun adapter on Windows,
+// the administrator prompt on macOS), so it runs beside AmneziaWG and the loading of the Xray config
+// instead of after them. hev only meets traffic once the host installs the routes, after the session.
+type hevStart struct {
+	c    *CoreController
+	gen  uint64
+	cfg  *sessionPlanHev
+	tun  hevTunnel
+	done chan struct{} // closed when Start returned
+	err  error         // Start's result; valid once done is closed
+
+	mu        sync.Mutex
+	cancelled bool
+}
+
+// beginSessionHev starts HEV TUN for start attempt gen without waiting for it.
+func (c *CoreController) beginSessionHev(gen uint64, cfg *sessionPlanHev) *hevStart {
+	h := &hevStart{c: c, gen: gen, cfg: cfg, tun: hevTun, done: make(chan struct{})}
 	claimHev(c, gen)
-	if err := hevTun.Start(cfg.ConfigYAML, opts); err != nil {
+	go h.run()
+	return h
+}
+
+func (h *hevStart) run() {
+	defer close(h.done)
+	h.mu.Lock()
+	cancelled := h.cancelled
+	h.mu.Unlock()
+	if cancelled {
+		h.err = errStartAborted
+		return
+	}
+	opts := hevtun.Options{TunFd: h.cfg.TunFd, RunDirectory: h.cfg.RunDirectory, MacInterface: h.cfg.MacInterface}
+	h.err = h.tun.Start(h.cfg.ConfigYAML, opts)
+	if h.err != nil {
+		return
+	}
+	h.mu.Lock()
+	cancelled = h.cancelled
+	h.mu.Unlock()
+	if cancelled {
+		// The session was abandoned while hev came up (a late answer to the macOS prompt, say).
+		stopHevUnlessOwnedByOther(h.c, h.gen, h.tun, defaultStopTimeout)
+	}
+}
+
+// cancel ends the start: hev is stopped now, or as soon as its Start returns.
+func (h *hevStart) cancel() {
+	h.mu.Lock()
+	h.cancelled = true
+	h.mu.Unlock()
+	_ = stopHevIfOwned(h.c, h.gen, defaultStopTimeout)
+}
+
+// await joins the start and then waits for hev to be ready. On any failure it stops hev again before
+// returning. A ForceStop that supersedes the start attempt ends the wait.
+func (h *hevStart) await() error {
+	c, gen := h.c, h.gen
+	for waiting := true; waiting; {
+		select {
+		case <-h.done:
+			waiting = false
+		case <-time.After(hevReadyPoll):
+			if c.superseded(gen) {
+				h.cancel()
+				return errStartAborted
+			}
+		}
+	}
+	if h.err != nil {
+		if errors.Is(h.err, errStartAborted) {
+			return errStartAborted
+		}
 		_ = stopHevIfOwned(c, gen, defaultStopTimeout)
-		return fmt.Errorf("HEV TUN failed to start: %w", err)
+		return fmt.Errorf("HEV TUN failed to start: %w", h.err)
+	}
+	if c.superseded(gen) {
+		_ = stopHevIfOwned(c, gen, defaultStopTimeout)
+		return errStartAborted
 	}
 	readyTimeout := max(hevReadyTimeout, hevTun.ReadyTimeout())
 	deadline := time.Now().Add(readyTimeout)

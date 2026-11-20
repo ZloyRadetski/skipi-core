@@ -60,6 +60,8 @@ type fakeHev struct {
 	waits         atomic.Int32
 	// readyOK, once set, ends the readyErr answers of WaitReady.
 	readyOK atomic.Bool
+	// startGate, when set, holds Start until it is closed (the macOS password prompt is such a wait).
+	startGate chan struct{}
 	// exited, when set, is what Exited returns: closed when hev ended. nil makes the session poll.
 	exited      chan struct{}
 	running     atomic.Bool
@@ -80,6 +82,9 @@ func (f *fakeHev) ReadyTimeout() time.Duration { return f.readyBudget }
 
 func (f *fakeHev) Start(cfg string, opts hevtun.Options) error {
 	f.log.add("hev.start")
+	if f.startGate != nil {
+		<-f.startGate
+	}
 	f.gotCfg.Store(cfg)
 	f.gotFd.Store(int64(opts.TunFd))
 	f.gotOpts.Store(opts)
@@ -265,9 +270,10 @@ func TestSessionStartAndStopOrderWithHev(t *testing.T) {
 	if err := c.StartSession(hevPlan(t, reserveLocalPort(t), true), 0); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := log.String(), "awg.start,xray.start,hev.start,hev.waitReady"; got != want {
-		t.Fatalf("start order = %s, want %s", got, want)
-	}
+	// HEV TUN is started at once and waited for last: where it begins relative to AmneziaWG and Xray
+	// is not fixed, but readiness is only asked after both are up.
+	inOrder(t, log, "awg.start", "xray.start", "hev.waitReady")
+	inOrder(t, log, "hev.start", "hev.waitReady")
 	if hev.gotCfg.Load() != hevTestYAML || hev.gotFd.Load() != 42 {
 		t.Fatalf("hev got cfg=%v fd=%d", hev.gotCfg.Load(), hev.gotFd.Load())
 	}
@@ -277,8 +283,8 @@ func TestSessionStartAndStopOrderWithHev(t *testing.T) {
 	if err := c.StopLoop(); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := log.String(), "awg.start,xray.start,hev.start,hev.waitReady,hev.stop,xray.close,awg.stop"; got != want {
-		t.Fatalf("order = %s, want %s", got, want)
+	if got, want := log.String(), "hev.waitReady,hev.stop,xray.close,awg.stop"; !strings.HasSuffix(got, want) {
+		t.Fatalf("order = %s, want it to end with %s", got, want)
 	}
 	if hev.Running() || c.State() != SessionIdle {
 		t.Fatal("everything must be stopped")
@@ -329,8 +335,9 @@ func TestSessionHevStartErrorRollsBack(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "HEV TUN") || !strings.Contains(err.Error(), "config rejected") {
 		t.Fatalf("err = %v", err)
 	}
-	if got, want := log.String(), "awg.start,xray.start,hev.start,xray.close,awg.stop"; got != want {
-		t.Fatalf("order = %s, want %s", got, want)
+	inOrder(t, log, "awg.start", "xray.start", "xray.close", "awg.stop")
+	if log.count("hev.start") != 1 {
+		t.Fatalf("hev must be started once: %s", log)
 	}
 	if c.State() != SessionIdle {
 		t.Fatalf("state = %d", c.State())
@@ -386,8 +393,8 @@ func TestForceStopCoversHev(t *testing.T) {
 	if err := c.ForceStop(); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := log.String(), "awg.start,xray.start,hev.start,hev.waitReady,hev.stop,xray.close,awg.stop"; got != want {
-		t.Fatalf("order = %s, want %s", got, want)
+	if got, want := log.String(), "hev.waitReady,hev.stop,xray.close,awg.stop"; !strings.HasSuffix(got, want) {
+		t.Fatalf("order = %s, want it to end with %s", got, want)
 	}
 }
 
@@ -704,6 +711,95 @@ func TestSessionWaitsOnTheHevExitInsteadOfPolling(t *testing.T) {
 	for c.State() != SessionIdle {
 		if time.Now().After(deadline) {
 			t.Fatalf("state = %d, want idle right after hev exited", c.State())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// inOrder fails unless the events of log contain want as a subsequence.
+func inOrder(t *testing.T, log *callLog, want ...string) {
+	t.Helper()
+	events := log.list()
+	i := 0
+	for _, e := range events {
+		if i < len(want) && e == want[i] {
+			i++
+		}
+	}
+	if i != len(want) {
+		t.Fatalf("events %v do not contain %v in that order", events, want)
+	}
+}
+
+// Speed: hev takes a while to come up (a console process on Windows, the administrator prompt on
+// macOS), so it starts at once and not after Xray has loaded its routing data and started.
+func TestHevStartsWhileTheXrayConfigIsStillLoading(t *testing.T) {
+	hev := &fakeHev{}
+	log := installOrderedFakes(t, hev)
+	origLoad := loadXrayConfig
+	t.Cleanup(func() { loadXrayConfig = origLoad })
+	loadXrayConfig = func(text string) (*core.Config, error) {
+		deadline := time.Now().Add(3 * time.Second)
+		for log.count("hev.start") == 0 {
+			if time.Now().After(deadline) {
+				return nil, errors.New("hev was not started while the config was loading")
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		return origLoad(text)
+	}
+	c := NewCoreController(nil)
+	if err := c.StartSession(hevPlan(t, reserveLocalPort(t), false), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.StopLoop() })
+	inOrder(t, log, "hev.start", "xray.start", "hev.waitReady")
+}
+
+// A start that fails after hev was started early leaves nothing of it running.
+func TestAFailedXrayStartStopsTheEarlyHev(t *testing.T) {
+	hev := &fakeHev{}
+	log := installOrderedFakes(t, hev)
+	startCoreInstance = func(coreInstance) error { return errors.New("xray refused") }
+	c := NewCoreController(nil)
+	err := c.StartSession(hevPlan(t, reserveLocalPort(t), false), 0)
+	if err == nil || !strings.Contains(err.Error(), "xray refused") {
+		t.Fatalf("err = %v", err)
+	}
+	if hev.Running() || c.State() != SessionIdle {
+		t.Fatalf("hev running = %v, state = %d, log = %s", hev.Running(), c.State(), log)
+	}
+}
+
+// The macOS password prompt is part of hev's start. A ForceStop during it ends the session start at
+// once, and a hev that comes up afterwards is stopped again.
+func TestForceStopWhileHevStartIsHeldEndsTheStartAndLeavesNothingRunning(t *testing.T) {
+	hev := &fakeHev{startGate: make(chan struct{})}
+	installOrderedFakes(t, hev)
+	c := NewCoreController(nil)
+	startErr := make(chan error, 1)
+	go func() { startErr <- c.StartSession(hevPlan(t, reserveLocalPort(t), false), 0) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for hev.log.count("hev.start") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("hev start never began")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	within(t, 3*time.Second, "ForceStop", func() { _ = c.ForceStop() })
+	select {
+	case err := <-startErr:
+		if err == nil {
+			t.Fatal("the aborted start must fail")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("StartSession did not return while hev's start was held")
+	}
+	close(hev.startGate) // the prompt is answered late: hev must not stay up
+	deadline = time.Now().Add(3 * time.Second)
+	for hev.Running() {
+		if time.Now().After(deadline) {
+			t.Fatal("a hev that came up after the abort was left running")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
