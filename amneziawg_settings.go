@@ -216,6 +216,25 @@ func (s *AmneziaWgSettings) resolvePeerEndpoints(dnsServers []netip.Addr) error 
 	return nil
 }
 
+// uapiBuilder collects UAPI lines. The protocol is line based, so a value carrying a line break
+// (or a NUL) would add settings of its own; every write must be exactly one line.
+type uapiBuilder struct {
+	strings.Builder
+	err error
+}
+
+func (u *uapiBuilder) WriteString(line string) (int, error) {
+	body, ok := strings.CutSuffix(line, "\n")
+	if !ok || strings.ContainsAny(body, "\r\n\x00") {
+		if u.err == nil {
+			key, _, _ := strings.Cut(body, "=")
+			u.err = fmt.Errorf("AmneziaWG setting %s has a line break or NUL in its value", key)
+		}
+		return 0, nil
+	}
+	return u.Builder.WriteString(line)
+}
+
 // BuildIpcConfig builds the AmneziaWG UAPI IPC configuration string.
 func (s *AmneziaWgSettings) BuildIpcConfig() (string, error) {
 	privHex, err := amneziawg.DecodeKeyToHex(s.SecretKey)
@@ -223,7 +242,7 @@ func (s *AmneziaWgSettings) BuildIpcConfig() (string, error) {
 		return "", fmt.Errorf("invalid secret key: %w", err)
 	}
 
-	var b strings.Builder
+	var b uapiBuilder
 	b.WriteString("private_key=" + privHex + "\n")
 
 	if s.Jc > 0 {
@@ -299,11 +318,13 @@ func (s *AmneziaWgSettings) BuildIpcConfig() (string, error) {
 		}
 		b.WriteString("public_key=" + pubHex + "\n")
 
-		if peer.PreSharedKey != "" {
+		if strings.TrimSpace(peer.PreSharedKey) != "" {
+			// A key that does not decode fails the start: a tunnel without it is not the one asked for.
 			pskHex, err := amneziawg.DecodeKeyToHex(peer.PreSharedKey)
-			if err == nil && pskHex != "" {
-				b.WriteString("preshared_key=" + pskHex + "\n")
+			if err != nil {
+				return "", fmt.Errorf("invalid peer pre-shared key: %w", err)
 			}
+			b.WriteString("preshared_key=" + pskHex + "\n")
 		}
 
 		if peer.Endpoint != "" {
@@ -315,7 +336,11 @@ func (s *AmneziaWgSettings) BuildIpcConfig() (string, error) {
 			allowed = []string{"0.0.0.0/0", "::/0"}
 		}
 		for _, ip := range allowed {
-			b.WriteString("allowed_ip=" + ip + "\n")
+			prefix, err := netip.ParsePrefix(strings.TrimSpace(ip))
+			if err != nil {
+				return "", fmt.Errorf("invalid peer allowed IP %q: %w", ip, err)
+			}
+			b.WriteString("allowed_ip=" + prefix.String() + "\n")
 		}
 
 		if ka, set := amneziawg.RangeSet(peer.KeepAlive); set {
@@ -323,6 +348,9 @@ func (s *AmneziaWgSettings) BuildIpcConfig() (string, error) {
 		}
 	}
 
+	if b.err != nil {
+		return "", b.err
+	}
 	return b.String(), nil
 }
 
