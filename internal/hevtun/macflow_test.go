@@ -78,7 +78,6 @@ func (f *fakeFS) Exists(path string) bool {
 }
 func (f *fakeFS) put(path, s string) { _ = f.WriteFile(path, []byte(s), 0o600) }
 
-
 const (
 	runDir   = "/Users/test/SKIPI/run"
 	stateDir = "/var/run/skipi-hev.501"

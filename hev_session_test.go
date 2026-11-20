@@ -58,6 +58,8 @@ type fakeHev struct {
 	// reports not ready yet. Later calls are not held.
 	firstWaitGate chan struct{}
 	waits         atomic.Int32
+	// exited, when set, is what Exited returns: closed when hev ended. nil makes the session poll.
+	exited chan struct{}
 	running     atomic.Bool
 	stats       [4]uint64
 	gotCfg      atomic.Value
@@ -121,6 +123,13 @@ func (f *fakeHev) Stats() (uint64, uint64, uint64, uint64) {
 }
 
 func (f *fakeHev) Running() bool { return f.running.Load() }
+
+func (f *fakeHev) Exited() <-chan struct{} {
+	if f.exited == nil {
+		return nil
+	}
+	return f.exited
+}
 
 type recCore struct {
 	log *callLog
@@ -677,5 +686,29 @@ func TestProcessModeHevGetsNoLogFile(t *testing.T) {
 	got, _ := hev.gotCfg.Load().(string)
 	if strings.Contains(got, "log-file") || !strings.Contains(got, "log-level: warn") {
 		t.Fatalf("hev got:\n%s", got)
+	}
+}
+
+// Perf 8: where the target reports hev's exit on a channel, the session waits on it: no wake-up
+// every second, and the stop follows the exit at once.
+func TestSessionWaitsOnTheHevExitInsteadOfPolling(t *testing.T) {
+	hev := &fakeHev{exited: make(chan struct{})}
+	installOrderedFakes(t, hev)
+	origWatch := hevWatchInterval
+	hevWatchInterval = time.Hour // a poll would never notice in time
+	t.Cleanup(func() { hevWatchInterval = origWatch })
+
+	c := NewCoreController(nil)
+	if err := c.StartSession(hevPlan(t, reserveLocalPort(t), false), 0); err != nil {
+		t.Fatal(err)
+	}
+	hev.running.Store(false)
+	close(hev.exited)
+	deadline := time.Now().Add(2 * time.Second)
+	for c.State() != SessionIdle {
+		if time.Now().After(deadline) {
+			t.Fatalf("state = %d, want idle right after hev exited", c.State())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

@@ -27,10 +27,6 @@ import (
 	"time"
 )
 
-// earlyExitWindow is how long Start watches for the hev main returning at once (a config that
-// does not parse, a bad TUN descriptor) so that failure is reported by Start itself.
-const earlyExitWindow = 50 * time.Millisecond
-
 type instance struct {
 	done chan struct{} // closed when the hev main returned
 	res  int
@@ -59,8 +55,9 @@ func current() *instance {
 func NeedsTunFd() bool { return true }
 
 // Start runs hev on a dedicated, locked OS thread with the given YAML config and TUN
-// descriptor. executable is only used by the Windows process mode and ignored here. It does not wait for readiness (see WaitReady) but fails at once when the hev
-// main returns right away. Only one instance can run per process.
+// descriptor. executable is only used by the Windows process mode and ignored here. It returns
+// at once: readiness, and a hev main that returned right away (a config that does not parse, a
+// bad TUN descriptor), are reported by WaitReady. Only one instance can run per process.
 func Start(configYAML string, opts Options) error {
 	tunFd := opts.TunFd
 	if configYAML == "" {
@@ -93,21 +90,22 @@ func Start(configYAML string, opts Options) error {
 		C.free(cfg)
 		close(inst.done)
 	}()
-
-	select {
-	case <-inst.done:
-		return fmt.Errorf("HEV TUN main returned immediately (code %d); see the hev log", inst.res)
-	case <-time.After(earlyExitWindow):
-		return nil
-	}
+	return nil
 }
 
 // WaitReady blocks until hev reports the tunnel initialized. It returns ErrReadyTimeout when
 // the timeout passes first and ErrExited when the hev main returned.
 func WaitReady(timeout time.Duration) error {
-	inst := current()
+	mu.Lock()
+	inst := active // also one whose main already returned: that is the answer
+	mu.Unlock()
 	if inst == nil {
 		return errors.New("HEV TUN is not running")
+	}
+	select {
+	case <-inst.done:
+		return fmt.Errorf("%w (code %d); see the hev log", ErrExited, inst.res)
+	default:
 	}
 	ms := timeout.Milliseconds()
 	if ms < 1 {
@@ -120,7 +118,8 @@ func WaitReady(timeout time.Duration) error {
 	case 1:
 		return nil
 	case -1:
-		return fmt.Errorf("%w (code %d)", ErrExited, inst.res)
+		<-inst.done // the main has returned; its code follows at once
+		return fmt.Errorf("%w (code %d); see the hev log", ErrExited, inst.res)
 	}
 	return ErrReadyTimeout
 }
@@ -150,6 +149,14 @@ func Stats() (txPackets, txBytes, rxPackets, rxBytes uint64) {
 	var a, b, c, d C.size_t
 	C.hev_socks5_tunnel_stats(&a, &b, &c, &d)
 	return uint64(a), uint64(b), uint64(c), uint64(d)
+}
+
+// Exited is closed when the running hev main returns; nil when none runs.
+func Exited() <-chan struct{} {
+	if inst := current(); inst != nil {
+		return inst.done
+	}
+	return nil
 }
 
 // Running reports whether the hev main is running.

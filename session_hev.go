@@ -31,11 +31,14 @@ type hevTunnel interface {
 	Stop() error
 	Stats() (txPackets, txBytes, rxPackets, rxBytes uint64)
 	Running() bool
+	// Exited is closed when the running hev ends, or nil when this target cannot tell (macOS,
+	// whose hev lives in a root process); the session then polls Running.
+	Exited() <-chan struct{}
 }
 
 type realHevTunnel struct{}
 
-func (realHevTunnel) NeedsTunFd() bool { return hevtun.NeedsTunFd() }
+func (realHevTunnel) NeedsTunFd() bool            { return hevtun.NeedsTunFd() }
 func (realHevTunnel) NeedsMacInterface() bool     { return hevtun.NeedsMacInterface() }
 func (realHevTunnel) ReadyTimeout() time.Duration { return hevtun.ReadyTimeout() }
 func (realHevTunnel) Start(configYAML string, opts hevtun.Options) error {
@@ -45,6 +48,7 @@ func (realHevTunnel) WaitReady(timeout time.Duration) error   { return hevtun.Wa
 func (realHevTunnel) Stop() error                             { return hevtun.Stop() }
 func (realHevTunnel) Stats() (uint64, uint64, uint64, uint64) { return hevtun.Stats() }
 func (realHevTunnel) Running() bool                           { return hevtun.Running() }
+func (realHevTunnel) Exited() <-chan struct{}                 { return hevtun.Exited() }
 
 // Seams for the HEV TUN part of a session.
 var (
@@ -62,20 +66,34 @@ const hevExitedReason = "HEV TUN exited unexpectedly"
 // watchHev stops session gen when HEV TUN exits under it: without hev the TUN drops every packet
 // while Xray and the session still look healthy. It returns once that session is no longer running.
 func (c *CoreController) watchHev(gen uint64) {
+	stillCurrent := func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.gen == gen && c.state == stateRunning && c.ownsHev
+	}
+	exitedUnder := func() {
+		log.Printf("SKIPI Core: %s; stopping the session", hevExitedReason)
+		_ = c.stopWithinReason(defaultStopTimeout, hevExitedReason)
+	}
+	// Where the target reports the exit, wait for it: no wake-ups, and the stop follows at once.
+	// A normal stop ends hev too, and the check below then finds the session no longer current.
+	if exited := hevTun.Exited(); exited != nil {
+		<-exited
+		if stillCurrent() {
+			exitedUnder()
+		}
+		return
+	}
 	ticker := time.NewTicker(hevWatchInterval)
 	defer ticker.Stop()
 	for range ticker.C {
-		c.mu.Lock()
-		current := c.gen == gen && c.state == stateRunning && c.ownsHev
-		c.mu.Unlock()
-		if !current {
+		if !stillCurrent() {
 			return
 		}
 		if hevTun.Running() {
 			continue
 		}
-		log.Printf("SKIPI Core: %s; stopping the session", hevExitedReason)
-		_ = c.stopWithinReason(defaultStopTimeout, hevExitedReason)
+		exitedUnder()
 		return
 	}
 }

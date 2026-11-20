@@ -32,3 +32,6 @@ func Stats() (txPackets, txBytes, rxPackets, rxBytes uint64) { return 0, 0, 0, 0
 
 // Running is always false.
 func Running() bool { return false }
+
+// Exited is nil: nothing runs.
+func Exited() <-chan struct{} { return nil }

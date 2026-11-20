@@ -97,3 +97,6 @@ func Stats() (txPackets, txBytes, rxPackets, rxBytes uint64) { return 0, 0, 0, 0
 
 // Running reports whether the supervisor is up.
 func Running() bool { return tunnel.running() }
+
+// Exited is nil: hev lives in a root process this one cannot wait on, so callers poll Running.
+func Exited() <-chan struct{} { return nil }

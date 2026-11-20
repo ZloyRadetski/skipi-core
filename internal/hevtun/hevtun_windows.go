@@ -378,3 +378,11 @@ func Stats() (txPackets, txBytes, rxPackets, rxBytes uint64) { return 0, 0, 0, 0
 
 // Running reports whether the hev process is alive.
 func Running() bool { return current() != nil }
+
+// Exited is closed when the running hev process ends; nil when none runs.
+func Exited() <-chan struct{} {
+	if p := current(); p != nil {
+		return p.done
+	}
+	return nil
+}
