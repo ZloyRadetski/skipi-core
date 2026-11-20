@@ -215,10 +215,36 @@ func CancelDownload(requestID string) {
 	downloads.early[requestID] = now
 }
 
+// probeKeys are the top-level config sections a probe instance is built from: the outbounds, the
+// global transport settings that are merged into them while parsing, and the log.
+var probeKeys = map[string]bool{"log": true, "outbounds": true, "transport": true}
+
+// probeOnlyJSON cuts everything but probeKeys from the config before it is parsed. Routing and
+// DNS would otherwise be built (scanning the geo files for every geosite and geoip rule) only to
+// be thrown away. Text that is not a JSON object is returned as is, for the loader to report.
+func probeOnlyJSON(configJSON string) string {
+	d := json.NewDecoder(strings.NewReader(configJSON))
+	d.UseNumber()
+	var root map[string]json.RawMessage
+	if err := d.Decode(&root); err != nil || root == nil {
+		return configJSON
+	}
+	for key := range root {
+		if !probeKeys[key] {
+			delete(root, key)
+		}
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return configJSON
+	}
+	return string(out)
+}
+
 // startOutboundTestInstance strips a normal app configuration down to the
 // dispatcher and outbound pieces required by an isolated test instance.
 func startOutboundTestInstance(configJSON string) (*core.Instance, error) {
-	config, err := coreserial.LoadJSONConfig(strings.NewReader(configJSON))
+	config, err := coreserial.LoadJSONConfig(strings.NewReader(probeOnlyJSON(configJSON)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse test config: %w", err)
 	}

@@ -203,3 +203,23 @@ func TestClosingAProbeInstanceIsBounded(t *testing.T) {
 		t.Fatalf("close took %v", took)
 	}
 }
+
+// Perf 2: a probe needs only the outbounds. Routing, DNS and the rest are cut from the JSON
+// before it is parsed, so a probe never scans the geo files (and never fails on them).
+func TestAProbeInstanceIsBuiltWithoutReadingRoutingOrDNS(t *testing.T) {
+	t.Setenv("xray.location.asset", t.TempDir()) // no geo files here at all
+	config := `{
+		"log": {"loglevel": "none"},
+		"inbounds": [{"port": 1, "protocol": "socks"}],
+		"dns": {"servers": [{"address": "1.1.1.1", "domains": ["geosite:no-such-list"]}]},
+		"routing": {"rules": [{"type": "field", "domain": ["geosite:no-such-list"], "outboundTag": "direct"},
+			{"type": "field", "ip": ["geoip:no-such-list"], "outboundTag": "direct"}]},
+		"observatory": {"subjectSelector": ["direct"]},
+		"outbounds": [{"protocol": "freedom", "tag": "direct"}]
+	}`
+	inst, err := startOutboundTestInstance(config)
+	if err != nil {
+		t.Fatalf("the probe instance read what it does not need: %v", err)
+	}
+	_ = inst.Close()
+}
