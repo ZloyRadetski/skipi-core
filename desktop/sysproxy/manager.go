@@ -10,6 +10,7 @@
 package sysproxy
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -287,7 +288,7 @@ func loadLease(path string) (*Lease, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(trimSpace(data)) == 0 {
+	if len(bytes.TrimSpace(data)) == 0 {
 		return nil, nil
 	}
 	return decodeLease(data)
@@ -356,8 +357,17 @@ func saveLease(path string, l Lease) error {
 	if err != nil {
 		return err
 	}
+	// The bytes are on disk before the rename publishes them: a crash must leave the old lease or the
+	// new one, never an empty file, which would read as "no lease" and strand the user's settings.
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(data)
+	syncErr := f.Sync()
+	if err := errors.Join(writeErr, syncErr, f.Close()); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -368,11 +378,4 @@ func removeLease(path string) error {
 		return err
 	}
 	return nil
-}
-
-func trimSpace(b []byte) []byte {
-	for len(b) > 0 && (b[0] == ' ' || b[0] == '\n' || b[0] == '\r' || b[0] == '\t') {
-		b = b[1:]
-	}
-	return b
 }

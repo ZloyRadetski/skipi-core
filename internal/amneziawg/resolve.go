@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"syscall"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
