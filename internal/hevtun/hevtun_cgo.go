@@ -23,32 +23,14 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
-	"sync"
 	"time"
 )
 
-type instance struct {
-	done chan struct{} // closed when the hev main returned
-	res  int
-}
-
-var (
-	mu     sync.Mutex
-	active *instance
-)
+var lifecycle instanceLifecycle
 
 // current returns the instance whose main has not returned yet, or nil.
 func current() *instance {
-	mu.Lock()
-	defer mu.Unlock()
-	if active != nil {
-		select {
-		case <-active.done:
-			active = nil
-		default:
-		}
-	}
-	return active
+	return lifecycle.current()
 }
 
 // NeedsTunFd reports that this target runs hev in process on a TUN descriptor the caller opened.
@@ -66,19 +48,10 @@ func Start(configYAML string, opts Options) error {
 	if tunFd <= 0 {
 		return fmt.Errorf("HEV TUN needs a TUN descriptor, got %d", tunFd)
 	}
-	mu.Lock()
-	if active != nil {
-		select {
-		case <-active.done:
-			active = nil
-		default:
-			mu.Unlock()
-			return errors.New("HEV TUN is already running")
-		}
+	inst, err := lifecycle.start()
+	if err != nil {
+		return err
 	}
-	inst := &instance{done: make(chan struct{})}
-	active = inst
-	mu.Unlock()
 
 	C.skipi_hev_reset()
 	cfg := C.CBytes([]byte(configYAML))
@@ -88,17 +61,18 @@ func Start(configYAML string, opts Options) error {
 		runtime.LockOSThread()
 		inst.res = int(C.skipi_hev_run((*C.uchar)(cfg), cfgLen, C.int(tunFd)))
 		C.free(cfg)
+		// HEV has cleared its thread-local state; allow Go to reuse the thread.
+		runtime.UnlockOSThread()
 		close(inst.done)
 	}()
+	close(inst.ready)
 	return nil
 }
 
 // WaitReady blocks until hev reports the tunnel initialized. It returns ErrReadyTimeout when
 // the timeout passes first and ErrExited when the hev main returned.
 func WaitReady(timeout time.Duration) error {
-	mu.Lock()
-	inst := active // also one whose main already returned: that is the answer
-	mu.Unlock()
+	inst := lifecycle.latest() // also one whose main already returned: that is the answer
 	if inst == nil {
 		return errors.New("HEV TUN is not running")
 	}
@@ -127,17 +101,19 @@ func WaitReady(timeout time.Duration) error {
 // Stop asks hev to quit and waits until its main returned. It blocks as long as hev takes;
 // callers bound it. Stopping a tunnel that is not running is a no-op.
 func Stop() error {
-	inst := current()
+	inst, shouldQuit := lifecycle.beginStop()
 	if inst == nil {
 		return nil
 	}
-	C.hev_socks5_tunnel_quit()
-	<-inst.done
-	mu.Lock()
-	if active == inst {
-		active = nil
+	if shouldQuit {
+		// Wait until reset and thread launch have completed, then until HEV
+		// reports that the globals used by quit are initialized (or it exits).
+		if inst.waitUntilQuitReady() && C.skipi_hev_wait_ready(C.int(1<<30)) == 1 {
+			C.hev_socks5_tunnel_quit()
+		}
+		lifecycle.endQuit()
 	}
-	mu.Unlock()
+	<-inst.done
 	return nil
 }
 

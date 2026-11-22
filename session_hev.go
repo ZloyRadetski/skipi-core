@@ -122,10 +122,18 @@ var hevOwner struct {
 	gen uint64
 }
 
-func claimHev(c *CoreController, gen uint64) {
+// Remains locked until the native stop actually returns, even after its caller times out.
+var hevStopGate sync.Mutex
+
+func claimHev(c *CoreController, gen uint64) bool {
+	if !hevStopGate.TryLock() {
+		return false
+	}
+	defer hevStopGate.Unlock()
 	hevOwner.Lock()
 	hevOwner.c, hevOwner.gen = c, gen
 	hevOwner.Unlock()
+	return true
 }
 
 // releaseHevOwner forgets the owner after a stop that stopped HEV TUN whoever started it.
@@ -143,36 +151,42 @@ func stopHevIfOwned(c *CoreController, gen uint64, d time.Duration) error {
 	if !owned {
 		return nil
 	}
-	err := stopHevBounded(d, nil)
-	hevOwner.Lock()
-	if hevOwner.c == c && hevOwner.gen == gen {
-		hevOwner.c, hevOwner.gen = nil, 0
-	}
-	hevOwner.Unlock()
-	return err
+	return stopHevGuarded(d, nil, hevTun, c, gen, false)
 }
 
 // stopHevUnlessOwnedByOther stops HEV TUN unless a different start attempt has claimed it since.
 // It stops through tun, the target the start used, so a late goroutine never reads the package variable.
 func stopHevUnlessOwnedByOther(c *CoreController, gen uint64, tun hevTunnel, d time.Duration) {
-	hevOwner.Lock()
-	other := hevOwner.c != nil && (hevOwner.c != c || hevOwner.gen != gen)
-	hevOwner.Unlock()
-	if other {
-		return
-	}
-	_, _ = lifecycle.RunBounded(tun.Stop, d, nil)
-	hevOwner.Lock()
-	if hevOwner.c == c && hevOwner.gen == gen {
-		hevOwner.c, hevOwner.gen = nil, 0
-	}
-	hevOwner.Unlock()
+	_ = stopHevGuarded(d, nil, tun, c, gen, true)
 }
 
 // stopHevBounded stops HEV TUN within d; a stop that hangs is counted in AbandonedInstances
 // until it returns and reported as ErrStopTimedOut. cancel, when set, also ends the wait.
-func stopHevBounded(d time.Duration, cancel <-chan struct{}) error {
-	err, timedOut := lifecycle.RunBounded(hevTun.Stop, d, cancel)
+func stopHevBounded(c *CoreController, gen uint64, d time.Duration, cancel <-chan struct{}) error {
+	return stopHevGuarded(d, cancel, hevTun, c, gen, false)
+}
+
+func stopHevGuarded(d time.Duration, cancel <-chan struct{}, tun hevTunnel, c *CoreController, gen uint64, allowUnowned bool) error {
+	err, timedOut := lifecycle.RunBounded(func() error {
+		hevStopGate.Lock()
+		defer hevStopGate.Unlock()
+		hevOwner.Lock()
+		owned := hevOwner.c == c && hevOwner.gen == gen
+		if allowUnowned && hevOwner.c == nil {
+			owned = true
+		}
+		hevOwner.Unlock()
+		if !owned {
+			return nil
+		}
+		err := tun.Stop()
+		hevOwner.Lock()
+		if hevOwner.c == c && hevOwner.gen == gen {
+			hevOwner.c, hevOwner.gen = nil, 0
+		}
+		hevOwner.Unlock()
+		return err
+	}, d, cancel)
 	if timedOut {
 		return fmt.Errorf("%w: HEV TUN did not stop within %v", ErrStopTimedOut, d)
 	}
@@ -202,7 +216,20 @@ type hevStart struct {
 // beginSessionHev starts HEV TUN for start attempt gen without waiting for it.
 func (c *CoreController) beginSessionHev(gen uint64, cfg *sessionPlanHev) *hevStart {
 	h := &hevStart{c: c, gen: gen, cfg: cfg, tun: hevTun, done: make(chan struct{})}
-	claimHev(c, gen)
+	c.mu.Lock()
+	if c.gen != gen || c.state != stateStarting {
+		c.mu.Unlock()
+		h.err = errStartAborted
+		close(h.done)
+		return h
+	}
+	if !claimHev(c, gen) {
+		c.mu.Unlock()
+		h.err = errors.New("HEV TUN is busy stopping the previous session")
+		close(h.done)
+		return h
+	}
+	c.mu.Unlock()
 	go h.run()
 	return h
 }

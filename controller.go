@@ -374,6 +374,7 @@ func (c *CoreController) stopWithinReason(d time.Duration, reason string) error 
 		return op.Wait(d)
 	}
 	op := lifecycle.NewStopOp()
+	gen := c.gen
 	inst := c.instance
 	ownsAwg := c.ownsAwg
 	ownsHev := c.ownsHev
@@ -386,8 +387,7 @@ func (c *CoreController) stopWithinReason(d time.Duration, reason string) error 
 	// Reverse of the start order: HEV TUN, then Xray, then AmneziaWG, each bounded by d.
 	var hevErr error
 	if ownsHev {
-		hevErr = stopHevBounded(d, op.Force())
-		releaseHevOwner()
+		hevErr = stopHevBounded(c, gen, d, op.Force())
 	}
 	closeErr, timedOut := lifecycle.RunBounded(inst.Close, d, op.Force())
 	var awgErr error
@@ -448,6 +448,7 @@ func (c *CoreController) ForceStop() error {
 	var xrayErr, hevErr error
 	hevStopped := false
 	c.mu.Lock()
+	gen := c.gen
 	switch c.state {
 	case stateStarting:
 		if c.abandonedStarts == nil {
@@ -483,8 +484,7 @@ func (c *CoreController) ForceStop() error {
 	// HEV TUN is a process singleton Core owns: unless the stop above already covered it, make sure
 	// it is stopped (a no-op when it is not running).
 	if !hevStopped {
-		hevErr = stopHevBounded(forceStopTimeout, nil)
-		releaseHevOwner()
+		hevErr = stopHevBounded(c, gen, forceStopTimeout, nil)
 	}
 	return errors.Join(xrayErr, hevErr, stopAnyAmneziaWg(forceStopTimeout.Milliseconds()))
 }
