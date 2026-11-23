@@ -56,20 +56,23 @@ func NewSystemBinder(exclude string) *Binder {
 	}
 }
 
-// bindToInterfaceIndex pins a socket to an interface. A socket is IPv4 or IPv6, so exactly one of
-// the two options applies; the bind succeeds when either one is accepted.
+// bindToInterfaceIndex pins a socket to an interface. A dual-stack socket needs both options, so
+// both are always tried; the bind succeeds when at least one is accepted.
 func bindToInterfaceIndex(fd uintptr, iface string) error {
 	index, err := strconv.ParseUint(iface, 10, 32)
 	if err != nil {
 		return fmt.Errorf("invalid interface index %q: %w", iface, err)
 	}
 	handle := windows.Handle(fd)
-	v4 := windows.SetsockoptInt(handle, ipprotoIP, ipUnicastIf, int(UnicastIfValueV4(uint32(index))))
-	if v4 == nil {
-		return nil
-	}
-	v6 := windows.SetsockoptInt(handle, ipprotoIPv6, ipUnicastIf, int(index))
-	if v6 == nil {
+	return applyUnicastIf(func(level, value int) error {
+		return windows.SetsockoptInt(handle, level, ipUnicastIf, value)
+	}, uint32(index))
+}
+
+func applyUnicastIf(set func(level, value int) error, index uint32) error {
+	v4 := set(ipprotoIP, int(UnicastIfValueV4(index)))
+	v6 := set(ipprotoIPv6, int(index))
+	if v4 == nil || v6 == nil {
 		return nil
 	}
 	return errors.Join(v4, v6)

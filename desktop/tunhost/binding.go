@@ -46,12 +46,18 @@ func Prepare(name string) error {
 // preparedName is the interface the session was prepared for; Close cleans up behind it.
 var preparedName string
 
+// boundName is the interface the current socket binding was made for; guarded by mu.
+var boundName string
+
 // Prepared reports whether the socket binding is in place.
 func Prepared() bool { return binder.Load() != nil }
 
 // prepareLocked reports whether this call put the binding in place.
 func prepareLocked(name string) (bool, error) {
 	if binder.Load() != nil {
+		if boundName != name {
+			return false, fmt.Errorf("the socket binding is already prepared for interface %q, not %q", boundName, name)
+		}
 		return false, nil
 	}
 	next := netbind.NewSystemBinder(name)
@@ -69,6 +75,7 @@ func prepareLocked(name string) (bool, error) {
 		return false, fmt.Errorf("cannot keep Core connections off the tunnel: %w", registerErr)
 	}
 	binder.Store(next)
+	boundName = name
 	return true, nil
 }
 

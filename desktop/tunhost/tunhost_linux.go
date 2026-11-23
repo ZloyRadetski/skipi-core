@@ -13,7 +13,13 @@ import (
 	"github.com/ZloyRadetski/skipi-core/desktop/nmtun"
 )
 
-var session *nmtun.Session
+// sessionHandle is what Close and Open need of the NetworkManager session.
+type sessionHandle interface {
+	FD() int
+	Close() error
+}
+
+var session sessionHandle
 
 // Open brings the interface described by planJSON up and returns the attached tun fd. Core's
 // outbound sockets are bound to the physical interface until Close.
@@ -52,12 +58,14 @@ func Open(planJSON string) (int, error) {
 func Close() error {
 	mu.Lock()
 	defer mu.Unlock()
-	releaseLocked()
-	if session == nil {
-		return nil
+	// The session goes first: NetworkManager is still removing the interface and its routes while
+	// it closes, and Core's own connections must stay off the tunnel until that is done.
+	var err error
+	if session != nil {
+		err = session.Close()
+		session = nil
 	}
-	err := session.Close()
-	session = nil
+	releaseLocked()
 	return err
 }
 

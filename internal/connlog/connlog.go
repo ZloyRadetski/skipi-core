@@ -56,6 +56,8 @@ type Log struct {
 	seq     int64
 	entries []Entry
 	pending map[string]string
+	order   []string // pending ids, oldest first; may hold ids already consumed
+	head    int
 }
 
 // New returns an empty log that records only while enabled.
@@ -78,10 +80,7 @@ func (l *Log) Record(line string) {
 	}
 	if m := sniffedDomainPattern.FindStringSubmatch(line); m != nil {
 		l.mu.Lock()
-		if len(l.pending) >= pendingLimit {
-			l.pending = make(map[string]string)
-		}
-		l.pending[m[1]] = m[2]
+		l.remember(m[1], m[2])
 		l.mu.Unlock()
 		return
 	}
@@ -92,6 +91,38 @@ func (l *Log) Record(line string) {
 	if m := defaultRoutePattern.FindStringSubmatch(line); m != nil {
 		l.add(m[1], m[2], "default")
 	}
+}
+
+// remember stores a sniffed name for its connection id, dropping the oldest names when full.
+// Callers hold l.mu.
+func (l *Log) remember(id, name string) {
+	if _, ok := l.pending[id]; !ok {
+		for len(l.pending) >= pendingLimit && l.head < len(l.order) {
+			delete(l.pending, l.order[l.head])
+			l.order[l.head] = ""
+			l.head++
+		}
+		l.order = append(l.order, id)
+		if len(l.order)-l.head > 2*pendingLimit {
+			// Most ids were consumed by their routing line; keep only the live ones.
+			live := l.order[:0]
+			for _, queued := range l.order[l.head:] {
+				if _, ok := l.pending[queued]; ok || queued == id {
+					live = append(live, queued)
+				}
+			}
+			clear(l.order[len(live):])
+			l.order, l.head = live, 0
+		}
+		// Compact once the consumed prefix outweighs the live part.
+		if l.head > pendingLimit {
+			n := copy(l.order, l.order[l.head:])
+			clear(l.order[n:])
+			l.order = l.order[:n]
+			l.head = 0
+		}
+	}
+	l.pending[id] = name
 }
 
 func (l *Log) add(id, destination, outbound string) {
@@ -165,7 +196,7 @@ type handler struct {
 }
 
 func (h *handler) Handle(msg corecommlog.Message) {
-	if g, ok := msg.(*corecommlog.GeneralMessage); ok && g.Severity == corecommlog.Severity_Info {
+	if g, ok := msg.(*corecommlog.GeneralMessage); ok && g.Severity == corecommlog.Severity_Info && h.log.enabled.Load() {
 		h.log.Record(msg.String())
 	}
 	if h.inner != nil {

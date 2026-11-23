@@ -19,6 +19,13 @@ import (
 // interface, which is never chosen. A socket is pinned with IP_BOUND_IF / IPV6_BOUND_IF, the macOS
 // counterpart of SO_BINDTODEVICE.
 func NewSystemBinder(exclude string) *Binder {
+	indexes := newIfIndexCache(func(name string) (int, error) {
+		link, err := net.InterfaceByName(name)
+		if err != nil {
+			return 0, err
+		}
+		return link.Index, nil
+	}, 30*time.Second, time.Now)
 	return &Binder{
 		Lookup: func() (string, bool) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -30,14 +37,14 @@ func NewSystemBinder(exclude string) *Binder {
 			return DefaultInterfaceFromNetstat(string(table), exclude)
 		},
 		Bind: func(fd uintptr, iface string) error {
-			link, err := net.InterfaceByName(iface)
+			index, err := indexes.index(iface)
 			if err != nil {
 				return err
 			}
 			// A dual-stack socket needs both options; a failure of the family the socket does not
 			// have is expected and ignored.
-			v4 := unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BOUND_IF, link.Index)
-			v6 := unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF, link.Index)
+			v4 := unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BOUND_IF, index)
+			v6 := unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_BOUND_IF, index)
 			if v4 != nil && v6 != nil {
 				return v4
 			}

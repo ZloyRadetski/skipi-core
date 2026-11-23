@@ -544,57 +544,68 @@ func FastSelect(configJSON string, candidateTags string, probeURL string, timeou
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
 
+	return raceCandidates(ctx, cancel, candidates, func(ctx context.Context, outboundTag string) (int64, error) {
+		tr := &http.Transport{
+			TLSHandshakeTimeout: time.Duration(timeoutMs) * time.Millisecond,
+			DisableKeepAlives:   true,
+			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+				d, err := corenet.ParseDestination(fmt.Sprintf("%s:%s", network, addr))
+				if err != nil {
+					return nil, err
+				}
+				taggedCtx := session.SetForcedOutboundTagToContext(dialCtx, outboundTag)
+				return core.Dial(taggedCtx, server, d)
+			},
+		}
+		defer tr.CloseIdleConnections()
+
+		client := &http.Client{
+			Transport: tr,
+			Timeout:   time.Duration(timeoutMs) * time.Millisecond,
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+		if err != nil {
+			return -1, err
+		}
+
+		start := time.Now()
+		resp, err := client.Do(req)
+		if err != nil {
+			return -1, err
+		}
+		_ = resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+			return time.Since(start).Milliseconds(), nil
+		}
+		return -1, fmt.Errorf("bad status: %d", resp.StatusCode)
+	})
+}
+
+// raceCandidates runs probeFn for every candidate at once and returns the fastest answer, early
+// when one is clearly good enough, else the first candidate. It cancels the probes it no longer
+// needs and waits for all of them, so the caller can close what they dial through safely.
+func raceCandidates(ctx context.Context, cancel context.CancelFunc, candidates []string, probeFn func(ctx context.Context, tag string) (int64, error)) string {
 	type probeResult struct {
 		tag     string
 		latency int64
 		err     error
 	}
-
 	resultCh := make(chan probeResult, len(candidates))
-
+	var wg sync.WaitGroup
 	for _, tag := range candidates {
+		wg.Add(1)
 		go func(outboundTag string) {
-			tr := &http.Transport{
-				TLSHandshakeTimeout: time.Duration(timeoutMs) * time.Millisecond,
-				DisableKeepAlives:   true,
-				DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-					d, err := corenet.ParseDestination(fmt.Sprintf("%s:%s", network, addr))
-					if err != nil {
-						return nil, err
-					}
-					taggedCtx := session.SetForcedOutboundTagToContext(dialCtx, outboundTag)
-					return core.Dial(taggedCtx, server, d)
-				},
-			}
-			defer tr.CloseIdleConnections()
-
-			client := &http.Client{
-				Transport: tr,
-				Timeout:   time.Duration(timeoutMs) * time.Millisecond,
-			}
-
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
-			if err != nil {
-				resultCh <- probeResult{tag: outboundTag, latency: -1, err: err}
-				return
-			}
-
-			start := time.Now()
-			resp, err := client.Do(req)
-			if err != nil {
-				resultCh <- probeResult{tag: outboundTag, latency: -1, err: err}
-				return
-			}
-			_ = resp.Body.Close()
-
-			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
-				dur := time.Since(start).Milliseconds()
-				resultCh <- probeResult{tag: outboundTag, latency: dur, err: nil}
-			} else {
-				resultCh <- probeResult{tag: outboundTag, latency: -1, err: fmt.Errorf("bad status: %d", resp.StatusCode)}
-			}
+			defer wg.Done()
+			latency, err := probeFn(ctx, outboundTag)
+			resultCh <- probeResult{tag: outboundTag, latency: latency, err: err}
 		}(tag)
 	}
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
 
 	var fastestTag string
 	var lowestLatency int64 = 999999

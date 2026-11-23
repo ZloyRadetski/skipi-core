@@ -62,3 +62,32 @@ func TestPrepareRejectsAnInvalidInterfaceName(t *testing.T) {
 		t.Fatal("prepared with an invalid name")
 	}
 }
+
+type orderSession struct{ boundAtClose bool }
+
+func (s *orderSession) FD() int { return -1 }
+func (s *orderSession) Close() error {
+	s.boundAtClose = Prepared()
+	return nil
+}
+
+// NetworkManager removes the interface and its routes while the session closes; Core's own
+// connections must stay off it until that is done.
+func TestCloseKeepsTheBindingUntilTheSessionIsClosed(t *testing.T) {
+	if err := Prepare("skipi0"); err != nil {
+		t.Fatal(err)
+	}
+	fake := &orderSession{}
+	mu.Lock()
+	session = fake
+	mu.Unlock()
+	if err := Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.boundAtClose {
+		t.Fatal("the binding was released before the session was closed")
+	}
+	if Prepared() {
+		t.Fatal("still prepared after Close")
+	}
+}

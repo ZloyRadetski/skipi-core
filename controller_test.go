@@ -87,6 +87,7 @@ func TestQueryTrafficStatsReturnsStructuredEmptySnapshotWhenStopped(t *testing.T
 }
 
 func TestStartLoopPublishesAndStopLoopClearsTunFdEnv(t *testing.T) {
+	stubTunFd(t, func(fd int64) (int64, error) { return fd, nil }, func(int64) {})
 	unsetEnvVariable(tunFdKey)
 	unsetEnvVariable(v2rayTunFdKey)
 

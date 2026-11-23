@@ -79,7 +79,6 @@ func SkipiCoreDesktopCreateController() (result C.uint64_t) {
 			result = 0
 		}
 	}()
-	clearLastError()
 	return C.uint64_t(desktopRuntime.CreateController())
 }
 
@@ -492,7 +491,6 @@ func cError(action func() error) (result *C.char) {
 		setLastError(err)
 		return C.CString(err.Error())
 	}
-	clearLastError()
 	return nil
 }
 
@@ -508,7 +506,6 @@ func cString(action func() (string, error)) (result *C.char) {
 		setLastError(err)
 		return nil
 	}
-	clearLastError()
 	return C.CString(value)
 }
 
@@ -524,7 +521,6 @@ func cInt32(action func() (int32, error)) (result C.int32_t) {
 		setLastError(err)
 		return -1
 	}
-	clearLastError()
 	return C.int32_t(value)
 }
 
@@ -540,7 +536,6 @@ func cInt64(action func() (int64, error)) (result C.int64_t) {
 		setLastError(err)
 		return -1
 	}
-	clearLastError()
 	return C.int64_t(value)
 }
 
@@ -559,16 +554,14 @@ func panicError(recovered any) error {
 	return fmt.Errorf("SKIPI Core desktop ABI recovered panic: %v", recovered)
 }
 
+// The last error is only set by a failing call and never cleared by a succeeding one: the
+// background polls (stats, memory, connection log, IsRunning) succeed constantly and would wipe
+// the error of a failure another thread has yet to read. It is only meaningful right after a
+// call that reported failure.
 func setLastError(err error) {
 	desktopErrors.Lock()
 	defer desktopErrors.Unlock()
 	desktopErrors.message = err.Error()
-}
-
-func clearLastError() {
-	desktopErrors.Lock()
-	defer desktopErrors.Unlock()
-	desktopErrors.message = ""
 }
 
 func lastError() string {

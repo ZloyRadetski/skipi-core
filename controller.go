@@ -204,13 +204,26 @@ func (c *CoreController) runStart(myGen uint64, load func() (*core.Config, error
 	// a failed start can never leave a stale/global fd visible to other
 	// instances created later in this process (env vars are process-wide).
 	// Must happen before core.New: features read the fd during construction.
+	ownedFd := tunFd
+	if tunFd > 0 {
+		dup, err := dupTunFd(tunFd)
+		if err != nil {
+			err = fmt.Errorf("failed to duplicate the TUN descriptor: %w", err)
+			fail(err)
+			return err
+		}
+		ownedFd = dup
+	}
 	c.mu.Lock()
 	if c.gen != myGen {
 		c.mu.Unlock()
+		if tunFd > 0 {
+			closeTunFd(ownedFd)
+		}
 		return errStartAborted
 	}
 	if tunFd > 0 {
-		fdStr := strconv.FormatInt(tunFd, 10)
+		fdStr := strconv.FormatInt(ownedFd, 10)
 		setEnvVariable(tunFdKey, fdStr)
 		setEnvVariable(v2rayTunFdKey, fdStr)
 	} else {
@@ -221,6 +234,9 @@ func (c *CoreController) runStart(myGen uint64, load func() (*core.Config, error
 
 	server, err := createCoreInstance(config)
 	if err != nil {
+		if tunFd > 0 {
+			closeTunFd(ownedFd)
+		}
 		err = fmt.Errorf("failed to create xray instance: %w", err)
 		fail(err)
 		return err
@@ -493,3 +509,9 @@ func (c *CoreController) ForceStop() error {
 func (c *CoreController) IsRunning() bool {
 	return c.isRunning.Load()
 }
+
+// Seams for the TUN descriptor Xray takes ownership of; see tunfd_linux.go.
+var (
+	dupTunFd   = platformDupTunFd
+	closeTunFd = platformCloseTunFd
+)
