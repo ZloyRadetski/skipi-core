@@ -52,6 +52,9 @@ func (f *fakeCoreInstance) Close() error {
 func installFakeCore(t *testing.T, fakes ...*fakeCoreInstance) {
 	t.Helper()
 	origCreate, origStart := createCoreInstance, startCoreInstance
+	origDup, origCloseFd := dupTunFd, closeTunFd
+	// These tests hand StartLoop made-up descriptor numbers, which the Linux duplicate rejects.
+	dupTunFd, closeTunFd = func(fd int64) (int64, error) { return fd, nil }, func(int64) {}
 	var next atomic.Int32
 	createCoreInstance = func(*core.Config) (coreInstance, error) {
 		i := int(next.Add(1)) - 1
@@ -67,6 +70,7 @@ func installFakeCore(t *testing.T, fakes ...*fakeCoreInstance) {
 	}
 	t.Cleanup(func() {
 		createCoreInstance, startCoreInstance = origCreate, origStart
+		dupTunFd, closeTunFd = origDup, origCloseFd
 		waitAbandonedZero(t)
 	})
 }
