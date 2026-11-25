@@ -12,6 +12,21 @@ cd "$ROOT"
 
 "$ROOT/scripts/build-hev-android.sh"
 
+# Build against the patched xray-core (patches/xray-geodata): tools/xrayoverlay applies the patches to
+# the pinned xray-core and prints a go.mod variant. It fails if a patch no longer applies.
+#
+# gomobile cannot use -modfile (it probes with GO111MODULE=off, where the flag is an error, and
+# builds in a temporary module), so here the replace goes into go.mod itself, only while this
+# script runs: go.mod and go.sum are restored on exit.
+XRAY_MODFILE="$(go run ./tools/xrayoverlay)"
+XRAY_PATCHED_DIR="$(dirname "$XRAY_MODFILE")/xray-core"
+if command -v cygpath >/dev/null 2>&1; then XRAY_PATCHED_DIR="$(cygpath -m "$XRAY_PATCHED_DIR")"; fi
+GOMOD_BACKUP="$(mktemp -d)"
+cp go.mod "$GOMOD_BACKUP/go.mod"
+cp go.sum "$GOMOD_BACKUP/go.sum"
+trap 'cp "$GOMOD_BACKUP/go.mod" "$ROOT/go.mod"; cp "$GOMOD_BACKUP/go.sum" "$ROOT/go.sum"; rm -rf "$GOMOD_BACKUP"' EXIT
+printf '\nreplace github.com/xtls/xray-core => %s\n' "$XRAY_PATCHED_DIR" >> go.mod
+
 # github.com/wlynxg/anet requires -checklinkname=0 with Go 1.23+.
 # 16 KB page alignment keeps the native library valid on Android 15+.
 export CGO_LDFLAGS="${CGO_LDFLAGS:-} -Wl,-z,max-page-size=16384"

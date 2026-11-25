@@ -1,0 +1,134 @@
+--- a/common/geodata/ip_matcher.go
++++ b/common/geodata/ip_matcher.go
+@@ -3,7 +3,6 @@
+ import (
+ 	"context"
+ 	"net/netip"
+-	"runtime"
+ 	"slices"
+ 	"sort"
+ 	"strings"
+@@ -37,7 +36,8 @@
+ }
+ 
+ type IPSet struct {
+-	ipv4, ipv6 *netipx.IPSet
++	ipv4       *skipiSet4
++	ipv6       *skipiSet6
+ 	max4, max6 uint8
+ }
+ 
+@@ -822,19 +822,21 @@
+ 	}
+ 	errors.LogDebug(context.Background(), "geodata geoip matcher cache MISS ", key)
+ 
+-	ipset, err := f.createFrom(func(add func(*CIDR)) error {
+-		for _, r := range rules {
+-			cidrs, err := loadIP(r.File, r.Code)
+-			if err != nil {
+-				return err
+-			}
+-			for i, c := range cidrs {
+-				add(c)
+-				cidrs[i] = nil // peak mem
+-			}
+-		}
+-		return nil
+-	})
++	// Two passes: the first only counts, so the second fills slices of the exact size.
++	sb := skipiSetBuilder{counting: true}
++	for _, r := range rules {
++		if err := loadIPInto(&sb, r.File, r.Code); err != nil {
++			return nil, err
++		}
++	}
++	sb.reserve()
++	for _, r := range rules {
++		if err := loadIPInto(&sb, r.File, r.Code); err != nil {
++			return nil, err
++		}
++	}
++	ipset := sb.build()
++	err := error(nil)
+ 	if err == nil {
+ 		f.shared.Store(key, ipset)
+ 	}
+@@ -877,75 +879,11 @@
+ }
+ 
+ func (f *IPSetFactory) createFrom(yield func(func(*CIDR)) error) (*IPSet, error) {
+-	var ipv4Builder, ipv6Builder netipx.IPSetBuilder
+-
+-	err := yield(func(c *CIDR) {
+-		ipBytes := c.GetIp()
+-		prefixLen := int(c.GetPrefix())
+-
+-		addr, ok := netip.AddrFromSlice(ipBytes)
+-		if !ok {
+-			errors.LogError(context.Background(), "ignore invalid IP byte slice: ", ipBytes)
+-			return
+-		}
+-
+-		prefix := netip.PrefixFrom(addr, prefixLen)
+-		if !prefix.IsValid() {
+-			errors.LogError(context.Background(), "ignore created invalid prefix from addr ", addr, " and length ", prefixLen)
+-			return
+-		}
+-
+-		if addr.Is4() {
+-			ipv4Builder.AddPrefix(prefix)
+-		} else if addr.Is6() {
+-			ipv6Builder.AddPrefix(prefix)
+-		}
+-	})
+-	if err != nil {
++	var sb skipiSetBuilder
++	if err := yield(func(c *CIDR) { skipiAddCIDR(&sb, c.GetIp(), int(c.GetPrefix())) }); err != nil {
+ 		return nil, err
+ 	}
+-
+-	// peak mem
+-	runtime.GC()
+-	defer runtime.GC()
+-
+-	ipv4, err := ipv4Builder.IPSet()
+-	if err != nil {
+-		return nil, errors.New("failed to build IPv4 set").Base(err)
+-	}
+-	ipv6, err := ipv6Builder.IPSet()
+-	if err != nil {
+-		return nil, errors.New("failed to build IPv6 set").Base(err)
+-	}
+-
+-	var has4, has6 bool
+-	var max4, max6 int
+-
+-	for _, p := range ipv4.Prefixes() {
+-		has4 = true
+-		if b := p.Bits(); b > max4 {
+-			max4 = b
+-		}
+-	}
+-	for _, p := range ipv6.Prefixes() {
+-		has6 = true
+-		if b := p.Bits(); b > max6 {
+-			max6 = b
+-		}
+-	}
+-
+-	if !has4 {
+-		max4 = 0xff
+-	} else if max4 == 0 {
+-		max4 = 0xfe
+-	}
+-	if !has6 {
+-		max6 = 0xff
+-	} else if max6 == 0 {
+-		max6 = 0xfe
+-	}
+-
+-	return &IPSet{ipv4: ipv4, ipv6: ipv6, max4: uint8(max4), max6: uint8(max6)}, nil
++	return sb.build(), nil
+ }
+ 
+ func buildOptimizedIPMatcher(f *IPSetFactory, rules []*IPRule) (IPMatcher, error) {

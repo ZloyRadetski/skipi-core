@@ -50,7 +50,10 @@ jobs:
           gomobile init
 
       - name: Run tests
-        run: go test -race -v ./...
+        # On the patched xray-core (patches/xray-geodata), like the release build below.
+        run: |
+          export GOFLAGS="-modfile=$(go run ./tools/xrayoverlay)"
+          go test -race -v ./...
 
       - name: Build SKIPI Core AAR
         # No `go get @latest` here on purpose: release builds must use the

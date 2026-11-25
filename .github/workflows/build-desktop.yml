@@ -69,6 +69,8 @@ jobs:
           export CGO_ENABLED=1
           export CC=gcc
           export CXX=g++
+          # Build against the patched xray-core (patches/xray-geodata); fails if a patch no longer applies.
+          export GOFLAGS="-modfile=$(go run ./tools/xrayoverlay)"
           mkdir -p dist
           go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o dist/skipicore.dll ./cmd/skipicore-desktop
           cp desktop/include/skipicore_desktop.h dist/
@@ -104,6 +106,8 @@ jobs:
           export CGO_ENABLED=1
           export CC=gcc
           export CXX=g++
+          # Build against the patched xray-core (patches/xray-geodata); fails if a patch no longer applies.
+          export GOFLAGS="-modfile=$(go run ./tools/xrayoverlay)"
           # skipi_hev links the HEV TUN static libraries built above; without it Linux builds use the stub.
           go test -tags skipi_hev ./...
           mkdir -p dist
@@ -153,6 +157,8 @@ jobs:
         run: |
           set -euo pipefail
           export CGO_ENABLED=1
+          # Build against the patched xray-core (patches/xray-geodata); fails if a patch no longer applies.
+          export GOFLAGS="-modfile=$(go run ./tools/xrayoverlay)"
           # The tests run on Linux and Windows; here the macOS-only code (hevtun_darwin, netbind) must compile.
           go vet ./...
           arch="$(uname -m)"

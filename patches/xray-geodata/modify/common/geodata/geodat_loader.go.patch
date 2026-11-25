@@ -1,0 +1,36 @@
+--- a/common/geodata/geodat_loader.go
++++ b/common/geodata/geodat_loader.go
+@@ -29,7 +29,6 @@
+ }
+ 
+ func loadFile(file, code string) ([]byte, error) {
+-	runtime.GC() // peak mem
+ 	r, size, err := filesystem.OpenAsset(file)
+ 	if err != nil {
+ 		return nil, errors.New("failed to open ", file).Base(err)
+@@ -59,14 +58,12 @@
+ // that has all the "@"-separated attrs. It decodes the entry while reading the file instead of
+ // unmarshalling it into a []*Domain, so value is only valid during fn.
+ func loadSite(file, code, attrs string, fn func(Domain_Type, []byte)) error {
+-	runtime.GC() // peak mem
+ 	r, size, err := filesystem.OpenAsset(file)
+ 	if err != nil {
+ 		return errors.New("failed to open ", file).Base(err)
+ 	}
+ 	defer r.Close()
+-	br := bufio.NewReaderSize(r, 64*1024)
+-	n, err := seek(br, []byte(code), size)
++	br, n, err := skipiOpenEntry(r, []byte(code), size)
+ 	if err != nil {
+ 		return errors.New("failed to load code ", code, " from ", file).Base(err)
+ 	}
+@@ -127,8 +124,7 @@
+ }
+ 
+ func find(r io.Reader, code []byte, readBody bool, size int64) ([]byte, error) {
+-	br := bufio.NewReaderSize(r, 64*1024)
+-	bodyL, err := seek(br, code, size)
++	br, bodyL, err := skipiOpenEntry(r, code, size)
+ 	if err != nil || !readBody {
+ 		return nil, err
+ 	}

@@ -42,6 +42,16 @@ built into this Core on <GOOS>".
 In PowerShell, quote `'-javapkg=app.skipi.core'` so the dotted Java package
 prefix is passed to `gomobile` as one argument.
 
+### Patched xray-core
+
+The Core is built against xray-core with small patches to its geo loading (about 2.5x faster tunnel start,
+about 3x lower peak memory with heavy geo rules). They live in `patches/xray-geodata` and are applied at
+build time by `go run ./tools/xrayoverlay`, which prints a `go.mod` variant to build with:
+`GOFLAGS="-modfile=$(go run ./tools/xrayoverlay)"`. The desktop build in skipi-box does this;
+`scripts/build-android.sh` adds the same `replace` to go.mod while it runs (gomobile cannot use
+`-modfile`) and restores go.mod afterwards. Any other build must patch too. After every xray-core update run
+`scripts/check-xray-patches.sh` (see `patches/xray-geodata/README.md`).
+
 ## Build (shared library for desktop)
 
 `cmd/skipicore-desktop` packages the same SKIPI Core process as a native shared
@@ -57,7 +67,7 @@ with `git submodule update --init --recursive`). It links into `libskipicore.so`
 
 ```bash
 scripts/build-hev-linux.sh     # -> build/hev/linux-amd64/*.a (patched copy of the submodule, -fPIC)
-CGO_ENABLED=1 go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o libskipicore.so ./cmd/skipicore-desktop
+GOFLAGS="-modfile=$(go run ./tools/xrayoverlay)" \nCGO_ENABLED=1 go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o libskipicore.so ./cmd/skipicore-desktop
 nm -D libskipicore.so | grep hev_socks5_tunnel_main_from_str   # HEV TUN is in the library
 ```
 
@@ -76,6 +86,7 @@ scripts/stage-hev-payload.sh clean     # back to the placeholder
 $env:CGO_ENABLED = "1"
 $env:CC = "gcc"
 $env:CXX = "g++"
+$env:GOFLAGS = "-modfile=$(go run ./tools/xrayoverlay)"
 go build -buildmode=c-shared -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o skipicore.dll ./cmd/skipicore-desktop
 ```
 
