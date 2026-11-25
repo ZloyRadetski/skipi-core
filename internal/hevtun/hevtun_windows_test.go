@@ -230,3 +230,22 @@ func TestWindowsWaitReadyWithoutStart(t *testing.T) {
 		t.Fatal("WaitReady with nothing running must fail")
 	}
 }
+
+func TestWindowsMemoryBytesIsTheHevProcessMemory(t *testing.T) {
+	isolate(t)
+	if got := MemoryBytes(); got != 0 {
+		t.Fatalf("MemoryBytes() = %d before Start, want 0", got)
+	}
+	if err := Start("mode: run\n", Options{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := MemoryBytes(); got < 100*1024 {
+		t.Fatalf("MemoryBytes() = %d while hev runs, want the child's private memory (>= 100 KiB)", got)
+	}
+	if err := Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if got := MemoryBytes(); got != 0 {
+		t.Fatalf("MemoryBytes() = %d after Stop, want 0", got)
+	}
+}

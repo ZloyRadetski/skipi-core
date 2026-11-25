@@ -35,3 +35,6 @@ func Running() bool { return false }
 
 // Exited is nil: nothing runs.
 func Exited() <-chan struct{} { return nil }
+
+// MemoryBytes is zero: nothing runs.
+func MemoryBytes() int64 { return 0 }

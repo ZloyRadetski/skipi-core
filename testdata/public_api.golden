@@ -178,6 +178,7 @@ type MemoryStats struct {
 	HeapReleased	int64	`json:"heapReleased"`
 	NumGoroutines	int	`json:"numGoroutines"`
 	NumGC		uint32	`json:"numGc"`
+	ExternalBytes	int64	`json:"externalBytes"`
 }
 
 type ProcessFinder interface {

@@ -137,3 +137,14 @@ func Exited() <-chan struct{} {
 
 // Running reports whether the hev main is running.
 func Running() bool { return current() != nil }
+
+// MemoryBytes is what hev holds from the system allocator (its sessions, lwIP buffers and
+// task bookkeeping): it shares the process heap with the Go runtime and the host, so it is counted
+// inside hev (third_party/patches/hev-socks5-tunnel/0002-memory-usage.patch). Task stacks are
+// separate mappings that only count once touched and are not included. Zero when hev is not running.
+func MemoryBytes() int64 {
+	if current() == nil {
+		return 0
+	}
+	return int64(C.skipi_hev_memory_bytes())
+}

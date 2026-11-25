@@ -10,4 +10,7 @@ int skipi_hev_run (const unsigned char *config, unsigned int len, int tun_fd);
 /* 1: ready, -1: main returned, 0: timeout. */
 int skipi_hev_wait_ready (int timeout_ms);
 
+/* Bytes hev currently holds from the system allocator (patch 0002-memory-usage). */
+unsigned long long skipi_hev_memory_bytes (void);
+
 #endif

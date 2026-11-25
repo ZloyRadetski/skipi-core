@@ -53,3 +53,9 @@ func TestStubStillValidatesTheDescriptor(t *testing.T) {
 		t.Fatal("NeedsTunFd() = false on a stub build")
 	}
 }
+
+func TestStubHasNoHevMemory(t *testing.T) {
+	if got := MemoryBytes(); got != 0 {
+		t.Fatalf("MemoryBytes() = %d, want 0: nothing runs", got)
+	}
+}

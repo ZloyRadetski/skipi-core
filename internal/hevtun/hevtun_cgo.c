@@ -101,3 +101,11 @@ skipi_hev_wait_ready (int timeout_ms)
     pthread_mutex_unlock (&mu);
     return res;
 }
+
+extern size_t hev_memory_usage (void);
+
+unsigned long long
+skipi_hev_memory_bytes (void)
+{
+    return (unsigned long long)hev_memory_usage ();
+}

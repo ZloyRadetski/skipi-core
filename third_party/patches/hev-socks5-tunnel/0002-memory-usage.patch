@@ -1,0 +1,180 @@
+diff --git a/third-part/hev-task-system/src/mem/base/hev-memory-allocator.c b/third-part/hev-task-system/src/mem/base/hev-memory-allocator.c
+index 02bba98..af70a61 100644
+--- a/third-part/hev-task-system/src/mem/base/hev-memory-allocator.c
++++ b/third-part/hev-task-system/src/mem/base/hev-memory-allocator.c
+@@ -7,6 +7,7 @@
+  ============================================================================
+  */
+ 
++#include <malloc.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -17,6 +18,55 @@
+ 
+ static __thread HevMemoryAllocator *tls_default_allocator;
+ 
++static size_t memory_usage;
++
++static size_t
++usable_size (void *ptr)
++{
++    return ptr ? malloc_usable_size (ptr) : 0;
++}
++
++void *
++hev_memory_tracked_malloc (size_t size)
++{
++    void *ptr;
++
++    ptr = malloc (size);
++    if (ptr)
++        __atomic_fetch_add (&memory_usage, usable_size (ptr), __ATOMIC_RELAXED);
++    return ptr;
++}
++
++void *
++hev_memory_tracked_realloc (void *ptr, size_t size)
++{
++    size_t old_size = usable_size (ptr);
++    void *new_ptr;
++
++    new_ptr = realloc (ptr, size);
++    if (new_ptr) {
++        __atomic_fetch_sub (&memory_usage, old_size, __ATOMIC_RELAXED);
++        __atomic_fetch_add (&memory_usage, usable_size (new_ptr),
++                            __ATOMIC_RELAXED);
++    }
++    return new_ptr;
++}
++
++void
++hev_memory_tracked_free (void *ptr)
++{
++    if (!ptr)
++        return;
++    __atomic_fetch_sub (&memory_usage, usable_size (ptr), __ATOMIC_RELAXED);
++    free (ptr);
++}
++
++size_t
++hev_memory_usage (void)
++{
++    return __atomic_load_n (&memory_usage, __ATOMIC_RELAXED);
++}
++
+ HevMemoryAllocator *
+ hev_memory_allocator_default (void)
+ {
+diff --git a/third-part/hev-task-system/src/mem/base/hev-memory-allocator.h b/third-part/hev-task-system/src/mem/base/hev-memory-allocator.h
+index fee6dc7..f9468f0 100644
+--- a/third-part/hev-task-system/src/mem/base/hev-memory-allocator.h
++++ b/third-part/hev-task-system/src/mem/base/hev-memory-allocator.h
+@@ -31,6 +31,24 @@ struct _HevMemoryAllocator
+     unsigned int ref_count;
+ };
+ 
++/**
++ * hev_memory_tracked_malloc, hev_memory_tracked_realloc, hev_memory_tracked_free:
++ *
++ * malloc, realloc and free for the allocators' backing blocks that also keep
++ * count of the bytes they hold, see hev_memory_usage.
++ */
++void *hev_memory_tracked_malloc (size_t size);
++void *hev_memory_tracked_realloc (void *ptr, size_t size);
++void hev_memory_tracked_free (void *ptr);
++
++/**
++ * hev_memory_usage:
++ *
++ * Bytes the memory allocators currently hold from the system allocator,
++ * cached slices included. Safe to call from any thread.
++ */
++size_t hev_memory_usage (void);
++
+ /**
+  * hev_memory_allocator_default:
+  *
+diff --git a/third-part/hev-task-system/src/mem/simple/hev-memory-allocator-simple.c b/third-part/hev-task-system/src/mem/simple/hev-memory-allocator-simple.c
+index e06b76b..368096e 100644
+--- a/third-part/hev-task-system/src/mem/simple/hev-memory-allocator-simple.c
++++ b/third-part/hev-task-system/src/mem/simple/hev-memory-allocator-simple.c
+@@ -38,17 +38,17 @@ hev_memory_allocator_simple_new (void)
+ static void *
+ _hev_memory_allocator_alloc (HevMemoryAllocator *self, size_t size)
+ {
+-    return malloc (size);
++    return hev_memory_tracked_malloc (size);
+ }
+ 
+ static void *
+ _hev_memory_allocator_realloc (HevMemoryAllocator *self, void *ptr, size_t size)
+ {
+-    return realloc (ptr, size);
++    return hev_memory_tracked_realloc (ptr, size);
+ }
+ 
+ static void
+ _hev_memory_allocator_free (HevMemoryAllocator *self, void *ptr)
+ {
+-    free (ptr);
++    hev_memory_tracked_free (ptr);
+ }
+diff --git a/third-part/hev-task-system/src/mem/slice/hev-memory-allocator-slice.c b/third-part/hev-task-system/src/mem/slice/hev-memory-allocator-slice.c
+index 530122f..6eb48fc 100644
+--- a/third-part/hev-task-system/src/mem/slice/hev-memory-allocator-slice.c
++++ b/third-part/hev-task-system/src/mem/slice/hev-memory-allocator-slice.c
+@@ -103,7 +103,7 @@ _hev_memory_allocator_alloc (HevMemoryAllocator *allocator, size_t size)
+ #ifdef _DEBUG
+         printf ("[%p] default alloc size: %lu\n", self, (unsigned long)size);
+ #endif
+-        slice = malloc (sizeof (HevMemorySlice) + size);
++        slice = hev_memory_tracked_malloc (sizeof (HevMemorySlice) + size);
+         if (!slice)
+             return NULL;
+         slice->index = -1;
+@@ -125,7 +125,7 @@ _hev_memory_allocator_alloc (HevMemoryAllocator *allocator, size_t size)
+ #ifdef _DEBUG
+         printf ("[%p] alloc size: %lu\n", self, (unsigned long)size);
+ #endif
+-        slice = malloc (sizeof (HevMemorySlice) + size);
++        slice = hev_memory_tracked_malloc (sizeof (HevMemorySlice) + size);
+         if (!slice)
+             return NULL;
+ 
+@@ -151,7 +151,7 @@ _hev_memory_allocator_realloc (HevMemoryAllocator *allocator, void *ptr,
+     size = ALIGN_UP (size, CACHED_SLICE_ALIGN);
+     index = size / CACHED_SLICE_ALIGN;
+ 
+-    slice = realloc (slice, sizeof (HevMemorySlice) + size);
++    slice = hev_memory_tracked_realloc (slice, sizeof (HevMemorySlice) + size);
+     if (!slice)
+         return NULL;
+ 
+@@ -180,7 +180,7 @@ _hev_memory_allocator_free (HevMemoryAllocator *allocator, void *ptr)
+     HevMemorySlice *slice = (HevMemorySlice *)ptr - 1;
+ 
+     if (slice->index < 0) {
+-        free (slice);
++        hev_memory_tracked_free (slice);
+         return;
+     }
+ 
+@@ -195,7 +195,7 @@ _hev_memory_allocator_free (HevMemoryAllocator *allocator, void *ptr)
+         if (!*owner)
+             _hev_memory_allocator_lru_remove (self, node);
+ 
+-        free (free_slice);
++        hev_memory_tracked_free (free_slice);
+     }
+ 
+     slice->next = self->cached_mslices[slice->index];
+@@ -225,7 +225,7 @@ _hev_memory_allocator_destroy (HevMemoryAllocator *allocator)
+ 
+         while (iter) {
+             HevMemorySlice *next = iter->next;
+-            free (iter);
++            hev_memory_tracked_free (iter);
+             iter = next;
+         }
+     }

@@ -415,3 +415,43 @@ func Exited() <-chan struct{} {
 	}
 	return nil
 }
+
+var (
+	psapi                    = windows.NewLazySystemDLL("psapi.dll")
+	procGetProcessMemoryInfo = psapi.NewProc("GetProcessMemoryInfo")
+)
+
+// processMemoryCounters is PROCESS_MEMORY_COUNTERS_EX.
+type processMemoryCounters struct {
+	cb                         uint32
+	pageFaultCount             uint32
+	peakWorkingSetSize         uintptr
+	workingSetSize             uintptr
+	quotaPeakPagedPoolUsage    uintptr
+	quotaPagedPoolUsage        uintptr
+	quotaPeakNonPagedPoolUsage uintptr
+	quotaNonPagedPoolUsage     uintptr
+	pagefileUsage              uintptr
+	peakPagefileUsage          uintptr
+	privateUsage               uintptr
+}
+
+// MemoryBytes is the private memory of the hev process, which the Go runtime's figures never
+// include. It is zero when hev is not running or cannot be read.
+func MemoryBytes() int64 {
+	p := current()
+	if p == nil || p.cmd.Process == nil {
+		return 0
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(p.cmd.Process.Pid))
+	if err != nil {
+		return 0
+	}
+	defer windows.CloseHandle(h)
+	var c processMemoryCounters
+	c.cb = uint32(unsafe.Sizeof(c))
+	if r, _, _ := procGetProcessMemoryInfo.Call(uintptr(h), uintptr(unsafe.Pointer(&c)), uintptr(c.cb)); r == 0 {
+		return 0
+	}
+	return int64(c.privateUsage)
+}

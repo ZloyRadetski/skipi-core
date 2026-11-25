@@ -7,6 +7,7 @@ import (
 	"runtime/debug"
 	"sync/atomic"
 
+	"github.com/ZloyRadetski/skipi-core/internal/hevtun"
 	"github.com/ZloyRadetski/skipi-core/internal/memstats"
 )
 
@@ -22,6 +23,7 @@ type MemoryStats struct {
 	HeapReleased  int64  `json:"heapReleased"`
 	NumGoroutines int    `json:"numGoroutines"`
 	NumGC         uint32 `json:"numGc"`
+	ExternalBytes int64  `json:"externalBytes"`
 }
 
 // The implementation lives in internal/memstats, whose Stats must stay field-for-field the same
@@ -46,6 +48,8 @@ func ReadMemoryStats() string {
 var releaseMemoryFn atomic.Pointer[func()]
 
 func init() {
+	// hev's memory is not in the Go runtime's figures; the memory readout adds it.
+	memstats.SetExternalBytes(hevtun.MemoryBytes)
 	f := debug.FreeOSMemory
 	releaseMemoryFn.Store(&f)
 }

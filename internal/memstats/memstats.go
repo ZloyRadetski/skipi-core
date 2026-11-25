@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/metrics"
+	"sync/atomic"
 )
 
 // Stats holds detailed metrics on Go runtime and core memory usage.
@@ -23,6 +24,32 @@ type Stats struct {
 	HeapReleased  int64  `json:"heapReleased"`
 	NumGoroutines int    `json:"numGoroutines"`
 	NumGC         uint32 `json:"numGc"`
+	// ExternalBytes is memory the tunnel runtime holds outside the Go runtime's own accounting
+	// (hev), so SysBytes alone understates what the core costs. See SetExternalBytes.
+	ExternalBytes int64 `json:"externalBytes"`
+}
+
+var externalBytesFn atomic.Pointer[func() int64]
+
+// SetExternalBytes registers the source of Stats.ExternalBytes; nil removes it. The function is
+// called on every read, so it must be cheap and safe to call from any goroutine.
+func SetExternalBytes(f func() int64) {
+	if f == nil {
+		externalBytesFn.Store(nil)
+		return
+	}
+	externalBytesFn.Store(&f)
+}
+
+func externalBytes() int64 {
+	f := externalBytesFn.Load()
+	if f == nil {
+		return 0
+	}
+	if n := (*f)(); n > 0 {
+		return n
+	}
+	return 0
 }
 
 // JSON returns the current memory usage of the Go runtime and tunnel core as a JSON string.
@@ -53,6 +80,7 @@ func ReadFromMetrics() *Stats {
 		{Name: "/memory/classes/heap/released:bytes"}, // returned to the OS     -> HeapReleased
 		{Name: "/gc/cycles/total:gc-cycles"},
 		{Name: "/sched/goroutines:goroutines"},
+		{Name: "/memory/classes/heap/unused:bytes"}, // span slack: with objects it is HeapInuse
 	}
 	metrics.Read(samples)
 	// Every metric above is a uint64 counter or gauge; anything else (including KindBad for a
@@ -69,6 +97,7 @@ func ReadFromMetrics() *Stats {
 	sysBytes := int64(samples[2].Value.Uint64())
 	heapFree := int64(samples[3].Value.Uint64())
 	heapReleased := int64(samples[4].Value.Uint64())
+	heapInuse := heapObjects + int64(samples[7].Value.Uint64())
 
 	return &Stats{
 		AllocBytes:    heapObjects,
@@ -76,11 +105,12 @@ func ReadFromMetrics() *Stats {
 		TotalAlloc:    totalAlloc,
 		SysBytes:      sysBytes,
 		SysMb:         fmt.Sprintf("%.2f MB", float64(sysBytes)/mb),
-		HeapInuse:     heapObjects,
+		HeapInuse:     heapInuse,
 		HeapIdle:      heapFree + heapReleased,
 		HeapReleased:  heapReleased,
 		NumGoroutines: int(samples[6].Value.Uint64()),
 		NumGC:         uint32(samples[5].Value.Uint64()),
+		ExternalBytes: externalBytes(),
 	}
 }
 
@@ -99,5 +129,6 @@ func ReadFromMemStats() *Stats {
 		HeapReleased:  int64(m.HeapReleased),
 		NumGoroutines: runtime.NumGoroutine(),
 		NumGC:         m.NumGC,
+		ExternalBytes: externalBytes(),
 	}
 }

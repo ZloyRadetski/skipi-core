@@ -102,3 +102,6 @@ func Running() bool { return tunnel.running() }
 
 // Exited is nil: hev lives in a root process this one cannot wait on, so callers poll Running.
 func Exited() <-chan struct{} { return nil }
+
+// MemoryBytes is zero: hev lives in a root process this one cannot measure.
+func MemoryBytes() int64 { return 0 }
