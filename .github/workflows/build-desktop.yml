@@ -135,7 +135,7 @@ jobs:
   # or packaged here and embedded into the Core library, so the app ships and downloads no hev.
   macos:
     name: Build desktop library (macOS)
-    runs-on: macos-latest
+    runs-on: macos-15
 
     steps:
       - name: Check out source
