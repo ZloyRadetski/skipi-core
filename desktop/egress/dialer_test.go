@@ -280,3 +280,16 @@ func TestSwitchingOffAffectsOnlyNewDials(t *testing.T) {
 		t.Fatalf("an open connection broke when merging was switched off: %v", err)
 	}
 }
+
+// A measurement must come back from the same link every time, or the numbers jump between the links' paths.
+func TestMeasurementsAreNotMerged(t *testing.T) {
+	base := &fakeBase{}
+	d := NewDialer(base)
+	d.SetScheduler(twoLinks())
+	conn, err := d.Dial(WithoutMerging(context.Background()), nil, server, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	sameCall(t, base.calls[0], nil, server, nil)
+}

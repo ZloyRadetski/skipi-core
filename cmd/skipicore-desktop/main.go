@@ -17,6 +17,8 @@ import (
 	"unsafe"
 
 	"github.com/ZloyRadetski/skipi-core/desktop/bridge"
+	"github.com/ZloyRadetski/skipi-core/desktop/egress"
+	"github.com/ZloyRadetski/skipi-core/desktop/multilink"
 	"github.com/ZloyRadetski/skipi-core/desktop/notify"
 	"github.com/ZloyRadetski/skipi-core/desktop/tunhost"
 )
@@ -25,6 +27,11 @@ const desktopAPIVersion = "1"
 
 var (
 	desktopRuntime = desktopbridge.NewRuntime()
+	// linkMerging spreads Core's own connections over every link while the application has it on.
+	linkMerging = multilink.NewEngine(multilink.EngineConfig{
+		Discover: multilink.DefaultDiscover,
+		Attach:   egress.System().SetScheduler,
+	})
 	desktopErrors  struct {
 		sync.Mutex
 		message string
@@ -385,6 +392,28 @@ func SkipiCoreDesktopMeasureOutboundDelay(configJSON *C.char, targetURL *C.char)
 		}
 		return desktopRuntime.MeasureOutboundDelay(config, target)
 	})
+}
+
+// SkipiCoreDesktopMultilinkApply applies the link merging settings (JSON, see multilink.Settings): it switches
+// merging on or off and changes the rest while it runs, without touching open connections. A refused setting
+// changes nothing. It returns NULL on success, otherwise an owned error string.
+//
+//export SkipiCoreDesktopMultilinkApply
+func SkipiCoreDesktopMultilinkApply(settingsJSON *C.char) *C.char {
+	return cError(func() error {
+		if settingsJSON == nil {
+			return fmt.Errorf("link merging settings must not be NULL")
+		}
+		return linkMerging.ApplyJSON(C.GoString(settingsJSON))
+	})
+}
+
+// SkipiCoreDesktopMultilinkStatus returns the links and what merging does with them as JSON (see
+// multilink.Status). The caller owns the returned string.
+//
+//export SkipiCoreDesktopMultilinkStatus
+func SkipiCoreDesktopMultilinkStatus() *C.char {
+	return cString(func() (string, error) { return linkMerging.StatusJSON(), nil })
 }
 
 // SkipiCoreDesktopMeasureTcpDelay returns the time of one TCP connect to

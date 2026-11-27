@@ -358,15 +358,16 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	if err := internet.RegisterDialerController(func(network, address string, c syscall.RawConn) error {
+	// SKIPI's dialer is in place from the start (package egress), and Xray then refuses
+	// RegisterDialerController; its dialer still runs every controller in this list.
+	internet.ControllersLock.Lock()
+	internet.Controllers = append(internet.Controllers, func(network, address string, c syscall.RawConn) error {
 		dialedMu.Lock()
 		dialedAddresses = append(dialedAddresses, address)
 		dialedMu.Unlock()
 		return nil
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "register dialer controller: %v\n", err)
-		os.Exit(1)
-	}
+	})
+	internet.ControllersLock.Unlock()
 	os.Exit(m.Run())
 }
 

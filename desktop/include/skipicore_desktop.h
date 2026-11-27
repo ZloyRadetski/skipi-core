@@ -53,6 +53,8 @@ SKIPI_CORE_DESKTOP_API int64_t SkipiCoreDesktopMeasureDelay(uint64_t handle, con
 SKIPI_CORE_DESKTOP_API int64_t SkipiCoreDesktopMeasureOutboundDelay(const char *config_json, const char *target_url);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopMeasureOutboundDelays(const char *config_json, const char *candidate_tags, const char *target_url, int64_t timeout_millis);
 SKIPI_CORE_DESKTOP_API int64_t SkipiCoreDesktopMeasureTcpDelay(const char *host, int32_t port, int32_t timeout_millis);
+SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopMultilinkApply(const char *settings_json);
+SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopMultilinkStatus(void);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopReadMemoryStats(void);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopForceFreeMemory(void);
 SKIPI_CORE_DESKTOP_API char *SkipiCoreDesktopTunAttach(const char *plan_json);

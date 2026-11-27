@@ -40,7 +40,7 @@ func (d *Dialer) DestIpAddress() net.IP { return d.base.DestIpAddress() }
 func (d *Dialer) Dial(ctx context.Context, src net.Address, dest net.Destination, sockopt *internet.SocketConfig) (net.Conn, error) {
 	sched := d.sched.Load()
 	family, ok := mergeable(src, dest, sockopt)
-	if !ok || sched == nil || sched.Usable(family) < 2 {
+	if !ok || sched == nil || ctx.Value(withoutMergingKey{}) != nil || sched.Usable(family) < 2 {
 		return d.base.Dial(ctx, src, dest, sockopt)
 	}
 	tried := map[string]struct{}{}
@@ -143,3 +143,11 @@ func onInternet(addr netip.Addr) bool {
 }
 
 var _ internet.SystemDialer = (*Dialer)(nil)
+
+type withoutMergingKey struct{}
+
+// WithoutMerging marks a dial that must take the way Xray's own dialer takes, whether merging is on or not: a
+// latency measurement that should not jump between the links' paths.
+func WithoutMerging(ctx context.Context) context.Context {
+	return context.WithValue(ctx, withoutMergingKey{}, true)
+}

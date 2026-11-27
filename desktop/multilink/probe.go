@@ -11,7 +11,7 @@ import (
 )
 
 // Internet reachability probes: a TCP connect to a well-known anycast IP, bound to the NIC.
-var probeTargets = [2][]string{
+var defaultProbeTargets = [2][]string{
 	Fam4: {"1.1.1.1:443", "8.8.8.8:443"},
 	Fam6: {"[2606:4700:4700::1111]:443", "[2001:4860:4860::8888]:443"},
 }
@@ -22,7 +22,7 @@ const (
 	probeEveryDown = 4 * time.Second
 )
 
-func probe(sl *Slot, f Family) bool {
+func (s *Scheduler) probe(sl *Slot, f Family) bool {
 	ip := sl.ip(f)
 	if ip == nil {
 		return false
@@ -31,7 +31,7 @@ func probe(sl *Slot, f Family) bool {
 	if f == Fam6 {
 		network = "tcp6"
 	}
-	for _, t := range probeTargets[f] {
+	for _, t := range s.ProbeTargets(f) {
 		d := net.Dialer{LocalAddr: &net.TCPAddr{IP: ip}, Control: nics.ForceEgress(sl.Index, f == Fam6), Timeout: probeTimeout}
 		if c, err := d.Dial(network, t); err == nil {
 			c.Close()
@@ -62,7 +62,7 @@ func (s *Scheduler) RunProbes(stop <-chan struct{}) {
 		for _, j := range s.probeDue() {
 			go func() {
 				defer j.sl.probing[j.f].Store(false)
-				s.SetState(j.sl, j.f, probe(j.sl, j.f))
+				s.SetState(j.sl, j.f, s.probe(j.sl, j.f))
 			}()
 		}
 	}
@@ -109,4 +109,22 @@ func (s *Scheduler) probeDue() []probeJob {
 		}
 	}
 	return due
+}
+
+// SetProbeTargets replaces the addresses each family is probed against; an empty family keeps the defaults.
+// Some networks block the well-known resolvers, and a link that only fails the probe would take no flows.
+func (s *Scheduler) SetProbeTargets(targets [2][]string) {
+	s.mu.Lock()
+	s.probeTargets = targets
+	s.mu.Unlock()
+}
+
+// ProbeTargets are the addresses family f is probed against.
+func (s *Scheduler) ProbeTargets(f Family) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.probeTargets[f]) > 0 {
+		return append([]string(nil), s.probeTargets[f]...)
+	}
+	return defaultProbeTargets[f]
 }

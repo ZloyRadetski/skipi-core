@@ -18,6 +18,7 @@ import (
 	"time"
 
 	skipicore "github.com/ZloyRadetski/skipi-core"
+	"github.com/ZloyRadetski/skipi-core/desktop/egress"
 	"github.com/ZloyRadetski/skipi-core/desktop/sysproxy"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
@@ -446,7 +447,8 @@ func (r *Runtime) MeasureTcpDelay(host string, port int, timeoutMillis int) (int
 	if timeoutMillis < 1 {
 		return -1, errors.New("SKIPI Core desktop TCP probe timeout must be positive")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMillis)*time.Millisecond)
+	// One link every time: with link merging on, connects would otherwise alternate between the links' paths.
+	ctx, cancel := context.WithTimeout(egress.WithoutMerging(context.Background()), time.Duration(timeoutMillis)*time.Millisecond)
 	defer cancel()
 
 	started := time.Now()

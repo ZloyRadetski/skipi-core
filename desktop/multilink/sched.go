@@ -189,6 +189,8 @@ type Scheduler struct {
 	limits   map[string]float64   // adapter id -> Mbit/s, 0 or absent = unlimited
 	now      func() time.Time
 
+	probeTargets [2][]string // replaces defaultProbeTargets per family when set
+
 	coolOn   atomic.Bool // phone cooling, opt-in, see phone.go
 	coolMbps float64     // what a phone is held to after heavy use, 0 = never
 }
