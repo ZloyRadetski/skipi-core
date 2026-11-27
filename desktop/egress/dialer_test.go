@@ -172,7 +172,7 @@ func TestDecidedOrLocalDialsPassThrough(t *testing.T) {
 }
 
 func unreachable() error {
-	return &gonet.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connectex", syscall.Errno(10051))}
+	return &gonet.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ENETUNREACH)}
 }
 
 // A link that cannot reach the network is left for another one within the same dial, and sidelined.
@@ -202,7 +202,7 @@ func TestBrokenLinkFailsOverWithinTheDial(t *testing.T) {
 
 // A refusal would come from every link: it is returned at once.
 func TestRefusalIsNotRetried(t *testing.T) {
-	refused := &gonet.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connectex", syscall.Errno(10061))}
+	refused := &gonet.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
 	base := &fakeBase{fail: func(dialCall) error { return refused }}
 	d := NewDialer(base)
 	d.SetScheduler(twoLinks())
