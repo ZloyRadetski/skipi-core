@@ -458,10 +458,10 @@ func TestV6CoverageDecidesWhetherIPv6IsBalanced(t *testing.T) {
 func TestSkipSet(t *testing.T) {
 	s := NewScheduler([]nics.Nic{nic("A", "10.0.0.1", 1), nic("B", "10.0.0.2", 1)})
 	a, b := s.slots[0], s.slots[1]
-	if got := s.Acquire(map[string]struct{}{a.key: {}}); got != b {
+	if got := s.Acquire([]string{a.key}); got != b {
 		t.Fatal("skip set not honoured")
 	}
-	if got := s.Acquire(map[string]struct{}{a.key: {}, b.key: {}}); got != nil {
+	if got := s.Acquire([]string{a.key, b.key}); got != nil {
 		t.Fatal("want nil when everything is skipped")
 	}
 }
@@ -511,103 +511,6 @@ func TestFailedProbeIgnoredWhileDataArrives(t *testing.T) {
 	}
 }
 
-func TestGameModeSteersNewFlows(t *testing.T) {
-	now := time.Now()
-	s := NewScheduler([]nics.Nic{{Name: "eth0", Index: 1, IP: net.ParseIP("10.0.0.1"), Weight: 1}, {Name: "eth1", Index: 2, IP: net.ParseIP("10.0.0.2"), Weight: 1}})
-	s.now = func() time.Time { return now }
-	s.SetGameMode(true)
-	sl0 := s.slots[0]
-	u := s.trackUDP(sl0, Fam4, 40000)
-	for i := 0; i < 12; i++ {
-		now = now.Add(time.Second)
-		for p := 0; p < 20; p++ {
-			u.record(120, &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 27015}, now)
-		}
-		s.Tick(time.Second)
-	}
-	if !sl0.gameActive {
-		t.Fatal("expected eth0 gameActive")
-	}
-	for i := 0; i < 10; i++ {
-		got := s.Acquire(nil)
-		if got == nil || got.Name != "eth1" {
-			t.Fatalf("got %v", got)
-		}
-		s.Release(got)
-	}
-}
-
-func TestGameModeActivityWindowAndIgnoredPorts(t *testing.T) {
-	now := time.Now()
-	s := NewScheduler([]nics.Nic{{Name: "eth0", Index: 1, IP: net.ParseIP("10.0.0.1"), Weight: 1}, {Name: "eth1", Index: 2, IP: net.ParseIP("10.0.0.2"), Weight: 1}})
-	s.now = func() time.Time { return now }
-	s.SetGameMode(true)
-	sl0 := s.slots[0]
-	u := s.trackUDP(sl0, Fam4, 40000)
-
-	// Background DNS/QUIC probes followed by a 60s idle gap must neither trigger nor taint the socket.
-	u.record(64, &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 53}, now)
-	u.record(120, &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 443}, now)
-	now = now.Add(60 * time.Second)
-	s.Tick(time.Second)
-	if sl0.gameActive {
-		t.Fatal("expected eth0 inactive after background probes and idle gap")
-	}
-
-	// Sustaining small UDP packets for 6s should start a fresh window and steer new TCP flows to eth1.
-	for i := 0; i < 6; i++ {
-		now = now.Add(time.Second)
-		for p := 0; p < 10; p++ {
-			u.record(120, &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 27015}, now)
-		}
-		s.Tick(time.Second)
-	}
-	if !sl0.gameActive {
-		t.Fatal("expected eth0 gameActive after 6s active burst")
-	}
-	if got := s.Acquire(nil); got == nil || got.Name != "eth1" {
-		t.Fatalf("expected steering to eth1, got %v", got)
-	} else {
-		s.Release(got)
-	}
-
-	// Idle >3s should clear gameActive.
-	now = now.Add(4 * time.Second)
-	s.Tick(time.Second)
-	if sl0.gameActive {
-		t.Fatal("expected eth0 gameActive cleared after >3s idle")
-	}
-}
-
-// A torrent client's DHT also sends small packets steadily, but to far more peers than a game.
-func TestManyPeersIsNotAGame(t *testing.T) {
-	now := time.Now()
-	u := &udpFlowActivity{}
-	for i := range 300 {
-		now = now.Add(100 * time.Millisecond)
-		u.record(120, &net.UDPAddr{IP: net.IPv4(10, 1, byte(i>>8), byte(i)), Port: 6881}, now)
-		if i > 60 && u.isGameLike(now) {
-			t.Fatalf("taken for a game after %d packets to %d peers", i+1, i+1)
-		}
-	}
-}
-
-// A phone on standby must not push a new flow back onto the link that carries the game.
-func TestGameModeWinsOverStandby(t *testing.T) {
-	phone := nic("phone", "172.20.10.2", 1)
-	phone.Phone = true
-	s := NewScheduler([]nics.Nic{nic("wire", "10.0.0.1", 1), phone})
-	s.SetGameMode(true)
-	for _, sl := range s.slots {
-		s.SetState(sl, Fam4, true)
-	}
-	s.slots[0].peak[Fam4], s.slots[1].peak[Fam4] = 10e6, 5e6
-	s.slots[0].gameActive = true
-	if got := s.Acquire(nil); got.Name != "phone" {
-		t.Fatalf("new flow went to %s, the link with the game", got.Name)
-	}
-}
-
 // The weight floor must not lift a link that is slow because it is capped.
 func TestCappedLinkIsNotLiftedByTheFloor(t *testing.T) {
 	s := NewScheduler([]nics.Nic{nic("A", "10.0.0.1", 1), nic("B", "10.0.0.2", 1)})
@@ -640,35 +543,6 @@ func TestFailedProbeIgnoredWhileOtherFamilyReceives(t *testing.T) {
 	s.SetState(a, Fam6, false)
 	if a.state[Fam6] != stateUp {
 		t.Fatalf("busy link's IPv6 marked %q", a.state[Fam6])
-	}
-}
-
-// The tunnel opens one socket per destination, so the torrent guard counts per application port.
-func TestManySocketsFromOneAppPortAreNotAGame(t *testing.T) {
-	now := time.Now()
-	s := NewScheduler([]nics.Nic{nic("A", "10.0.0.1", 1)})
-	var socks []*udpFlowActivity
-	for range 30 {
-		socks = append(socks, s.trackUDP(s.slots[0], Fam4, 6881))
-	}
-	for range 60 {
-		now = now.Add(100 * time.Millisecond)
-		for i, u := range socks {
-			u.record(120, &net.UDPAddr{IP: net.IPv4(10, 1, 0, byte(i)), Port: 6881}, now)
-		}
-	}
-	for _, u := range socks {
-		if u.isGameLike(now) {
-			t.Fatal("one of 30 peer sockets of a torrent client was taken for a game")
-		}
-	}
-	game := s.trackUDP(s.slots[0], Fam4, 50000)
-	for range 60 {
-		now = now.Add(100 * time.Millisecond)
-		game.record(120, &net.UDPAddr{IP: net.IPv4(10, 2, 0, 1), Port: 27015}, now)
-	}
-	if !game.isGameLike(now) {
-		t.Fatal("a single game socket must still count")
 	}
 }
 
@@ -705,5 +579,24 @@ func TestAChangedHandleResetsTheLinkState(t *testing.T) {
 	s.Update([]nics.Nic{{ID: "mobile", Name: "Mobile", IP: ip, Handle: 2, Weight: 1}})
 	if sl.state[Fam4] != stateUnknown || !sl.downUntil[Fam4].IsZero() || !sl.lastProbe[Fam4].IsZero() {
 		t.Fatalf("state %v down until %v after a handle change", sl.state[Fam4], sl.downUntil[Fam4])
+	}
+}
+
+// AcquireUsable counts and picks under one lock, and takes nothing below the minimum.
+func TestAcquireUsableCountsAndPicks(t *testing.T) {
+	s := NewScheduler([]nics.Nic{nic("A", "10.0.0.1", 1), nic("B", "10.0.0.2", 1)})
+	sl, n := s.AcquireUsable(Fam4, 2, nil)
+	if sl == nil || n != 2 || sl.active.Load() != 1 {
+		t.Fatalf("got %v, %d usable", sl, n)
+	}
+	s.Release(sl)
+	s.Fail(s.slots[1], Fam4, time.Hour)
+	if sl, n := s.AcquireUsable(Fam4, 2, nil); sl != nil || n != 1 {
+		t.Fatalf("below the minimum got %v, %d usable", sl, n)
+	}
+	for _, sl := range s.slots {
+		if sl.active.Load() != 0 {
+			t.Fatalf("%s holds a slot it was not given", sl.Name)
+		}
 	}
 }

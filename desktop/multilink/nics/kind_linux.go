@@ -1,6 +1,8 @@
 // Based on net-merge (https://github.com/net-merge/net-merge), Copyright (c) 2026 Rohit Mahto, MIT License;
 // see third_party/net-merge. Changes for SKIPI Core: Copyright 2026, Radetski, GPL-3.0.
 
+//go:build !android
+
 package nics
 
 import (

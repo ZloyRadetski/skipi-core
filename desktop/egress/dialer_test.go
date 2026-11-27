@@ -301,7 +301,7 @@ func TestNoLinkPickedFallsBackToTheBaseDialer(t *testing.T) {
 	base := &fakeBase{}
 	d := NewDialer(base)
 	d.SetScheduler(twoLinks())
-	d.acquire = func(multilink.Family, map[string]struct{}) *multilink.Slot { return nil }
+	d.acquire = func(multilink.Family, []string) *multilink.Slot { return nil }
 	conn, err := d.Dial(context.Background(), nil, server, nil)
 	if conn == nil || err != nil {
 		t.Fatalf("Dial = %v, %v", conn, err)
@@ -343,4 +343,66 @@ func (b *hangingBase) Dial(ctx context.Context, src net.Address, dest net.Destin
 		return nil, ctx.Err()
 	}
 	return b.fakeBase.Dial(ctx, src, dest, sockopt)
+}
+
+// Copying the caller's options is done once per (options, link): the next dial gets the same copy.
+func TestPinnedOptionsAreCopiedOncePerLink(t *testing.T) {
+	d := NewDialer(&fakeBase{})
+	opt := &internet.SocketConfig{Mark: 7}
+	a := d.pinned(opt, "Wi-Fi", 0)
+	if a == opt || a.Interface != "Wi-Fi" || a.Mark != 7 || opt.Interface != "" {
+		t.Fatalf("pinned %+v from %+v", a, opt)
+	}
+	if b := d.pinned(opt, "Wi-Fi", 0); b != a {
+		t.Fatal("the same options and link were copied again")
+	}
+	if c := d.pinned(opt, "Ethernet 2", 0); c == a || c.Interface != "Ethernet 2" {
+		t.Fatalf("another link got %+v", c)
+	}
+	if n := d.pinned(nil, "Wi-Fi", 0); n.Interface != "Wi-Fi" {
+		t.Fatalf("nil options pinned %+v", n)
+	}
+	for i := range 3 * maxPins {
+		d.pinned(&internet.SocketConfig{}, "Wi-Fi", time.Duration(i))
+	}
+	if len(d.pins) > maxPins {
+		t.Fatalf("%d cached copies", len(d.pins))
+	}
+}
+
+// A phone's sockets are kept alive every two minutes, whatever Xray's options say, unless they turn keep-alive off.
+func TestPhoneKeepAliveIsPassedToTheDial(t *testing.T) {
+	d := NewDialer(&fakeBase{})
+	p := d.pinned(&internet.SocketConfig{TcpKeepAliveIdle: 30}, "Phone", 2*time.Minute)
+	if p.TcpKeepAliveIdle != 120 || p.TcpKeepAliveInterval != 120 {
+		t.Fatalf("keep-alive %d/%d s", p.TcpKeepAliveIdle, p.TcpKeepAliveInterval)
+	}
+	off := d.pinned(&internet.SocketConfig{TcpKeepAliveIdle: -1}, "Phone", 2*time.Minute)
+	if off.TcpKeepAliveIdle != -1 {
+		t.Fatalf("a disabled keep-alive became %d", off.TcpKeepAliveIdle)
+	}
+	if plain := d.pinned(&internet.SocketConfig{TcpKeepAliveIdle: 30}, "Wi-Fi", 0); plain.TcpKeepAliveIdle != 30 {
+		t.Fatalf("a link that is no phone got %d", plain.TcpKeepAliveIdle)
+	}
+}
+
+func TestAPhoneLinkDialsWithItsKeepAlive(t *testing.T) {
+	base := &fakeBase{}
+	d := NewDialer(base)
+	d.SetScheduler(multilink.NewScheduler([]nics.Nic{
+		{ID: "{phone}", Name: "Phone", Index: 3, IP: gonet.ParseIP("172.20.10.2"), Weight: 1, Phone: true},
+		{ID: "{eth}", Name: "Ethernet 2", Index: 19, IP: gonet.ParseIP("192.168.1.200"), Weight: 1},
+	}))
+	for range 30 {
+		dialTo(t, d, nil, server, nil).Close()
+	}
+	for _, c := range base.calls {
+		want := int32(0)
+		if c.sockopt.Interface == "Phone" {
+			want = 120
+		}
+		if c.sockopt.TcpKeepAliveIdle != want {
+			t.Fatalf("%s dialed with keep-alive %d, want %d", c.sockopt.Interface, c.sockopt.TcpKeepAliveIdle, want)
+		}
+	}
 }

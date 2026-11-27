@@ -18,6 +18,10 @@ const (
 	probeTimeout   = 2 * time.Second
 	probeEveryUp   = 15 * time.Second
 	probeEveryDown = 4 * time.Second
+	// probeEveryIdle is the period while nothing uses the links: no flow open, no dial for probeIdleAfter and no data
+	// arriving. A link that dies meanwhile is found by the next dial (it fails over) or at the next probe.
+	probeEveryIdle = 90 * time.Second
+	probeIdleAfter = 30 * time.Second
 )
 
 func (s *Scheduler) probe(sl *Slot, f Family) bool {
@@ -57,12 +61,17 @@ func (s *Scheduler) RunProbes(stop <-chan struct{}) {
 			return
 		case <-t.C:
 		}
-		for _, j := range s.probeDue() {
-			go func() {
-				defer j.sl.probing[j.f].Store(false)
-				s.SetState(j.sl, j.f, s.probe(j.sl, j.f))
-			}()
-		}
+		s.probeStep()
+	}
+}
+
+// probeStep starts the probes that are due.
+func (s *Scheduler) probeStep() {
+	for _, j := range s.probeDue() {
+		go func() {
+			defer j.sl.probing[j.f].Store(false)
+			s.SetState(j.sl, j.f, s.probe(j.sl, j.f))
+		}()
 	}
 }
 
@@ -71,6 +80,7 @@ func (s *Scheduler) probeDue() []probeJob {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
+	idle := s.idleLocked(now)
 	var due []probeJob
 	for _, sl := range s.slots {
 		if !sl.present {
@@ -84,6 +94,9 @@ func (s *Scheduler) probeDue() []probeJob {
 			switch sl.state[f] {
 			case stateUnknown:
 				every = 0
+				if !sl.lastProbe[f].IsZero() { // a probe failed while the link was busy, see SetState
+					every = probeEveryDown
+				}
 			case stateDown:
 				every = probeEveryDown
 			case stateUp:
@@ -93,6 +106,8 @@ func (s *Scheduler) probeDue() []probeJob {
 				// probe forward (see Suspect).
 				if sl.phone.Load() && !sl.suspect[f] {
 					every = probeEveryPhone
+				} else if idle && !sl.suspect[f] {
+					every = probeEveryIdle
 				}
 			}
 			if now.Sub(sl.lastProbe[f]) < every {
@@ -107,6 +122,20 @@ func (s *Scheduler) probeDue() []probeJob {
 		}
 	}
 	return due
+}
+
+// idleLocked reports whether nothing uses the links: no flow open, no dial lately and no data arriving. The caller
+// holds s.mu.
+func (s *Scheduler) idleLocked(now time.Time) bool {
+	if now.Sub(s.lastAcquire) < probeIdleAfter {
+		return false
+	}
+	for _, sl := range s.slots {
+		if sl.active.Load() > 0 || now.Sub(sl.heard[Fam4]) < probeEveryUp || now.Sub(sl.heard[Fam6]) < probeEveryUp {
+			return false
+		}
+	}
+	return true
 }
 
 // SetProbeTargets replaces the addresses each family is probed against; an empty family keeps the defaults.

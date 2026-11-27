@@ -24,12 +24,17 @@ type flowConn struct {
 	s        *Scheduler
 	once     sync.Once
 	activity *flowActivity
+	rab, wab abort // end a wait for the cap when the connection closes or the read or write deadline passes
+	close    sync.Once
 }
 
 // Open hands a connection dialed out of sl to the scheduler. sl comes from AcquireFor; from here the returned
 // connection releases it when it closes, so the caller must not call ReleaseFor for it.
 func (s *Scheduler) Open(conn net.Conn, sl *Slot, f Family) net.Conn {
-	return &flowConn{Conn: conn, sl: sl, fam: f, s: s, activity: s.track(sl, f)}
+	c := &flowConn{Conn: conn, sl: sl, fam: f, s: s, activity: s.track(sl, f)}
+	c.rab.done = make(chan struct{})
+	c.wab.done = c.rab.done
+	return c
 }
 
 func (c *flowConn) Read(p []byte) (int, error) {
@@ -40,13 +45,15 @@ func (c *flowConn) Read(p []byte) (int, error) {
 	if n > 0 {
 		c.sl.bytesIn[c.fam].Add(int64(n))
 		c.activity.bytes.Add(int64(n))
-		c.sl.throttle(true, n)
+		if werr := c.sl.throttle(true, n, &c.rab); werr != nil && err == nil {
+			err = werr // the data is delivered with the error; a closed connection reports its own end on the next read
+		}
 	}
 	return n, err
 }
 
 func (c *flowConn) Write(p []byte) (int, error) {
-	n, err := c.sl.writePaced(c.Conn, p, false)
+	n, err := c.sl.writePaced(c.Conn, p, false, &c.wab)
 	c.sl.bytesOut[c.fam].Add(int64(n))
 	c.activity.bytes.Add(int64(n))
 	return n, err
@@ -59,7 +66,36 @@ func (c *flowConn) release() {
 	})
 }
 
-func (c *flowConn) Close() error { c.release(); return c.Conn.Close() }
+func (c *flowConn) Close() error {
+	c.release()
+	c.close.Do(func() { close(c.rab.done) })
+	return c.Conn.Close()
+}
+
+func deadlineNanos(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+// The deadlines are kept here as well, so a wait for the cap ends at them as the connection's own I/O does.
+func (c *flowConn) SetDeadline(t time.Time) error {
+	n := deadlineNanos(t)
+	c.rab.deadline.Store(n)
+	c.wab.deadline.Store(n)
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *flowConn) SetReadDeadline(t time.Time) error {
+	c.rab.deadline.Store(deadlineNanos(t))
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *flowConn) SetWriteDeadline(t time.Time) error {
+	c.wab.deadline.Store(deadlineNanos(t))
+	return c.Conn.SetWriteDeadline(t)
+}
 
 func (c *flowConn) CloseWrite() error {
 	c.release()

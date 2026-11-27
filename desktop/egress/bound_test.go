@@ -45,7 +45,7 @@ func TestALinkWithAHandleIsBoundThroughTheHostBeforeItConnects(t *testing.T) {
 	}
 	addr := ln.Addr().(*net.TCPAddr)
 	dest := xnet.TCPDestination(xnet.IPAddress(addr.IP), xnet.Port(addr.Port))
-	conn, err := dialBound(context.Background(), sl, multilink.Fam4, dest, nil)
+	conn, err := dialBound(context.Background(), sl, multilink.Fam4, dest, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestAFailedBindFailsTheDial(t *testing.T) {
 	sched := multilink.NewScheduler([]nics.Nic{{ID: "mobile", Name: "Mobile data", IP: net.IPv4(192, 0, 2, 1).To4(), Handle: 42, Weight: 1}})
 	sl := sched.AcquireFor(multilink.Fam4, nil)
 	dest := xnet.TCPDestination(xnet.IPAddress(net.IPv4(127, 0, 0, 1)), 9)
-	if _, err := dialBound(context.Background(), sl, multilink.Fam4, dest, nil); err == nil {
+	if _, err := dialBound(context.Background(), sl, multilink.Fam4, dest, nil, 0); err == nil {
 		t.Fatal("a link that cannot be bound must not dial")
 	}
 }

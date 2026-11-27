@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,11 +32,7 @@ const (
 	// link does not stall.
 	limitBurstMin  = 16 << 10
 	limitBurstTime = 50 * time.Millisecond
-	// udpFree lets small datagrams through untouched: DNS, mDNS and calls stay responsive even
-	// while a bulk QUIC download is being paced on the same adapter.
-	udpFree = 512
-
-	bytesPerMbit = 1_000_000 / 8
+	bytesPerMbit   = 1_000_000 / 8
 )
 
 // limitPair is the installed cap: nil means unlimited. It is swapped as a whole so the data path
@@ -59,7 +58,8 @@ func newBucket(bytesPerSec float64) *bucket {
 
 // take reserves n bytes and sleeps until they may pass. The reservation happens under the lock,
 // so concurrent flows queue fairly instead of all waking at once; the sleep itself is outside it.
-func (b *bucket) take(n int) {
+// ab, when not nil, ends the sleep early with an error: the connection was closed or its deadline came.
+func (b *bucket) take(n int, ab *abort) error {
 	b.mu.Lock()
 	now := time.Now()
 	b.tokens = math.Min(b.burst, b.tokens+now.Sub(b.last).Seconds()*b.rate)
@@ -74,8 +74,59 @@ func (b *bucket) take(n int) {
 		b.tokens -= need
 	}
 	b.mu.Unlock()
-	if wait > 0 {
-		time.Sleep(wait)
+	err := ab.sleep(wait)
+	if err != nil && wait > 0 {
+		// Not sent after all: hand the reservation back, so a connection that gave up does not hold the others up.
+		b.mu.Lock()
+		b.last = b.last.Add(-wait)
+		b.mu.Unlock()
+	}
+	return err
+}
+
+// abort ends a wait for tokens early: when done is closed (the connection was closed) or at the deadline (unix nanoseconds,
+// 0 = none). A nil abort never ends a wait.
+type abort struct {
+	done     chan struct{}
+	deadline atomic.Int64
+}
+
+// sleep waits d, or less when the connection ends first.
+func (a *abort) sleep(d time.Duration) error {
+	if a == nil {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		return nil
+	}
+	if d <= 0 {
+		return nil // nothing to wait for; the connection reports its own end
+	}
+	select {
+	case <-a.done:
+		return net.ErrClosed
+	default:
+	}
+	late := false
+	if dl := a.deadline.Load(); dl != 0 {
+		left := time.Duration(dl - time.Now().UnixNano())
+		if left <= 0 {
+			return os.ErrDeadlineExceeded
+		}
+		if left < d {
+			d, late = left, true
+		}
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		if late {
+			return os.ErrDeadlineExceeded
+		}
+		return nil
+	case <-a.done:
+		return net.ErrClosed
 	}
 }
 
@@ -137,10 +188,10 @@ func (sl *Slot) limitMbps() float64 {
 }
 
 // throttle paces n bytes in one direction (down = from the internet) on this adapter.
-func (sl *Slot) throttle(down bool, n int) {
+func (sl *Slot) throttle(down bool, n int, ab *abort) error {
 	p := sl.limit.Load()
 	if p == nil || n <= 0 {
-		return
+		return nil
 	}
 	b := p.out
 	if down {
@@ -148,23 +199,17 @@ func (sl *Slot) throttle(down bool, n int) {
 	}
 	for n > 0 {
 		k := min(n, p.chunk)
-		b.take(k)
+		if err := b.take(k, ab); err != nil {
+			return err
+		}
 		n -= k
 	}
-}
-
-// throttlePacket is throttle for datagrams: small ones skip the bucket so latency-sensitive
-// traffic (DNS, calls) is not stuck behind a bulk download.
-func (sl *Slot) throttlePacket(down bool, n int) {
-	if n <= udpFree {
-		return
-	}
-	sl.throttle(down, n)
+	return nil
 }
 
 // writePaced waits for the adapter's tokens and writes p in chunks while doing so, so a large
 // buffer is delivered smoothly instead of in one burst at the end of the wait.
-func (sl *Slot) writePaced(dst io.Writer, p []byte, down bool) (int, error) {
+func (sl *Slot) writePaced(dst io.Writer, p []byte, down bool, ab *abort) (int, error) {
 	pair := sl.limit.Load()
 	if pair == nil {
 		return dst.Write(p)
@@ -172,7 +217,9 @@ func (sl *Slot) writePaced(dst io.Writer, p []byte, down bool) (int, error) {
 	written := 0
 	for len(p) > 0 {
 		k := min(len(p), pair.chunk)
-		sl.throttle(down, k)
+		if err := sl.throttle(down, k, ab); err != nil {
+			return written, err
+		}
 		n, err := dst.Write(p[:k])
 		written += n
 		if err != nil {

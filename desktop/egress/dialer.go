@@ -11,6 +11,7 @@ package egress
 import (
 	"context"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,8 +26,22 @@ type Dialer struct {
 	base  internet.SystemDialer
 	sched atomic.Pointer[multilink.Scheduler]
 	// acquire picks the link for a dial; nil takes the scheduler's own pick (a seam for tests).
-	acquire func(multilink.Family, map[string]struct{}) *multilink.Slot
+	acquire func(multilink.Family, []string) *multilink.Slot
+
+	// pins caches the socket options copied for a link (see pinned), so a dial does not clone them again.
+	pinMu sync.Mutex
+	pins  map[pinKey]*internet.SocketConfig
 }
+
+type pinKey struct {
+	opt       *internet.SocketConfig
+	link      string
+	keepAlive time.Duration
+}
+
+// maxPins bounds the cache: socket options come from the config, a handful per outbound, so it only fills up when
+// the config is replaced over and over.
+const maxPins = 64
 
 // attemptTimeout is how long one link gets to connect while another is left to try; the last link gets the whole
 // connect budget, as an unmerged dial does.
@@ -53,36 +68,46 @@ func (d *Dialer) Dial(ctx context.Context, src net.Address, dest net.Destination
 	if !ok || ctx.Value(withoutMergingKey{}) != nil {
 		return d.base.Dial(ctx, src, dest, sockopt)
 	}
-	usable := sched.Usable(family)
-	if usable < 2 {
-		return d.base.Dial(ctx, src, dest, sockopt)
-	}
+	var usable int
+	var first *multilink.Slot // the pick made together with the count
 	acquire := d.acquire
 	if acquire == nil {
 		acquire = sched.AcquireFor
+		first, usable = sched.AcquireUsable(family, 2, nil)
+	} else {
+		usable = sched.Usable(family)
 	}
-	tried := map[string]struct{}{}
+	if usable < 2 {
+		return d.base.Dial(ctx, src, dest, sockopt)
+	}
+	var triedBuf [4]string
+	tried := triedBuf[:0]
 	var lastErr error
 	for {
-		sl := acquire(family, tried)
+		sl := first
+		first = nil
+		if sl == nil {
+			sl = acquire(family, tried)
+		}
 		if sl == nil {
 			if lastErr == nil {
 				return d.base.Dial(ctx, src, dest, sockopt)
 			}
 			return nil, lastErr
 		}
-		tried[sl.Key()] = struct{}{}
+		tried = append(tried, sl.Key())
 		// While another link is left, a link that does not answer is given up on early.
 		attemptCtx, cancel := ctx, context.CancelFunc(func() {})
 		if len(tried) < usable {
 			attemptCtx, cancel = context.WithTimeout(ctx, attemptTimeout)
 		}
+		keepAlive := sched.PhoneKeepAlive(sl)
 		var conn net.Conn
 		var err error
 		if sl.Handle() != 0 {
-			conn, err = dialBound(attemptCtx, sl, family, dest, sockopt)
+			conn, err = dialBound(attemptCtx, sl, family, dest, sockopt, keepAlive)
 		} else {
-			pinned := pinnedOptions(sockopt, sl.Name)
+			pinned := d.pinned(sockopt, sl.Name, keepAlive)
 			var from net.Address
 			if dest.Address.Family().IsIP() {
 				from = net.IPAddress(sl.IP(family))
@@ -113,13 +138,29 @@ func (d *Dialer) Dial(ctx context.Context, src net.Address, dest net.Destination
 	}
 }
 
-// pinnedOptions copies the caller's socket options with the link named, so the caller's own stay untouched.
-func pinnedOptions(sockopt *internet.SocketConfig, link string) *internet.SocketConfig {
+// pinned is the caller's socket options with the link named (and, for a phone, its keep-alive period), as a copy so
+// the caller's own stay untouched. The copy is kept per (options, link, period): Xray's options are fixed once the
+// config is loaded, and cloning them with reflection on every dial is the dearest thing a merged dial does itself.
+func (d *Dialer) pinned(sockopt *internet.SocketConfig, link string, keepAlive time.Duration) *internet.SocketConfig {
+	key := pinKey{sockopt, link, keepAlive}
+	d.pinMu.Lock()
+	defer d.pinMu.Unlock()
+	if p, ok := d.pins[key]; ok {
+		return p
+	}
 	pinned := &internet.SocketConfig{}
 	if sockopt != nil {
 		pinned = proto.Clone(sockopt).(*internet.SocketConfig)
 	}
 	pinned.Interface = link
+	if keepAlive > 0 && pinned.TcpKeepAliveIdle >= 0 && pinned.TcpKeepAliveInterval >= 0 {
+		pinned.TcpKeepAliveIdle = int32(keepAlive / time.Second)
+		pinned.TcpKeepAliveInterval = int32(keepAlive / time.Second)
+	}
+	if d.pins == nil || len(d.pins) >= maxPins {
+		d.pins = make(map[pinKey]*internet.SocketConfig)
+	}
+	d.pins[key] = pinned
 	return pinned
 }
 

@@ -49,8 +49,8 @@ type Slot struct {
 	Index int
 	// Handle is the host's name for the link (see nics.Nic.Handle); it changes when the network reconnects.
 	handle atomic.Uint64
-	key   string
-	addr  atomic.Pointer[slotAddr]
+	key    string
+	addr   atomic.Pointer[slotAddr]
 
 	active, total, failed atomic.Int64 // active is across families (idle check on removal)
 	actF                  [2]atomic.Int64
@@ -73,8 +73,7 @@ type Slot struct {
 	rateIn, rateOut [2]float64 // bytes/s over the last tick
 	peak            [2]float64 // observed capacity: max recent rateIn+rateOut
 	flows           [2]map[*flowActivity]struct{}
-	udpFlows        [2]map[*udpFlowActivity]struct{}
-	gameActive      bool
+	quiet           bool // scratch of Tick: carried too little this tick to count as a sample
 
 	// The adapter's total traffic from the OS's counters (all apps, not only net-merge's flows).
 	linkIn, linkOut         uint64
@@ -106,38 +105,6 @@ func (s *Scheduler) track(sl *Slot, f Family) *flowActivity {
 func (s *Scheduler) untrack(sl *Slot, f Family, a *flowActivity) {
 	s.mu.Lock()
 	delete(sl.flows[f], a)
-	s.mu.Unlock()
-}
-
-// trackUDP follows one socket for game detection. appPort is the application's own port: the tunnel
-// opens a socket per destination, so who an application talks to is only seen across its sockets.
-func (s *Scheduler) trackUDP(sl *Slot, f Family, appPort uint16) *udpFlowActivity {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	app := s.apps[appPort]
-	if app == nil {
-		if s.apps == nil {
-			s.apps = map[uint16]*appPeers{}
-		}
-		app = &appPeers{}
-		s.apps[appPort] = app
-	}
-	app.sockets++
-	u := &udpFlowActivity{app: app, appPort: appPort}
-	if sl.udpFlows[f] == nil {
-		sl.udpFlows[f] = make(map[*udpFlowActivity]struct{})
-	}
-	sl.udpFlows[f][u] = struct{}{}
-	return u
-}
-func (s *Scheduler) untrackUDP(sl *Slot, f Family, u *udpFlowActivity) {
-	s.mu.Lock()
-	delete(sl.udpFlows[f], u)
-	if u.app != nil {
-		if u.app.sockets--; u.app.sockets == 0 {
-			delete(s.apps, u.appPort)
-		}
-	}
 	s.mu.Unlock()
 }
 
@@ -195,13 +162,12 @@ type SlotStats struct {
 // discounts idle TCP sockets; static mode
 // retains weighted least-open-flows. Data transfer accounting stays lock-free.
 type Scheduler struct {
-	mu       sync.Mutex
-	slots    []*Slot
-	auto     bool
-	gameMode bool
-	apps     map[uint16]*appPeers // UDP peers per application port, guarded by mu
-	limits   map[string]float64   // adapter id -> Mbit/s, 0 or absent = unlimited
-	now      func() time.Time
+	mu          sync.Mutex
+	slots       []*Slot
+	auto        bool
+	limits      map[string]float64 // adapter id -> Mbit/s, 0 or absent = unlimited
+	now         func() time.Time
+	lastAcquire time.Time // the last dial, guarded by mu, see probeDue
 
 	probeTargets [2][]string // replaces defaultProbeTargets per family when set
 
@@ -216,9 +182,7 @@ func NewScheduler(nics []nics.Nic) *Scheduler {
 }
 
 // SetAuto makes Tick derive weights from observed throughput instead of the static ones.
-func (s *Scheduler) SetAuto(on bool)     { s.mu.Lock(); s.auto = on; s.mu.Unlock() }
-func (s *Scheduler) SetGameMode(on bool) { s.mu.Lock(); s.gameMode = on; s.mu.Unlock() }
-func (s *Scheduler) GameMode() bool      { s.mu.Lock(); defer s.mu.Unlock(); return s.gameMode }
+func (s *Scheduler) SetAuto(on bool) { s.mu.Lock(); s.auto = on; s.mu.Unlock() }
 
 // SetLimit caps an adapter at mbitPerSec Mbit/s across all of its flows and both address families;
 // 0 removes the cap. Saved in the scheduler, so an adapter that is unplugged and comes back keeps it.
@@ -371,7 +335,8 @@ func (s *Scheduler) Tick(dt time.Duration) {
 	// nics.Octets calls into the OS, so read the counters on a snapshot of the slots without s.mu
 	// (it would stall AcquireFor and Update) and take the lock only to store the results.
 	s.mu.Lock()
-	slots := append([]*Slot(nil), s.slots...)
+	var slotBuf [8]*Slot
+	slots := append(slotBuf[:0], s.slots...)
 	s.mu.Unlock()
 
 	type sample struct {
@@ -379,27 +344,16 @@ func (s *Scheduler) Tick(dt time.Duration) {
 		ok      bool
 	}
 
-	samples := make([]sample, len(slots))
-	for i, sl := range slots {
+	var sampleBuf [8]sample
+	samples := sampleBuf[:0]
+	for _, sl := range slots {
 		in, out, ok := nics.Octets(sl.Index)
-		samples[i] = sample{in, out, ok}
+		samples = append(samples, sample{in, out, ok})
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	for _, sl := range s.slots {
-		active := false
-		for _, f := range []Family{Fam4, Fam6} {
-			for u := range sl.udpFlows[f] {
-				if u.isGameLike(now) {
-					active = true
-					break
-				}
-			}
-		}
-		sl.gameActive = active
-	}
 	sec := dt.Seconds()
 	for i, sl := range slots {
 		in, out, ok := samples[i].in, samples[i].out, samples[i].ok
@@ -416,7 +370,6 @@ func (s *Scheduler) Tick(dt time.Duration) {
 	for _, f := range []Family{Fam4, Fam6} {
 		var maxPeak float64
 		live, measured := 0, true
-		idle := map[*Slot]bool{}
 		// How many flows each link is moving data on, and the average over the live links.
 		var busySum, busyN int64
 		for _, sl := range s.slots {
@@ -435,6 +388,7 @@ func (s *Scheduler) Tick(dt time.Duration) {
 			}
 		}
 		for _, sl := range s.slots {
+			sl.quiet = false
 			in, out := sl.bytesIn[f].Load(), sl.bytesOut[f].Load()
 			sl.rateIn[f] = float64(in-sl.lastIn[f]) / sec
 			sl.rateOut[f] = float64(out-sl.lastOut[f]) / sec
@@ -462,7 +416,7 @@ func (s *Scheduler) Tick(dt time.Duration) {
 					sl.peak[f] += (r - sl.peak[f]) * (1 - math.Exp(-sec/tau))
 				}
 			} else {
-				idle[sl] = true
+				sl.quiet = true
 			}
 			if !sl.present || sl.ip(f) == nil {
 				continue
@@ -472,8 +426,8 @@ func (s *Scheduler) Tick(dt time.Duration) {
 		}
 		// An idle link may have a pessimistic estimate. Let it recover, but never
 		// raise it above half the best link just because no traffic is flowing.
-		for sl := range idle {
-			if sl.present && sl.ip(f) != nil && sl.peak[f] > 0 {
+		for _, sl := range s.slots {
+			if sl.quiet && sl.present && sl.ip(f) != nil && sl.peak[f] > 0 {
 				sl.peak[f] = math.Min(sl.peak[f]*1.03, math.Max(sl.peak[f], 0.5*maxPeak))
 			}
 		}
@@ -506,23 +460,40 @@ func (s *Scheduler) Tick(dt time.Duration) {
 }
 
 // Acquire picks an IPv4 NIC for a new flow, skipping the ones in skip. The caller must Release it.
-func (s *Scheduler) Acquire(skip map[string]struct{}) *Slot { return s.AcquireFor(Fam4, skip) }
-func (s *Scheduler) Release(sl *Slot)                       { s.ReleaseFor(sl, Fam4) }
+func (s *Scheduler) Acquire(skip []string) *Slot { return s.AcquireFor(Fam4, skip) }
+func (s *Scheduler) Release(sl *Slot)            { s.ReleaseFor(sl, Fam4) }
 
-// AcquireFor picks a NIC that has an address of the given family.
-func (s *Scheduler) AcquireFor(f Family, skip map[string]struct{}) *Slot {
+// AcquireFor picks a NIC that has an address of the given family, skipping the links whose keys are in skip.
+func (s *Scheduler) AcquireFor(f Family, skip []string) *Slot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	sl, _ := s.acquire(f, 0, skip)
+	return sl
+}
+
+// AcquireUsable is Usable and AcquireFor under one lock: it picks a link like AcquireFor, but only when at least min
+// links are usable, and says how many are. It returns nil, and takes no slot, below min.
+func (s *Scheduler) AcquireUsable(f Family, min int, skip []string) (*Slot, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acquire(f, min, skip)
+}
+
+// acquire is AcquireFor with s.mu held. It also counts the usable links (see Usable, skip does not apply to the count)
+// and takes nothing when there are fewer than min.
+func (s *Scheduler) acquire(f Family, min int, skip []string) (*Slot, int) {
 	now := s.now()
 	// Tiers: 0 = probed up, 1 = not probed yet, 2 = probe failed or link error cooldown.
 	// Only the best non-empty tier is used, so a dead tether gets no flows but, if every NIC
 	// looks dead, flows still go somewhere rather than nowhere.
+	var tierBuf [3][8]*Slot // room for eight links per tier without a heap allocation
 	var tiers [3][]*Slot
+	for i := range tiers {
+		tiers[i] = tierBuf[i][:0]
+	}
+	usable := 0
 	for _, sl := range s.slots {
 		if !sl.present || sl.ip(f) == nil {
-			continue
-		}
-		if _, no := skip[sl.key]; no {
 			continue
 		}
 		t := 1
@@ -531,6 +502,12 @@ func (s *Scheduler) AcquireFor(f Family, skip map[string]struct{}) *Slot {
 			t = 2
 		case sl.state[f] == stateUp:
 			t = 0
+		}
+		if t < 2 {
+			usable++
+		}
+		if slices.Contains(skip, sl.key) {
+			continue
 		}
 		tiers[t] = append(tiers[t], sl)
 	}
@@ -541,13 +518,8 @@ func (s *Scheduler) AcquireFor(f Family, skip map[string]struct{}) *Slot {
 			break
 		}
 	}
-	if len(pool) == 0 {
-		return nil
-	}
-	if s.gameMode { // keep new flows off a link with a game or call, if another can take them
-		if free := slices.DeleteFunc(slices.Clone(pool), func(sl *Slot) bool { return sl.gameActive }); len(free) > 0 {
-			pool = free
-		}
+	if len(pool) == 0 || usable < min {
+		return nil, usable
 	}
 	pool = s.standby(pool, f)
 	// Random start so ties don't resonate with the arrival pattern (a rotating counter can
@@ -568,7 +540,8 @@ func (s *Scheduler) AcquireFor(f Family, skip map[string]struct{}) *Slot {
 	best.active.Add(1)
 	best.actF[f].Add(1)
 	best.total.Add(1)
-	return best
+	s.lastAcquire = now
+	return best, usable
 }
 
 // V6Usable reports whether any adapter can currently carry IPv6.
@@ -620,6 +593,8 @@ func (s *Scheduler) SetState(sl *Slot, f Family, up bool) {
 		sl.downUntil[f] = time.Time{}
 	} else if !sl.busyCarrying() {
 		sl.state[f] = stateDown
+	} else {
+		sl.lastProbe[f] = s.now() // ignored: the next probe is a period away, not the next second
 	}
 }
 

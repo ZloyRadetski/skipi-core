@@ -111,7 +111,7 @@ func TestThroughputOnTheOtherLinksBringsThePhoneIn(t *testing.T) {
 
 func TestPhoneIsUsedWhenItIsTheOnlyWay(t *testing.T) {
 	s, wifi, phone := wifiAndPhone(100, 50)
-	if got := s.Acquire(map[string]struct{}{"Wi-Fi": {}}); got != phone {
+	if got := s.Acquire([]string{"Wi-Fi"}); got != phone {
 		t.Fatal("a retry that excludes Wi-Fi must fall over to the phone")
 	}
 	s.Release(phone)
@@ -273,7 +273,7 @@ func TestIdlePhoneIsProbedRarely(t *testing.T) {
 	}
 	s.SetState(wifi, Fam4, true)
 	s.SetState(phone, Fam4, true)
-
+	wifi.active.Add(1) // a flow is open, so the links are not idle (see probeEveryIdle)
 	clock = clock.Add(probeEveryUp)
 	if got := due(); !got[wifi] || got[phone] {
 		t.Fatalf("after %s: Wi-Fi probed %v (want true), phone probed %v (want false)", probeEveryUp, got[wifi], got[phone])

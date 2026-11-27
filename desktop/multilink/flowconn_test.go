@@ -219,3 +219,76 @@ func TestClassifyBindErrors(t *testing.T) {
 		})
 	}
 }
+
+// A write waiting for the cap's tokens ends when the connection is closed, not when the wait is over.
+func TestCloseEndsAPacedWrite(t *testing.T) {
+	s := NewScheduler(nil)
+	sl := &Slot{}
+	sl.setLimit(0.05) // 6 KB/s: every 16 KB chunk after the first waits 2.6 s
+	c := s.Open(pipeServer(t, func(c net.Conn) { io.Copy(io.Discard, c) }), sl, Fam4)
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Write(make([]byte, 1<<20))
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	c.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the write finished without an error after Close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not end the paced write")
+	}
+}
+
+// A write deadline ends the wait too, with a timeout, and a later deadline lets writes go on.
+func TestWriteDeadlineEndsAPacedWrite(t *testing.T) {
+	s := NewScheduler(nil)
+	sl := &Slot{}
+	sl.setLimit(0.05)
+	c := s.Open(pipeServer(t, func(c net.Conn) { io.Copy(io.Discard, c) }), sl, Fam4)
+	defer c.Close()
+	c.SetWriteDeadline(time.Now().Add(150 * time.Millisecond))
+	start := time.Now()
+	_, err := c.Write(make([]byte, 1<<20))
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("err = %v, want a timeout", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("the deadline took %s to end the write", d)
+	}
+	c.SetWriteDeadline(time.Time{})
+	if _, err := c.Write(make([]byte, 1<<10)); err != nil {
+		t.Fatalf("write after the deadline was lifted: %v", err)
+	}
+}
+
+// A read held back by the cap ends at the read deadline.
+func TestReadDeadlineEndsAPacedRead(t *testing.T) {
+	s := NewScheduler(nil)
+	sl := &Slot{}
+	sl.setLimit(0.05)
+	srv := pipeServer(t, func(c net.Conn) {
+		c.Write(make([]byte, 256<<10))
+		time.Sleep(3 * time.Second)
+	})
+	c := s.Open(srv, sl, Fam4)
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	start := time.Now()
+	buf := make([]byte, 64<<10)
+	var err error
+	for err == nil {
+		_, err = c.Read(buf)
+	}
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("err = %v, want a timeout", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("the read took %s to end at its deadline", d)
+	}
+}

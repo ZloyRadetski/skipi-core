@@ -174,3 +174,12 @@ func (s *Scheduler) Suspect(sl *Slot, f Family) {
 		sl.suspect[f] = true
 	}
 }
+
+// PhoneKeepAlive is the TCP keep-alive period for an upstream socket on sl when the link is a phone, and 0 for any
+// other link, whose sockets keep the period their own options name.
+func (s *Scheduler) PhoneKeepAlive(sl *Slot) time.Duration {
+	if sl.phone.Load() {
+		return s.keepAlive(sl)
+	}
+	return 0
+}

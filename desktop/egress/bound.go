@@ -16,7 +16,7 @@ import (
 // dialBound dials over a link the host owns (Android's networks): the socket is bound to the link by its handle
 // before it connects, which an interface name given to Xray's dialer cannot do there. It makes the socket the way
 // Xray's own dialer does, minus the options that need the system to allow them.
-func dialBound(ctx context.Context, sl *multilink.Slot, family multilink.Family, dest net.Destination, sockopt *internet.SocketConfig) (net.Conn, error) {
+func dialBound(ctx context.Context, sl *multilink.Slot, family multilink.Family, dest net.Destination, sockopt *internet.SocketConfig, phoneKeepAlive time.Duration) (net.Conn, error) {
 	control := sl.Control(family == multilink.Fam6)
 	if dest.Network == net.Network_UDP {
 		destAddr, err := net.ResolveUDPAddr("udp", dest.NetAddr())
@@ -49,6 +49,9 @@ func dialBound(ctx context.Context, sl *multilink.Slot, family multilink.Family,
 		if sockopt.TcpKeepAliveInterval > 0 {
 			keepAlive.Interval = time.Duration(sockopt.TcpKeepAliveInterval) * time.Second
 		}
+	}
+	if phoneKeepAlive > 0 && keepAlive.Enable {
+		keepAlive.Idle, keepAlive.Interval = phoneKeepAlive, phoneKeepAlive
 	}
 	dialer := &net.Dialer{Timeout: 16 * time.Second, KeepAlive: keepAliveDuration, KeepAliveConfig: keepAlive, Control: control}
 	return dialer.DialContext(ctx, dest.Network.SystemString(), dest.NetAddr())

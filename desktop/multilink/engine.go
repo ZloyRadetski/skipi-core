@@ -227,29 +227,25 @@ func (e *Engine) rescanLocked() {
 	e.sched.Update(use)
 }
 
-const tickEvery = time.Second
-
-var rescanEvery = 3 * time.Second
+// One timer drives everything the engine does on its own: sampling, probes and the rescan. A desktop only needs to see
+// a plugged-in tether within a few seconds, so the rescan is not run more often than rescanEvery.
+var (
+	tickEvery   = time.Second
+	rescanEvery = 10 * time.Second
+)
 
 func (e *Engine) startLoopsLocked() {
 	stop := make(chan struct{})
 	e.stop = stop
 	sched := e.sched
 	rescan := !e.cfg.NoRescan
-	n := 2
-	if rescan {
-		n++
-	}
-	e.loops.Add(n)
-	go func() {
-		defer e.loops.Done()
-		sched.RunProbes(stop)
-	}()
+	e.loops.Add(1)
 	go func() {
 		defer e.loops.Done()
 		t := time.NewTicker(tickEvery)
 		defer t.Stop()
 		last := time.Now()
+		scanned := last
 		for {
 			select {
 			case <-stop:
@@ -257,22 +253,11 @@ func (e *Engine) startLoopsLocked() {
 			case now := <-t.C:
 				sched.Tick(now.Sub(last))
 				last = now
-			}
-		}
-	}()
-	if !rescan {
-		return
-	}
-	go func() {
-		defer e.loops.Done()
-		t := time.NewTicker(rescanEvery)
-		defer t.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-t.C:
-				e.Rescan()
+				sched.probeStep()
+				if rescan && now.Sub(scanned) >= rescanEvery {
+					scanned = now
+					e.Rescan()
+				}
 			}
 		}
 	}()

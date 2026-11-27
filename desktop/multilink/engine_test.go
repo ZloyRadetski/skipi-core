@@ -272,9 +272,9 @@ func TestConcurrentApplyAndStopAreSafe(t *testing.T) {
 
 // A host that reports its links itself (Android) rescans on every report, so no timer rescans besides.
 func TestNoRescanLoopWhenTheHostReportsLinks(t *testing.T) {
-	old := rescanEvery
-	rescanEvery = 5 * time.Millisecond
-	defer func() { rescanEvery = old }()
+	oldRescan, oldTick := rescanEvery, tickEvery
+	rescanEvery, tickEvery = 5*time.Millisecond, 5*time.Millisecond
+	defer func() { rescanEvery, tickEvery = oldRescan, oldTick }()
 	count := func(noRescan bool) int {
 		h := homeLinks()
 		var mu sync.Mutex

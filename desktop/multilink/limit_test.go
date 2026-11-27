@@ -46,12 +46,12 @@ func TestParseLimit(t *testing.T) {
 func TestBucketPacesAfterTheBurst(t *testing.T) {
 	b := newBucket(100_000) // 100 KB/s, below the minimum burst
 	start := time.Now()
-	b.take(limitBurstMin) // a quiet bucket starts full, so the first chunk is free
+	b.take(limitBurstMin, nil) // a quiet bucket starts full, so the first chunk is free
 	if d := time.Since(start); d > 50*time.Millisecond {
 		t.Fatalf("the initial burst waited %s", d)
 	}
 	start = time.Now()
-	b.take(limitChunkMin)
+	b.take(limitChunkMin, nil)
 	if d := time.Since(start); d < 100*time.Millisecond {
 		t.Fatalf("16 KB at 100 KB/s took %s, want about 164 ms", d)
 	}
@@ -61,7 +61,7 @@ func TestThrottleWithoutLimitIsFree(t *testing.T) {
 	sl := &Slot{}
 	start := time.Now()
 	for i := 0; i < 100; i++ {
-		sl.throttle(true, 64<<10)
+		sl.throttle(true, 64<<10, nil)
 	}
 	if d := time.Since(start); d > 50*time.Millisecond {
 		t.Fatalf("throttling an unlimited adapter took %s", d)
@@ -71,22 +71,11 @@ func TestThrottleWithoutLimitIsFree(t *testing.T) {
 func TestThrottleKeepsDirectionsSeparate(t *testing.T) {
 	sl := &Slot{}
 	sl.setLimit(4) // 4 Mbit/s = 500 KB/s
-	sl.throttle(false, 64<<10)
+	sl.throttle(false, 64<<10, nil)
 	start := time.Now()
-	sl.throttle(true, limitChunkMin) // the download bucket is untouched
+	sl.throttle(true, limitChunkMin, nil) // the download bucket is untouched
 	if d := time.Since(start); d > 50*time.Millisecond {
 		t.Fatalf("download waited %s behind upload traffic", d)
-	}
-}
-
-func TestSmallDatagramsAreNotPaced(t *testing.T) {
-	sl := &Slot{}
-	sl.setLimit(4)
-	sl.throttle(false, 64<<10)
-	start := time.Now()
-	sl.throttlePacket(false, 40) // a DNS query
-	if d := time.Since(start); d > 50*time.Millisecond {
-		t.Fatalf("a 40-byte datagram waited %s behind a bulk flow", d)
 	}
 }
 
@@ -128,7 +117,7 @@ func TestHighCapIsReached(t *testing.T) {
 	sl.setLimit(400) // 50 MB/s
 	const size = 8 << 20
 	start := time.Now()
-	if _, err := sl.writePaced(io.Discard, make([]byte, size), false); err != nil {
+	if _, err := sl.writePaced(io.Discard, make([]byte, size), false, nil); err != nil {
 		t.Fatal(err)
 	}
 	d := time.Since(start)
