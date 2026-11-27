@@ -5,7 +5,11 @@
 
 package tunhost
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ZloyRadetski/skipi-core/desktop/egress"
+)
 
 func TestPrepareLockedRejectsADifferentInterfaceName(t *testing.T) {
 	mu.Lock()
@@ -23,5 +27,17 @@ func TestPrepareLockedRejectsADifferentInterfaceName(t *testing.T) {
 	releaseLocked()
 	if fresh, err := prepareLocked("skipi1"); err != nil || !fresh {
 		t.Fatalf("after release = %v, %v", fresh, err)
+	}
+}
+
+// SKIPI Core's own dialer sits in front of Xray's from the start; the TUN binding must still reach every dial.
+func TestPrepareWorksWithTheSkipiDialerInPlace(t *testing.T) {
+	if err := egress.InstallError(); err != nil {
+		t.Fatalf("the SKIPI dialer is not installed: %v", err)
+	}
+	mu.Lock()
+	defer func() { releaseLocked(); mu.Unlock() }()
+	if _, err := prepareLocked("skipi0"); err != nil {
+		t.Fatalf("prepare with the SKIPI dialer in place: %v", err)
 	}
 }
