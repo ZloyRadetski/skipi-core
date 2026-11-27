@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ZloyRadetski/skipi-core/desktop/multilink/nics"
@@ -46,6 +47,8 @@ type Slot struct {
 	ID    string
 	Name  string
 	Index int
+	// Handle is the host's name for the link (see nics.Nic.Handle); it changes when the network reconnects.
+	handle atomic.Uint64
 	key   string
 	addr  atomic.Pointer[slotAddr]
 
@@ -147,6 +150,17 @@ func (sl *Slot) busy(f Family) int64 {
 		}
 	}
 	return n
+}
+
+// Handle is the host's handle for the link, 0 when the link is bound by its interface.
+func (sl *Slot) Handle() uint64 { return sl.handle.Load() }
+
+// Control binds a socket to the link before it connects.
+func (sl *Slot) Control(v6 bool) func(network, address string, c syscall.RawConn) error {
+	if h := sl.handle.Load(); h != 0 {
+		return nics.ForceHandle(h)
+	}
+	return nics.ForceEgress(sl.Index, v6)
 }
 
 func (sl *Slot) ip(f Family) net.IP {
@@ -294,6 +308,7 @@ func (s *Scheduler) Update(nics []nics.Nic) {
 		if found == nil {
 			sl := &Slot{ID: n.ID, Name: n.Name, Index: n.Index, key: key, weight: [2]float64{n.Weight, n.Weight}, present: true}
 			sl.addr.Store(na)
+			sl.handle.Store(n.Handle)
 			sl.phone.Store(n.Phone)
 			s.applyLimit(sl)
 			s.slots = append(s.slots, sl)
@@ -301,6 +316,7 @@ func (s *Scheduler) Update(nics []nics.Nic) {
 		}
 		found.present = true
 		found.Name, found.Index = n.Name, n.Index
+		found.handle.Store(n.Handle)
 		found.phone.Store(n.Phone)
 		if !s.auto {
 			found.weight = [2]float64{n.Weight, n.Weight}

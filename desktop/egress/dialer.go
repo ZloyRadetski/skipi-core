@@ -51,12 +51,18 @@ func (d *Dialer) Dial(ctx context.Context, src net.Address, dest net.Destination
 			return nil, lastErr
 		}
 		tried[sl.Key()] = struct{}{}
-		pinned := pinnedOptions(sockopt, sl.Name)
-		var from net.Address
-		if dest.Address.Family().IsIP() {
-			from = net.IPAddress(sl.IP(family))
+		var conn net.Conn
+		var err error
+		if sl.Handle() != 0 {
+			conn, err = dialBound(ctx, sl, family, dest, sockopt)
+		} else {
+			pinned := pinnedOptions(sockopt, sl.Name)
+			var from net.Address
+			if dest.Address.Family().IsIP() {
+				from = net.IPAddress(sl.IP(family))
+			}
+			conn, err = d.base.Dial(ctx, from, dest, pinned)
 		}
-		conn, err := d.base.Dial(ctx, from, dest, pinned)
 		if err == nil {
 			if dest.Network == net.Network_UDP {
 				// A UDP socket holds no balancing slot (DNS makes them short and many), and it is handed back as the

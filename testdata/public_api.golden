@@ -76,6 +76,12 @@ func MeasureOutboundDownload(
 	requestID string,
 ) (string, error)
 
+func MultilinkApply(settingsJSON string) error
+
+func MultilinkSetLinks(linksJSON string) error
+
+func MultilinkStatus() string
+
 func NewAmneziaWgRunner(settings *AmneziaWgSettings, socksPort int) (*AmneziaWgRunner, error)
 
 func NewCoreController(handler CoreCallbackHandler) *CoreController

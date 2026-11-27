@@ -13,6 +13,8 @@ const (
 	WiFi     Kind = "wifi"
 	Ethernet Kind = "ethernet"
 	Phone    Kind = "phone"
+	// Mobile is the device's own mobile data (Android).
+	Mobile Kind = "mobile"
 )
 
 func phoneDescription(description string) bool {

@@ -60,6 +60,8 @@ func (s Settings) validate() error {
 type EngineConfig struct {
 	// Discover lists the adapters that could carry traffic, and the ones skipped with why.
 	Discover func() ([]nics.Nic, []nics.Skip, error)
+	// Kinds names what each adapter is, by name; nil reads the system's.
+	Kinds func() map[string]nics.Kind
 	// Attach hands the scheduler to the dialer, or takes it away with nil.
 	Attach func(*Scheduler)
 	// NoLoops leaves ticking, rescanning and probing to the caller (tests).
@@ -307,7 +309,7 @@ func (e *Engine) Status() Status {
 		return st
 	}
 	st.Merging = e.sched.Usable(Fam4) >= 2 || e.sched.Usable(Fam6) >= 2
-	kinds := nics.AdapterKinds()
+	kinds := e.kinds()
 	seen := map[string]bool{}
 	for _, s := range e.sched.Snapshot() {
 		if !s.Present {
@@ -339,6 +341,13 @@ func (e *Engine) Status() Status {
 		st.Skipped = append(st.Skipped, SkipStatus{Name: s.Name, Reason: s.Reason})
 	}
 	return st
+}
+
+func (e *Engine) kinds() map[string]nics.Kind {
+	if e.cfg.Kinds != nil {
+		return e.cfg.Kinds()
+	}
+	return nics.AdapterKinds()
 }
 
 func kindOf(kinds map[string]nics.Kind, name string) nics.Kind {

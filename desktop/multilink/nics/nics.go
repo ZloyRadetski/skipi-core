@@ -17,6 +17,9 @@ type Nic struct {
 	ID     string
 	Name   string
 	Index  int // interface index, used to force egress (IP_UNICAST_IF); 0 = don't force
+	// Handle names the link to the host that owns the networks (Android's network handle); 0 = none. A link with
+	// a handle is bound through HostBinder instead of by its interface index.
+	Handle uint64
 	IP     net.IP
 	IP6    net.IP
 	Weight float64
