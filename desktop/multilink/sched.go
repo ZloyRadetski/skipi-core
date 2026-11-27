@@ -316,7 +316,7 @@ func (s *Scheduler) Update(nics []nics.Nic) {
 		}
 		found.present = true
 		found.Name, found.Index = n.Name, n.Index
-		found.handle.Store(n.Handle)
+		handleChanged := found.handle.Swap(n.Handle) != n.Handle
 		found.phone.Store(n.Phone)
 		if !s.auto {
 			found.weight = [2]float64{n.Weight, n.Weight}
@@ -327,6 +327,7 @@ func (s *Scheduler) Update(nics []nics.Nic) {
 			if f == Fam6 {
 				changed = !old.ip6.Equal(na.ip6)
 			}
+			changed = changed || handleChanged
 			if changed {
 				found.state[f] = stateUnknown
 				found.lastProbe[f], found.downUntil[f] = time.Time{}, time.Time{}

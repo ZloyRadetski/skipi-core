@@ -24,6 +24,13 @@ func SetHostBinder(b HostBinder) {
 	hostBinder.Store(&b)
 }
 
+// BindError is a socket that could not be bound to its network. The fault is the link's own, so a dial that
+// meets it goes on to another link (see multilink.Classify).
+type BindError struct{ Err error }
+
+func (e *BindError) Error() string { return "bind socket to network: " + e.Err.Error() }
+func (e *BindError) Unwrap() error { return e.Err }
+
 // ErrNoHostBinder is returned for a handle when no host binder is installed.
 var ErrNoHostBinder = errors.New("no host network binder")
 
@@ -32,11 +39,17 @@ func ForceHandle(handle uint64) func(network, address string, c syscall.RawConn)
 	return func(network, address string, c syscall.RawConn) error {
 		b := hostBinder.Load()
 		if b == nil {
-			return ErrNoHostBinder
+			return &BindError{Err: ErrNoHostBinder}
 		}
 		var serr error
 		if err := c.Control(func(fd uintptr) { serr = (*b)(handle, fd) }); err != nil {
-			return err
+			return &BindError{Err: err}
+		}
+		if serr != nil {
+			var be *BindError
+			if !errors.As(serr, &be) {
+				serr = &BindError{Err: serr}
+			}
 		}
 		return serr
 	}

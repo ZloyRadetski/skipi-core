@@ -4,7 +4,9 @@
 package nics
 
 import (
+	"errors"
 	"net"
+	"syscall"
 	"testing"
 )
 
@@ -47,3 +49,25 @@ func TestIsPhoneFindsAnIPhoneHotspot(t *testing.T) {
 		}
 	}
 }
+
+// A socket that cannot be bound to its network reports a BindError, whatever the reason.
+func TestForceHandleReportsBindErrors(t *testing.T) {
+	var c syscall.RawConn = fakeRawConn{}
+	SetHostBinder(nil)
+	var be *BindError
+	if err := ForceHandle(7)("tcp", "192.0.2.1:80", c); !errors.As(err, &be) || !errors.Is(err, ErrNoHostBinder) {
+		t.Fatalf("without a binder: %v", err)
+	}
+	SetHostBinder(func(uint64, uintptr) error { return syscall.EPERM })
+	defer SetHostBinder(nil)
+	be = nil
+	if err := ForceHandle(7)("tcp", "192.0.2.1:80", c); !errors.As(err, &be) || !errors.Is(err, syscall.EPERM) {
+		t.Fatalf("with a failing binder: %v", err)
+	}
+}
+
+type fakeRawConn struct{}
+
+func (fakeRawConn) Control(f func(uintptr)) error     { f(0); return nil }
+func (fakeRawConn) Read(func(uintptr) bool) error     { return nil }
+func (fakeRawConn) Write(func(uintptr) bool) error    { return nil }

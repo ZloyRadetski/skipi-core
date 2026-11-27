@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net"
 	"strings"
+	"time"
 	"sync"
 	"testing"
 
@@ -240,5 +241,61 @@ func TestRescanFollowsTheAdapters(t *testing.T) {
 	e.Rescan()
 	if got := h.current().Usable(Fam4); got != 1 {
 		t.Fatalf("Usable = %d after two links vanished, want 1", got)
+	}
+}
+
+// Stop and Apply from different goroutines must not meet inside the loops' wait group.
+func TestConcurrentApplyAndStopAreSafe(t *testing.T) {
+	h := homeLinks()
+	e := NewEngine(EngineConfig{Discover: h.discover, Attach: h.attach})
+	on := `{"enabled":true,"probeTargets":["127.0.0.1:9"]}`
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if i%2 == 0 {
+					_ = e.ApplyJSON(on)
+				} else {
+					e.Stop()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	e.Stop()
+	if e.Running() || h.current() != nil {
+		t.Fatal("merging still on after Stop")
+	}
+}
+
+// A host that reports its links itself (Android) rescans on every report, so no timer rescans besides.
+func TestNoRescanLoopWhenTheHostReportsLinks(t *testing.T) {
+	old := rescanEvery
+	rescanEvery = 5 * time.Millisecond
+	defer func() { rescanEvery = old }()
+	count := func(noRescan bool) int {
+		h := homeLinks()
+		var mu sync.Mutex
+		n := 0
+		e := NewEngine(EngineConfig{NoRescan: noRescan, Attach: h.attach, Discover: func() ([]nics.Nic, []nics.Skip, error) {
+			mu.Lock()
+			n++
+			mu.Unlock()
+			return h.discover()
+		}})
+		apply(t, e, `{"enabled":true,"probeTargets":["127.0.0.1:9"]}`)
+		time.Sleep(100 * time.Millisecond)
+		e.Stop()
+		mu.Lock()
+		defer mu.Unlock()
+		return n
+	}
+	if n := count(false); n < 3 {
+		t.Fatalf("control: %d discoveries, the timer should have rescanned", n)
+	}
+	if n := count(true); n != 1 {
+		t.Fatalf("%d discoveries, want only the one of Apply", n)
 	}
 }

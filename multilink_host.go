@@ -16,6 +16,8 @@ var (
 		Discover: hostLinks.Discover,
 		Kinds:    hostLinks.Kinds,
 		Attach:   egress.System().SetScheduler,
+		// MultilinkSetLinks rescans on every report.
+		NoRescan: true,
 	})
 )
 

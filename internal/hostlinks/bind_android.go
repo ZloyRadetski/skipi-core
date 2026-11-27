@@ -18,7 +18,6 @@ static int skipi_bind_to_network(uint64_t handle, int fd) {
 import "C"
 
 import (
-	"fmt"
 	"syscall"
 
 	"github.com/ZloyRadetski/skipi-core/desktop/multilink/nics"
@@ -28,7 +27,7 @@ import (
 func InstallBinder() {
 	nics.SetHostBinder(func(handle uint64, fd uintptr) error {
 		if errno := C.skipi_bind_to_network(C.uint64_t(handle), C.int(fd)); errno != 0 {
-			return fmt.Errorf("bind socket to network: %w", syscall.Errno(errno))
+			return &nics.BindError{Err: syscall.Errno(errno)}
 		}
 		return nil
 	})

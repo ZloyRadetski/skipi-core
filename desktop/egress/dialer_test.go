@@ -11,6 +11,7 @@ import (
 	"os"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/ZloyRadetski/skipi-core/desktop/multilink"
 	"github.com/ZloyRadetski/skipi-core/desktop/multilink/nics"
@@ -186,7 +187,7 @@ func TestBrokenLinkFailsOverWithinTheDial(t *testing.T) {
 	d := NewDialer(base)
 	sched := twoLinks()
 	d.SetScheduler(sched)
-	for range 3 {
+	for range 40 {
 		dialTo(t, d, nil, server, nil).Close()
 	}
 	wifiDials := 0
@@ -292,4 +293,54 @@ func TestMeasurementsAreNotMerged(t *testing.T) {
 	}
 	conn.Close()
 	sameCall(t, base.calls[0], nil, server, nil)
+}
+
+// The scheduler can lose its last link between the usable count and the pick; the dial then goes the way Xray's
+// own dialer takes rather than returning no connection and no error.
+func TestNoLinkPickedFallsBackToTheBaseDialer(t *testing.T) {
+	base := &fakeBase{}
+	d := NewDialer(base)
+	d.SetScheduler(twoLinks())
+	d.acquire = func(multilink.Family, map[string]struct{}) *multilink.Slot { return nil }
+	conn, err := d.Dial(context.Background(), nil, server, nil)
+	if conn == nil || err != nil {
+		t.Fatalf("Dial = %v, %v", conn, err)
+	}
+	conn.Close()
+	if len(base.calls) != 1 || base.calls[0].sockopt != nil {
+		t.Fatalf("calls %+v", base.calls)
+	}
+}
+
+// While another link is left to try, one attempt gets a short time; the last one keeps the whole budget.
+func TestAHangingLinkIsGivenUpEarlyWhileAnotherIsLeft(t *testing.T) {
+	old := attemptTimeout
+	attemptTimeout = 50 * time.Millisecond
+	defer func() { attemptTimeout = old }()
+	var deadlines []bool
+	base := &fakeBase{}
+	hang := &hangingBase{fakeBase: base, deadlines: &deadlines}
+	d := NewDialer(hang)
+	d.SetScheduler(twoLinks())
+	conn := dialTo(t, d, nil, server, nil)
+	conn.Close()
+	if len(deadlines) != 2 || !deadlines[0] || deadlines[1] {
+		t.Fatalf("attempt deadlines %v, want [true false]", deadlines)
+	}
+}
+
+// hangingBase never answers its first dial until the context ends.
+type hangingBase struct {
+	*fakeBase
+	deadlines *[]bool
+}
+
+func (b *hangingBase) Dial(ctx context.Context, src net.Address, dest net.Destination, sockopt *internet.SocketConfig) (net.Conn, error) {
+	_, has := ctx.Deadline()
+	*b.deadlines = append(*b.deadlines, has)
+	if len(*b.deadlines) == 1 {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return b.fakeBase.Dial(ctx, src, dest, sockopt)
 }

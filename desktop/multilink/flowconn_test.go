@@ -5,6 +5,7 @@ package multilink
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -192,6 +193,28 @@ func TestClassifyDialErrors(t *testing.T) {
 			retry, linkDown := Classify(tc.err)
 			if retry != tc.retry || linkDown != tc.linkDown {
 				t.Fatalf("Classify = retry %v link down %v, want %v %v", retry, linkDown, tc.retry, tc.linkDown)
+			}
+		})
+	}
+}
+
+// A socket that could not be bound to its network is a fault of that link: the dial goes to another one and the
+// link takes no new flows for a while. Portable codes only: this runs on every OS.
+func TestClassifyBindErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"no binder", &nics.BindError{Err: nics.ErrNoHostBinder}},
+		{"errno", &nics.BindError{Err: syscall.ENETUNREACH}},
+		{"refused errno", &nics.BindError{Err: syscall.ECONNREFUSED}},
+		{"inside a dial error", &net.OpError{Op: "dial", Net: "tcp", Err: &nics.BindError{Err: syscall.EPERM}}},
+		{"wrapped", fmt.Errorf("dial: %w", &nics.BindError{Err: errors.New("boom")})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			retry, linkDown := Classify(tc.err)
+			if !retry || !linkDown {
+				t.Fatalf("Classify = retry %v link down %v, want true true", retry, linkDown)
 			}
 		})
 	}

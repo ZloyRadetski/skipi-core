@@ -10,6 +10,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/ZloyRadetski/skipi-core/desktop/multilink/nics"
 )
 
 // flowConn is one connection that the scheduler placed on a link. It counts the connection's bytes on that link,
@@ -92,7 +94,11 @@ func Classify(err error) (retry, linkDown bool) {
 	is := func(wsa, std syscall.Errno) bool { return errors.Is(err, wsa) || errors.Is(err, std) }
 	var dns *net.DNSError
 	var ne net.Error
+	var bind *nics.BindError
 	switch {
+	case errors.As(err, &bind):
+		// The socket could not be bound to the link's network: another link may do, and this one is broken.
+		return true, true
 	case errors.As(err, &dns):
 		return false, false
 	case is(wsaeAddrNotAvail, syscall.EADDRNOTAVAIL), is(wsaeNetDown, syscall.ENETDOWN), is(wsaeNetUnreach, syscall.ENETUNREACH):

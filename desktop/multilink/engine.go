@@ -66,12 +66,18 @@ type EngineConfig struct {
 	Attach func(*Scheduler)
 	// NoLoops leaves ticking, rescanning and probing to the caller (tests).
 	NoLoops bool
+	// NoRescan leaves out the timer that rescans the adapters: the host reports every change itself and calls
+	// Rescan then (Android).
+	NoRescan bool
 }
 
 // Engine runs link merging: it finds the adapters, keeps the scheduler's view of them current, measures and
 // probes the links, and attaches the scheduler to the dialer while merging is on.
 type Engine struct {
 	cfg EngineConfig
+
+	// life serialises Apply and Stop, so the loops' wait group is never added to while Stop waits on it.
+	life sync.Mutex
 
 	mu       sync.Mutex
 	settings Settings
@@ -102,8 +108,10 @@ func (e *Engine) Apply(s Settings) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
+	e.life.Lock()
+	defer e.life.Unlock()
 	if !s.Enabled {
-		e.Stop()
+		e.stopLocked()
 		e.mu.Lock()
 		e.settings = s
 		e.mu.Unlock()
@@ -152,6 +160,12 @@ func (e *Engine) configureLocked() {
 // Stop switches merging off: the dialer goes back to Xray's own for new connections, and the loops end. Open
 // connections stay where they are.
 func (e *Engine) Stop() {
+	e.life.Lock()
+	defer e.life.Unlock()
+	e.stopLocked()
+}
+
+func (e *Engine) stopLocked() {
 	e.mu.Lock()
 	if e.sched == nil {
 		e.mu.Unlock()
@@ -213,16 +227,20 @@ func (e *Engine) rescanLocked() {
 	e.sched.Update(use)
 }
 
-const (
-	tickEvery   = time.Second
-	rescanEvery = 3 * time.Second
-)
+const tickEvery = time.Second
+
+var rescanEvery = 3 * time.Second
 
 func (e *Engine) startLoopsLocked() {
 	stop := make(chan struct{})
 	e.stop = stop
 	sched := e.sched
-	e.loops.Add(3)
+	rescan := !e.cfg.NoRescan
+	n := 2
+	if rescan {
+		n++
+	}
+	e.loops.Add(n)
 	go func() {
 		defer e.loops.Done()
 		sched.RunProbes(stop)
@@ -242,6 +260,9 @@ func (e *Engine) startLoopsLocked() {
 			}
 		}
 	}()
+	if !rescan {
+		return
+	}
 	go func() {
 		defer e.loops.Done()
 		t := time.NewTicker(rescanEvery)

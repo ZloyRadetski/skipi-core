@@ -690,3 +690,20 @@ func TestFailedProbeIgnoredWhileUploading(t *testing.T) {
 		t.Fatalf("link that gets nothing back left %q", a.state[Fam4])
 	}
 }
+
+// A new handle for the same address is a new network: what was learned about the old one is dropped.
+func TestAChangedHandleResetsTheLinkState(t *testing.T) {
+	ip := net.ParseIP("192.0.2.10")
+	s := NewScheduler([]nics.Nic{{ID: "mobile", Name: "Mobile", IP: ip, Handle: 1, Weight: 1}})
+	sl := s.slots[0]
+	s.SetState(sl, Fam4, true)
+	s.Fail(sl, Fam4, time.Hour)
+	s.Update([]nics.Nic{{ID: "mobile", Name: "Mobile", IP: ip, Handle: 1, Weight: 1}})
+	if sl.state[Fam4] != stateUp {
+		t.Fatal("an unchanged link lost its state")
+	}
+	s.Update([]nics.Nic{{ID: "mobile", Name: "Mobile", IP: ip, Handle: 2, Weight: 1}})
+	if sl.state[Fam4] != stateUnknown || !sl.downUntil[Fam4].IsZero() || !sl.lastProbe[Fam4].IsZero() {
+		t.Fatalf("state %v down until %v after a handle change", sl.state[Fam4], sl.downUntil[Fam4])
+	}
+}

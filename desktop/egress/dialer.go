@@ -12,6 +12,7 @@ import (
 	"context"
 	"net/netip"
 	"sync/atomic"
+	"time"
 
 	"github.com/ZloyRadetski/skipi-core/desktop/multilink"
 	"github.com/xtls/xray-core/common/net"
@@ -23,7 +24,13 @@ import (
 type Dialer struct {
 	base  internet.SystemDialer
 	sched atomic.Pointer[multilink.Scheduler]
+	// acquire picks the link for a dial; nil takes the scheduler's own pick (a seam for tests).
+	acquire func(multilink.Family, map[string]struct{}) *multilink.Slot
 }
+
+// attemptTimeout is how long one link gets to connect while another is left to try; the last link gets the whole
+// connect budget, as an unmerged dial does.
+var attemptTimeout = 4 * time.Second
 
 // NewDialer puts the dialer in front of base, with merging off.
 func NewDialer(base internet.SystemDialer) *Dialer { return &Dialer{base: base} }
@@ -39,30 +46,50 @@ func (d *Dialer) DestIpAddress() net.IP { return d.base.DestIpAddress() }
 
 func (d *Dialer) Dial(ctx context.Context, src net.Address, dest net.Destination, sockopt *internet.SocketConfig) (net.Conn, error) {
 	sched := d.sched.Load()
-	family, ok := mergeable(src, dest, sockopt)
-	if !ok || sched == nil || ctx.Value(withoutMergingKey{}) != nil || sched.Usable(family) < 2 {
+	if sched == nil {
 		return d.base.Dial(ctx, src, dest, sockopt)
+	}
+	family, ok := mergeable(src, dest, sockopt)
+	if !ok || ctx.Value(withoutMergingKey{}) != nil {
+		return d.base.Dial(ctx, src, dest, sockopt)
+	}
+	usable := sched.Usable(family)
+	if usable < 2 {
+		return d.base.Dial(ctx, src, dest, sockopt)
+	}
+	acquire := d.acquire
+	if acquire == nil {
+		acquire = sched.AcquireFor
 	}
 	tried := map[string]struct{}{}
 	var lastErr error
 	for {
-		sl := sched.AcquireFor(family, tried)
+		sl := acquire(family, tried)
 		if sl == nil {
+			if lastErr == nil {
+				return d.base.Dial(ctx, src, dest, sockopt)
+			}
 			return nil, lastErr
 		}
 		tried[sl.Key()] = struct{}{}
+		// While another link is left, a link that does not answer is given up on early.
+		attemptCtx, cancel := ctx, context.CancelFunc(func() {})
+		if len(tried) < usable {
+			attemptCtx, cancel = context.WithTimeout(ctx, attemptTimeout)
+		}
 		var conn net.Conn
 		var err error
 		if sl.Handle() != 0 {
-			conn, err = dialBound(ctx, sl, family, dest, sockopt)
+			conn, err = dialBound(attemptCtx, sl, family, dest, sockopt)
 		} else {
 			pinned := pinnedOptions(sockopt, sl.Name)
 			var from net.Address
 			if dest.Address.Family().IsIP() {
 				from = net.IPAddress(sl.IP(family))
 			}
-			conn, err = d.base.Dial(ctx, from, dest, pinned)
+			conn, err = d.base.Dial(attemptCtx, from, dest, pinned)
 		}
+		cancel()
 		if err == nil {
 			if dest.Network == net.Network_UDP {
 				// A UDP socket holds no balancing slot (DNS makes them short and many), and it is handed back as the
