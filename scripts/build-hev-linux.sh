@@ -43,6 +43,16 @@ for p in "$PATCH_DIR"/*.patch; do
   patch -p1 -d "$SRC" --no-backup-if-mismatch < "$p"
 done
 
+# 2b. hev's Makefile turns the task stack overflow detector on for every non-Windows build. The detector
+# replaces the process-wide SIGSEGV/SIGBUS handlers and its handler dereferences hev's thread-local context,
+# which only hev's own thread has. Here hev lives inside the JVM, which raises SIGSEGV by itself (null checks,
+# safepoint polls) on threads hev knows nothing about: the handler then crashes the whole application.
+grep -q '^TPFLAGS+=ENABLE_STACK_OVERFLOW_DETECTOR=1$' "$SRC/Makefile" || {
+  echo "hev Makefile no longer enables the stack overflow detector the expected way; recheck this step" >&2
+  exit 1
+}
+sed -i 's/^TPFLAGS+=ENABLE_STACK_OVERFLOW_DETECTOR=1$/TPFLAGS+=ENABLE_STACK_OVERFLOW_DETECTOR=0/' "$SRC/Makefile"
+
 # 3. make static. REV_ID is passed in because the copy has no git metadata of its own.
 # -Wno-error: hev builds with -Werror, which a newer host gcc must not turn into a build break.
 REV_ID="$(git -C "$SUBMODULE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -60,9 +70,18 @@ cp_lib "$SRC/third-part/lwip/bin/liblwip.a"
 cp_lib "$SRC/third-part/hev-task-system/bin/libhev-task-system.a"
 cp "$SRC/src/hev-main.h" "$OUT/include/hev-main.h"
 
+# 4b. Nothing may call the detector (see 2b): its source is always compiled, only the call is switched.
+if command -v nm >/dev/null 2>&1; then
+  if nm "$DEST/libhev-task-system.a" 2>/dev/null | grep ' U hev_task_stack_detector_new' >/dev/null; then
+    echo "the task system still calls the stack overflow detector" >&2
+    exit 1
+  fi
+fi
+
 # 5. The entry point the cgo glue calls must be in the archive.
 if command -v nm >/dev/null 2>&1; then
-  nm "$DEST/libhev-socks5-tunnel.a" 2>/dev/null | grep -q ' T hev_socks5_tunnel_main_from_str' || {
+  # No grep -q: it exits at the first match, nm then dies of SIGPIPE and pipefail reports a false failure.
+  nm "$DEST/libhev-socks5-tunnel.a" 2>/dev/null | grep ' T hev_socks5_tunnel_main_from_str' >/dev/null || {
     echo "hev_socks5_tunnel_main_from_str is missing from libhev-socks5-tunnel.a" >&2
     exit 1
   }

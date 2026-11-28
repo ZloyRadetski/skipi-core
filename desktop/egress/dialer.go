@@ -104,7 +104,7 @@ func (d *Dialer) Dial(ctx context.Context, src net.Address, dest net.Destination
 		keepAlive := sched.PhoneKeepAlive(sl)
 		var conn net.Conn
 		var err error
-		if sl.Handle() != 0 {
+		if sl.Handle() != 0 || bindsLinkItself() {
 			conn, err = dialBound(attemptCtx, sl, family, dest, sockopt, keepAlive)
 		} else {
 			pinned := d.pinned(sockopt, sl.Name, keepAlive)
